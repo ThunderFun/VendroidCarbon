@@ -3,11 +3,11 @@
 /local.properties
 .idea
 .DS_Store
-/build
+build/
 /captures
 .externalNativeBuild
 .cxx
 local.properties
 app/release/
 .gradle/
-/gradle
+app/src/main/res/raw/vencord_mobile.js

@@ -91,7 +91,7 @@ class NavigationPolicyTest {
     }
 
     // ------------------------------------------------------------------
-    //  NavigationPolicy.decide — main frame
+    //  NavigationPolicy.decide: main frame
     // ------------------------------------------------------------------
 
     @Test fun decide_mainFrameDiscord_loadsInWebview() {
@@ -181,7 +181,7 @@ class NavigationPolicyTest {
     }
 
     // ------------------------------------------------------------------
-    //  NavigationPolicy.decide — subframe (iframe)
+    //  NavigationPolicy.decide: subframe (iframe)
     // ------------------------------------------------------------------
 
     @Test fun decide_subframeGithub_loadsInWebview() {

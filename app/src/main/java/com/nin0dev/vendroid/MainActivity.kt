@@ -515,7 +515,7 @@ class MainActivity : AppCompatActivity() {
                     .getOrDefault(true)) {
                 Toast.makeText(this, "Safe mode enabled, Vencord won't be loaded", Toast.LENGTH_SHORT)
                     .show()
-                VDELog.w("Main", "Safe mode enabled — Vencord will not load")
+                VDELog.w("Main", "Safe mode enabled; Vencord will not load")
                 editor.putBoolean("safeMode", false)
                 editor.apply()
             }
@@ -1029,38 +1029,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Boot-verify probe: checks for Vencord/VencordMobile globals and any
-    // uncaught errors. Runs as a separate eval so it fires even when the
-    // bundle died mid-script.
-    //
-    // __vdeUncaught entries are pre-formatted strings ("msg@src:line" from
-    // VencordNative.bridgeBootstrapJs), so they are joined raw.
-    //
-    // localStorage diagnosis reports the type, the own-property descriptor
-    // (native storage defines an accessor on window), the shim flag, and the
-    // prelude's at-boot snapshot (__vdeLsBoot) to distinguish "storage never
-    // worked" from "removed by in-page code". No self-heal: a silent repair
-    // would erase the evidence of who removed it.
-    //
-    // fw/anim report the firewall gate (__vendroidFw) and the
-    // animation/visibility gate (__vendroidAnimCtrl). Off means the page
-    // never received the patches. The ok verdict ignores both: a missing
-    // patch is a payload bug, not a failed Vencord boot.
-    private val BOOT_VERIFY_JS =
-            "(function(){try{" +
-                "var u=(window.__vdeUncaught||[]).slice(0,5).join(' | ');" +
-                "var lsv,thr=false;try{lsv=window.localStorage}catch(e){thr=true}" +
-                "var ls='ls='+(thr?'throws':typeof lsv)" +
-                    "+'|own='+(Object.getOwnPropertyDescriptor(window,'localStorage')?'y':'n')" +
-                    "+'|shim='+(window.__vdeLsShim?'y':'n')" +
-                    "+'|watch='+(window.__vdeLsWatch===undefined?'n':window.__vdeLsWatch)" +
-                    "+'|boot0='+(window.__vdeLsBoot===undefined?'?':window.__vdeLsBoot);" +
-                "var w=(typeof Vencord!=='undefined'&&Vencord&&Vencord.Webpack)?(Vencord.Webpack.wreq?'wreq-ok':'no-wreq'):'none';" +
-                "return 'vencord='+typeof Vencord+'|webpack='+w+'|mobile='+typeof VencordMobile+'|'" +
-                    "+'fw='+(window.__vendroidFw?'on':'off')+'|anim='+(window.__vendroidAnimCtrl?'on':'off')" +
-                    "+'|'+ls+'|uncaught=['+u+']';" +
-                "}catch(e){return 'probe-failed:'+e.message}})()"
-
     /**
      * Schedules a boot-verify probe after the runtimes have had time to boot.
      * Called from injection paths and [VWebviewClient.onPageFinished].
@@ -1086,23 +1054,10 @@ class MainActivity : AppCompatActivity() {
             persistSafeModeBootState()
             return
         }
-        w.evaluateJavascript(BOOT_VERIFY_JS) { raw ->
-            val verdict = raw?.let { unquoteJsResult(it) } ?: "no-result"
-            val ok = verdict.startsWith("vencord=object") && verdict.contains("|mobile=object")
-            val safe = UrlNormalizer.redactForLog(verdict)
-            if (ok) VDELog.i("Main", "Boot verify ($source): OK | $safe")
-            else VDELog.e("Main", "Boot verify ($source): FAILED | $safe")
+        BootVerify.runProbe(w, source) { ok, verdict ->
             persistBootState(ok, verdict)
         }
     }
-
-    /** Un-quotes the JSON string returned by evaluateJavascript. */
-    private fun unquoteJsResult(raw: String): String =
-        try {
-            org.json.JSONArray("[$raw]").getString(0)
-        } catch (_: Exception) {
-            raw.trim('"')
-        }
 
     /** Persists a short human-readable boot summary for the recovery screen. */
     private fun persistBootState(ok: Boolean, verdict: String) {
@@ -1209,9 +1164,9 @@ class MainActivity : AppCompatActivity() {
          * so unit tests can drive it synchronously, and so the queued lambda
          * captures no activity.
          *
-         * Guards are re-evaluated at execution time: the queue wait can span a
-         * safe-mode re-entry or an invalidateBundleCache() from the JS-bridge
-         * update path. Publishes go through the compare-and-set helpers
+         * Guards are re-evaluated at execution time: the queue wait can span
+         * a safe-mode re-entry or a bundle-cache invalidation. Publishes go
+         * through the compare-and-set helpers
          * [HttpClient.setVencordMobileRuntimeIfNull] and
          * [HttpClient.setVencordRuntimeIfNull] because the preload thread may
          * publish the same content while this task waits; an unconditional set

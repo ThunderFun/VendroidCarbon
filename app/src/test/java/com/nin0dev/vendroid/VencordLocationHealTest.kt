@@ -85,7 +85,7 @@ class VencordLocationHealTest {
 
     @Test
     fun plainHttpOnAllowedHost_heals() {
-        seedCustomLegacyState("http://vde-builds.nin0.dev/vencord/browser.js")
+        seedCustomLegacyState("http://github.com/Vendicated/Vencord/releases/latest/download/browser.js")
 
         VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
 
@@ -96,7 +96,7 @@ class VencordLocationHealTest {
 
     @Test
     fun uriToleratedButOkHttpUnparseable_heals() {
-        seedCustomLegacyState("https://vde-builds.nin0.dev:99999/browser.js")
+        seedCustomLegacyState("https://github.com:99999/browser.js")
 
         VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
 
@@ -155,16 +155,31 @@ class VencordLocationHealTest {
     @Test
     fun customPathOnAllowedHost_notTouched() {
         // The developer workflow must survive the heal.
-        seedCustomLegacyState("https://vde-builds.nin0.dev/branch/browser.js")
+        seedCustomLegacyState("https://github.com/Vendicated/Vencord/releases/download/devbuild/browser.js")
 
         VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
 
         assertEquals(
-            "https://vde-builds.nin0.dev/branch/browser.js",
+            "https://github.com/Vendicated/Vencord/releases/download/devbuild/browser.js",
             prefs.getString("vencordLocation", null)
         )
         assertTrue(vendroidFile.exists())
         assertFalse(prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false))
+    }
+
+    @Test
+    fun retiredOperatorHostUrl_heals() {
+        // A vencordLocation persisted by an older build pointing at the
+        // retired operator host can never fetch again after the upstream
+        // flip; the heal must remove it so the boot falls back to the
+        // official GitHub URL.
+        seedCustomLegacyState("https://vde-builds.nin0.dev/vencord/browser.js")
+
+        VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
+
+        assertNull(prefs.getString("vencordLocation", null))
+        assertFalse(vendroidFile.exists())
+        assertTrue(prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false))
     }
 
     @Test

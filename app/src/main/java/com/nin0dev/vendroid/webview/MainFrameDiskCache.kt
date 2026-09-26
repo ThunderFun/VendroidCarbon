@@ -123,13 +123,13 @@ import kotlin.concurrent.withLock
 
         return try {
             val base = entryBaseName(urlString)
-            // Matched-pair scheme: the body is named by the SAME timestamp
+            // Matched-pair scheme: the body is named by the same timestamp
             // stored in the meta ("$base.<ts>.html"). The meta (renamed last)
             // is the commit point, so a reader always resolves the body from
-            // the timestamp it just read from meta — a torn {new body, old
-            // meta} combination is structurally impossible. (With a fixed
+            // the timestamp it just read from meta. A torn {new body, old
+            // meta} combination is structurally impossible. With a fixed
             // "base.html" name, renaming the body into place before the meta
-            // could expose a new body paired with an old meta.)
+            // could expose a new body paired with an old meta.
             val bodyTmp = File(dir, "$base.tmp")
             val bodyFile = File(dir, "$base.$nowMs.html")
             val metaTmp = File(dir, "$base.meta.tmp")
@@ -159,7 +159,7 @@ import kotlin.concurrent.withLock
                     sb.append(kv).append('\n')
                 }
             }
-            // Write meta atomically LAST — it is the commit point.
+            // Write meta atomically LAST. It is the commit point.
             metaTmp.writeText(sb.toString())
             if (!metaTmp.renameTo(meta)) {
                 metaTmp.delete()
@@ -234,7 +234,7 @@ import kotlin.concurrent.withLock
             // torn pair.
             val fetchedAt = readFetchedAt(metaFile) ?: return null
             if (nowMs - fetchedAt > MAX_AGE_MS) {
-                // Expired — drop so a later read doesn't re-serve a dead entry.
+                // Expired. Drop so a later read doesn't re-serve a dead entry.
                 metaFile.delete()
                 File(dir, "$base.$fetchedAt.html").delete()
                 return null

@@ -47,8 +47,13 @@ object VencordCsp {
             // so attacker-created buckets stay blocked.
             "https://discord-attachments-uploads-prd.storage.googleapis.com " +
             "https://discord-attachments-upstream-prd.storage.googleapis.com " +
-            "https://vde-builds.nin0.dev " +
-            "https://badges.vencord.dev https://vendroid.nin0.dev; " +
+            // Upstream bundle/CSS hosts (GitHub releases). The bundle and the
+            // prefetched CSS are inline-injected, so script-src/style-src need
+            // no entries; these only carry the in-page CSS re-fetch fallback,
+            // which follows the same 302 hop chain the native fetch
+            // re-validates (github.com → release-assets.githubusercontent.com).
+            "https://github.com https://release-assets.githubusercontent.com " +
+            "https://badges.vencord.dev; " +
             "img-src * data: blob:; " +
             "media-src * blob:; " +
             "font-src * data:; " +

@@ -2,6 +2,24 @@ plugins {
     id 'com.android.application'
 }
 
+// vencord_mobile.js is generated from the numbered parts in src/main/vencord/.
+// Parts are the source of truth; the two-digit prefixes make lexicographic
+// sort equal to the intended concatenation order. The file tree and output
+// file are resolved at configuration time for configuration-cache safety.
+def vencordParts = fileTree(dir: "src/main/vencord", include: ["*.js"])
+def vencordMergedFile = file("src/main/res/raw/vencord_mobile.js")
+
+tasks.register("mergeVencordMobileJs") {
+    inputs.files(vencordParts)
+    outputs.file(vencordMergedFile)
+    doLast {
+        def out = new ByteArrayOutputStream()
+        vencordParts.files.sort { it.name }.each { out.write(it.readBytes()) }
+        vencordMergedFile.bytes = out.toByteArray()
+    }
+}
+preBuild.dependsOn "mergeVencordMobileJs"
+
 def keystoreProperties = new Properties()
 def keystorePropertiesFile = rootProject.file("local.properties")
 if (keystorePropertiesFile.exists()) {

@@ -2,7 +2,7 @@
 -keepattributes *Annotation*
 -keepattributes RuntimeVisibleAnnotations
 
-# WebView JS bridge — VencordNative must keep its class name, method names,
+# WebView JS bridge: VencordNative must keep its class name, method names,
 # and parameter types exactly as-is because JavaScript calls them by name
 # via VencordMobileNative.getString(...) etc.  The default
 # proguard-android-optimize.txt keeps @JavascriptInterface methods,
@@ -24,7 +24,7 @@
 -keep class com.nin0dev.vendroid.webview.VencordNative$QuickCssBridge { *; }
 -keep class com.nin0dev.vendroid.webview.VencordNative$FirewallEditorBridge { *; }
 
-# Gson — only keep the core Gson class + TypeToken (for reflection).
+# Gson: keep only the core Gson class + TypeToken (for reflection).
 # Let R8 shrink all unused Gson adapters/internals. Only serialized
 # model classes need to be kept (via @SerializedName or explicit rules).
 -keep class com.google.gson.Gson { *; }
@@ -39,15 +39,15 @@
 # Keep source file names and line numbers for crash reports in debug
 -keepattributes SourceFile,LineNumberTable
 
-# Aggressive R8 optimization — enables inlining, class merging,
+# Aggressive R8 optimization: enables inlining, class merging,
 # access modification, and multiple optimization passes for a
-# significantly smaller DEX with faster class loading at runtime.
+# smaller DEX and faster class loading.
 -repackageclasses ''
 -allowaccessmodification
 -optimizationpasses 5
 -mergeinterfacesaggressively
 
-# VDELog — in-app logging engine. Keep the class and all members; R8's
+# VDELog: in-app logging engine. Keep the class and all members; R8's
 # aggressive passes (-optimizationpasses 5, -allowaccessmodification,
 # -repackageclasses) can inline or merge it away if it looks unused.
 # The HandlerThread and Handler fields must survive for file I/O.
@@ -55,7 +55,7 @@
 -keep class com.nin0dev.vendroid.utils.VDELog$Level { *; }
 -keep class com.nin0dev.vendroid.utils.VDELog$LogEntry { *; }
 
-# FirewallConfig — runtime-editable domain allowlist. Aggressive R8 passes can
+# FirewallConfig: runtime-editable domain allowlist. Aggressive R8 passes can
 # inline or merge a singleton that looks unused from static analysis; keep it
 # and its Category enum explicitly.
 -keep class com.nin0dev.vendroid.utils.FirewallConfig { *; }

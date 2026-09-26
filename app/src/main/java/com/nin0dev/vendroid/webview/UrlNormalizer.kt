@@ -217,7 +217,7 @@ import java.net.IDN
     }
 
     /**
-     * Returns true if [s] mixes Latin script with Cyrillic or Greek — the
+     * Returns true if [s] mixes Latin script with Cyrillic or Greek, the
      * primary sources of homograph attacks. Pure-Cyrillic, pure-Greek, and
      * Latin+CJK are not flagged.
      */
@@ -306,7 +306,7 @@ import java.net.IDN
     ): String {
         if (scheme == null) return ""
         val sb = StringBuilder(64 + rawPath.length)
-        // Hostless schemes use scheme-specific syntax, not authority —
+        // Hostless schemes use scheme-specific syntax, not authority, so
         // emit "scheme:" without "//" to avoid "about://blank". Only treat it
         // as hostless when there is genuinely no host; when IDNA rejects a host
         // (asciiHost == null but rawHost != null) we must still show it,

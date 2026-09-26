@@ -1,6 +1,5 @@
 package com.nin0dev.vendroid.webview
 
-import android.content.ComponentName
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -18,13 +17,11 @@ import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.ShareHelper
 import com.nin0dev.vendroid.utils.VDELog
 import java.io.File
-import java.io.IOException
 import java.lang.ref.WeakReference
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
-import okhttp3.Response
 
 class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebView) {
     private val wvRef: WeakReference<WebView> = WeakReference(wv)
@@ -34,86 +31,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // Maximum length of a single String value a page script may persist via
         // setString; bounds the settings XML size from any single write.
         private const val MAX_STRING_VALUE_LENGTH = 64 * 1024 // 64 KB
-        // Settings keys the rest of the app reads as Booleans (via
-        // SharedPreferences.getBoolean). Writing a String to any of these (e.g.
-        // via setString) makes getBoolean throw ClassCastException. That was
-        // a cold-start crash loop before the fallbacks went into MainActivity;
-        // now it silently defeats the toggle. setString must never write to
-        // them. String-read mirror: STRING_SETTING_KEYS below.
-        internal val BOOLEAN_SETTING_KEYS = setOf(
-            "vendroid_confirmExternalLinks",
-            "vendroid_blockTypingIndicator",
-            "vendroid_rememberLastChannel",
-            // Migrated by MainActivity.migrateSettings() and read by the plugin.
-            // Guarded here so setString can't type-poison them into Strings.
-            "checkVDEUpdates",
-            "checkAnnouncements",
-            // Desktop UA switch. installWebView reads this as a Boolean at
-            // startup; that read falls back to false on a wrong type, but a
-            // String would still disable the toggle.
-            "desktopMode"
-        )
+        // Delegates: the implementations live in BridgeSettings.kt; the
+        // contract tests reach these as VencordNative.<member>.
+        internal val BOOLEAN_SETTING_KEYS get() = BridgeSettings.BOOLEAN_SETTING_KEYS
+        internal val STRING_SETTING_KEYS get() = BridgeSettings.STRING_SETTING_KEYS
+        internal fun isTypeSafeBridgeWrite(op: String, key: String) = BridgeSettings.isTypeSafeBridgeWrite(op, key)
+        internal fun isBridgeKeyAllowed(id: String) = BridgeSettings.isBridgeKeyAllowed(id)
 
-        // Settings keys the app reads as Strings. Writing a Boolean here
-        // makes getString throw ClassCastException; clientMod did exactly
-        // that: both of its readers sat on the startup fetch path (and
-        // updateVencord's @JavascriptInterface body) with no matching catch,
-        // so one bridge call crash-looped the process on every cold start,
-        // and no recovery option cleared the key. setBool must never write
-        // to these, the mirror of BOOLEAN_SETTING_KEYS above. vencordLocation
-        // is already rejected by isKeyAllowed for reads and writes; listed
-        // here only to pin the contract if that gate changes.
-        internal val STRING_SETTING_KEYS = setOf(
-            "clientMod",
-            "vencordLocation"
-        )
-
-        // Single type-contract gate for both bridge write paths: returns
-        // false when the app reads [key] with the other type. Both setters
-        // call this before guardedPrefs, so a rejected call consumes no
-        // rate-limit slot or distinct-key budget. internal + pure so
-        // BridgeSettingTypeContractTest can pin it without Android.
-        internal fun isTypeSafeBridgeWrite(op: String, key: String): Boolean =
-            !(op == "setString" && key in BOOLEAN_SETTING_KEYS) &&
-                !(op == "setBool" && key in STRING_SETTING_KEYS)
-
-        // Settings keys outside the Vencord-/vendroid_ prefixes that the plugin
-        // may legitimately read/write via the bridge.
-        private val EXTRA_ALLOWED_KEYS = setOf(
-            "checkVDEUpdates",
-            "checkAnnouncements",
-            // Desktop mode toggle from the eq.js settings tree, consumed by
-            // installWebView at startup. Unprefixed; without this entry both
-            // its reads and writes were dropped, so the toggle never applied.
-            "desktopMode"
-        )
-
-        // Which settings keys page JS may read or write via the bridge. Split
-        // from [isKeyAllowed] and kept pure so BridgeKeyAllowlistTest can pin
-        // it without Android. vencordLocation is rejected for reads as well
-        // as writes: it selects the code the app downloads and executes, and
-        // a custom value can carry credentials in its query string.
-        internal fun isBridgeKeyAllowed(id: String): Boolean =
-            id != "vencordLocation" &&
-                (id == "clientMod" ||
-                    id in EXTRA_ALLOWED_KEYS ||
-                    id.startsWith("Vencord-") ||
-                    id.startsWith("vendroid_") ||
-                    id.startsWith("Vencord_") ||
-                    id.startsWith("css_cache_"))
-        // Launcher activity-alias names (manifest: <activity-alias
-        // android:name=".${name}MainActivity">). Declared as a List because
-        // reconcileIconState() uses the order as tie-breaker when several
-        // aliases are enabled.
-        private val ICON_NAMES = listOf("Main", "Jolly", "Discord", "Retro", "TS12")
-        // Launcher icon currently believed active. PackageManager component
-        // state is the source of truth; this is only a cache. changeAppIcon()
-        // commits it only after the enable call succeeds, never speculatively.
-        // Null means not yet resolved for this process. All access happens
-        // under iconLock.
-        @Volatile
-        private var currentIcon: String? = null
-        private val iconLock = Any()
         private val gson = com.google.gson.Gson()
 
         // Capability token, injected only into the top-level Discord document
@@ -203,7 +127,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
          * JavaScript that runs in the TOP-LEVEL Discord document before any
          * bridge call. It wraps window.VencordMobileNative so every method call
          * is prepended with the per-session capability token. The token is held
-         * ONLY in this closure, never published as a window global — so even a
+         * ONLY in this closure, never published as a window global, so even a
          * same-origin subframe/window that can access this document's globals
          * cannot read it, nor pass the native check. Subframes hold the raw
          * injected object but no usable token.
@@ -258,136 +182,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 "window.VencordMobileNative=wrap;}" +
                 "})();").also { cachedBootstrapJs = it }
         }
-
-        // Alias class names in the manifest expand against the AGP namespace
-        // ("com.nin0dev.vendroid"), not the runtime applicationId. Debug and
-        // dev builds append an applicationIdSuffix, so their manifest package
-        // is "com.nin0dev.vendroid.debug" while alias classes stay
-        // "com.nin0dev.vendroid.${name}MainActivity" (verified in the merged
-        // debug manifest). Deriving the class from pkg.packageName would name
-        // components that do not exist and make every PM write throw
-        // IllegalArgumentException. Must match `namespace` in build.gradle.
-        private const val ICON_COMPONENT_CLASS_PREFIX = "com.nin0dev.vendroid."
-
-        // The Context supplies the owning package (the applicationId) for the
-        // ComponentName; the class part is the namespace-prefixed alias name.
-        private fun iconComponent(pkg: Context, name: String): ComponentName =
-            ComponentName(pkg, "$ICON_COMPONENT_CLASS_PREFIX${name}MainActivity")
-
-        // getComponentEnabledSetting documents no exceptions, but a component
-        // missing from this build (flavor or manifest drift) must not break
-        // reconciliation. A missing component reads as the manifest default.
-        private fun iconComponentState(pm: PackageManager, pkg: Context, name: String): Int =
-            try {
-                pm.getComponentEnabledSetting(iconComponent(pkg, name))
-            } catch (t: Throwable) {
-                PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
-            }
-
-        private fun iconFromComponent(cn: ComponentName?): String? {
-            val cls = cn?.className ?: return null
-            if (!cls.startsWith(ICON_COMPONENT_CLASS_PREFIX)) return null
-            val short = cls.removePrefix(ICON_COMPONENT_CLASS_PREFIX)
-            return ICON_NAMES.find { short == "${it}MainActivity" }
-        }
-
-        /**
-         * Reconcile the [currentIcon] cache with PackageManager state and
-         * repair corruption in either direction:
-         *  - the cache names an alias PM does not have enabled (a failed
-         *    switch leaves this behind; it made "already active" lie and
-         *    blocked retries), or
-         *  - several aliases are enabled (a half-applied switch leaves this
-         *    behind; it shows up as duplicate launcher entries).
-         *
-         * Resolution when several aliases are enabled: the cached icon (last
-         * known intent) wins, else the alias this activity was launched from
-         * (the entry the user actually tapped), else ICON_NAMES order. Every
-         * other enabled alias is disabled, not just dropped from the cache.
-         */
-        private fun reconcileIconState(act: MainActivity) {
-            val pm = act.packageManager
-            val pkg = act.applicationContext
-            val states = ICON_NAMES.associateWith { iconComponentState(pm, pkg, it) }
-            val enabled = ICON_NAMES.filter {
-                states[it] == PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-            }
-            val cached = currentIcon
-            val resolved = when {
-                cached != null && enabled.contains(cached) -> cached
-                enabled.size == 1 -> enabled[0]
-                enabled.size > 1 ->
-                    iconFromComponent(act.intent?.component)?.takeIf { enabled.contains(it) }
-                        ?: enabled.first()
-                // No alias is explicitly enabled. Main normally sits at its
-                // manifest default (android:enabled="true") and that is what
-                // the launcher shows. If Main was also explicitly disabled,
-                // the launcher has no entry at all and the switcher would
-                // report "already active" forever, so restore the default.
-                else -> {
-                    if (states["Main"] == PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
-                        try {
-                            pm.setComponentEnabledSetting(
-                                iconComponent(pkg, "Main"),
-                                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                                PackageManager.DONT_KILL_APP
-                            )
-                            VDELog.w("VN", "Icon repair: launcher had no enabled entry; re-enabled Main")
-                        } catch (t: Throwable) {
-                            VDELog.e("VN", "Icon repair: could not re-enable Main", t)
-                        }
-                    }
-                    "Main"
-                }
-            }
-            if (resolved != cached) {
-                // Assign before logging so a throwing logger cannot leave the
-                // cache stale.
-                currentIcon = resolved
-                if (cached == null) {
-                    // First resolution this process, not a desync.
-                    VDELog.d("VN", "Icon cache resolved to '$resolved'")
-                } else {
-                    VDELog.w("VN", "Icon cache desync (cache=$cached, pm=$resolved) — repaired")
-                }
-            }
-            for (name in enabled) {
-                if (name == resolved) continue
-                try {
-                    pm.setComponentEnabledSetting(
-                        iconComponent(pkg, name),
-                        PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                        PackageManager.DONT_KILL_APP
-                    )
-                    VDELog.w("VN", "Icon repair: disabled stale enabled launcher alias '$name'")
-                } catch (t: Throwable) {
-                    VDELog.e("VN", "Icon repair: could not disable stale launcher alias '$name'", t)
-                }
-            }
-        }
-
-        /**
-         * Called when a VencordNative (and thus a MainActivity) is created.
-         * Refreshes the icon cache from PackageManager and repairs any
-         * corruption found; this is what heals duplicate launcher entries
-         * after a process restart. PM reads are cheap, and only actual
-         * corruption triggers writes.
-         */
-        fun initCurrentIcon(activity: MainActivity?) {
-            val act = activity ?: return
-            try {
-                synchronized(iconLock) { reconcileIconState(act) }
-            } catch (t: Throwable) {
-                // Runs from the class constructor (MainActivity.onCreate);
-                // construction must never fail. A failed reconcile leaves the
-                // cache unresolved; the next changeAppIcon reconciles again.
-                VDELog.e("VN", "initCurrentIcon: reconcile failed", t)
-            }
-        }
     }
 
     init {
-        initCurrentIcon(activity.get())
+        IconAliasManager.initCurrentIcon(activity.get())
     }
 
     @Volatile
@@ -449,7 +247,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         if (evicted) editor.apply()
     }
 
-    // Per-key rate limiter — prevents rapid re-writes to the same key while
+    // Per-key rate limiter: prevents rapid re-writes to the same key while
     // allowing independent keys to be written in parallel. Uses
     // System.nanoTime() (monotonic) instead of currentTimeMillis() (wall clock,
     // which can jump on clock adjustments and break the limiter). Bounded:
@@ -481,7 +279,9 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     // scripted writes at 20/s per key.
     private val TOGGLE_SETTING_KEYS = setOf(
         "vendroid_confirmExternalLinks",
-        "vendroid_blockTypingIndicator"
+        "vendroid_blockTypingIndicator",
+        "vendroid_gestures",
+        "vendroid_support_warnings"
     )
 
     private fun minWriteIntervalNanos(id: String): Long =
@@ -560,10 +360,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 // a destructive remove there would let page JS permanently
                 // delete settings it couldn't otherwise touch.
                 if (forWrite) {
-                    VDELog.e("VN", "$op($safeId) ClassCastException — removing corrupted key", e)
+                    VDELog.e("VN", "$op($safeId) ClassCastException, removing corrupted key", e)
                     prefs.edit().remove(safeId).apply()
                 } else {
-                    VDELog.w("VN", "$op($safeId) ClassCastException on read — returning default")
+                    VDELog.w("VN", "$op($safeId) ClassCastException on read, returning default")
                 }
                 default
             }
@@ -599,7 +399,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         val wvActivity = activity.get() ?: return false
         // Fast path: with no navigation in flight, the cached host was written
         // after the current document committed, so it cannot be stale across a
-        // navigation — skip the UI-thread round trip. This makes steady-state
+        // navigation. Skip the UI-thread round trip. This makes steady-state
         // bridge writes (setString/setBool) latch-free instead of blocking the
         // shared JS bridge thread on a possibly-busy UI thread for up to 50ms.
         if (!wvActivity.navigationInProgress) return true
@@ -700,12 +500,12 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     // Native-gated actions for the app-owned UI buttons rendered in
-    // vencord_mobile.js ("View logs" / "Open firewall editor"). These two
-    // buttons live in code this project ships, so the app routes them through a
-    // single request channel. The other privileged methods (openQuickCss,
-    // updateVencord, updateVendroid) are called directly by the required
-    // first-party vendroidEnhancements plugin and must remain JS-callable —
-    // they are not collapsed into this channel.
+    // vencord_mobile.js ("View logs" / "Open firewall editor"). openQuickCss,
+    // the other privileged method, is called directly by the QuickCSS editor
+    // bridge and must stay JS-callable, so it is not collapsed into this
+    // channel. updateVencord/updateVendroid were retired with the
+    // upstream-bundle flip: their only callers lived in the vendored
+    // vendroidEnhancements plugin, which the vanilla bundle does not carry.
     private val ALLOWED_NATIVE_ACTIONS = setOf("openLogs", "openFirewallEditor")
 
     @JavascriptInterface
@@ -723,94 +523,11 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     @JavascriptInterface
-    fun updateVencord(token: String?) {
-        // Strict check before any work — this overwrites vencord.js via a
-        // network download, so non-Discord whitelisted pages must not invoke it.
-        if (!isBridgeAuthorized(token)) return
-        if (!isOnDiscordDomainStrict()) return
-        if (!rateLimitWrite("updateVencord", 5 * 60 * 1_000_000_000L)) return
-        // Fail fast on a misconfigured vencordLocation, before any network work.
-        val sPrefs = settingsPrefs ?: return
-        val vencordLocation = HttpClient.resolveBundleLocation(sPrefs)
-        // Same gate as fetchVencord's; the contract lives on
-        // HttpClient.bundleLocationFetchProblem.
-        HttpClient.bundleLocationFetchProblem(vencordLocation)?.let { problem ->
-            VDELog.e("VN", "Vencord location rejected: $problem (${UrlNormalizer.redactForLog(vencordLocation)})")
-            return
-        }
-        safeExecute {
-            var resp: Response? = null
-            try {
-                val act = activity.get() ?: return@safeExecute
-                val vendroidFile = File(act.filesDir, "vencord.js")
-                resp = HttpClient.executeVencordGetResolvingRedirect(vencordLocation, null)
-                if (resp.code !in 200..299) {
-                    throw IOException("HTTP ${resp.code} updating Vencord bundle")
-                }
-                // The shared writer handles sanity checks, patching, the
-                // atomic install, and the ETag / patch bookkeeping.
-                // VencordRuntime intentionally stays stale; the new bundle
-                // applies on restart.
-                HttpClient.downloadStoreAndSync(
-                    resp, vendroidFile, sPrefs,
-                    publishToRuntime = false,
-                    bundleLocation = vencordLocation
-                )
-                act.runOnUiThread {
-                    act.showDiscordToast("Updated Vencord, restart to apply changes!", "SUCCESS")
-                }
-            } catch (ex: Exception) {
-                activity.get()?.let { VDELog.e("VN", "Failed to update Vencord", ex) }
-            } finally {
-                // Close to return the pooled connection (not disconnect()).
-                resp?.close()
-            }
-        }
-    }
-
-    @JavascriptInterface
-    fun updateVendroid(token: String?) {
-        // Mirrors updateVencord: strict domain gate + rate limit before any
-        // network work. The update check is informational only — this app has no
-        // self-update installer, so it surfaces a toast telling the user to grab
-        // the new build from the project page.
-        if (!isBridgeAuthorized(token)) return
-        if (!isOnDiscordDomainStrict()) return
-        if (!rateLimitWrite("updateVendroid", 5 * 60 * 1_000_000_000L)) return
-        safeExecute {
-            var resp: Response? = null
-            try {
-                // Placeholder endpoint — replace with the real update manifest.
-                resp = HttpClient.fetch("https://vde-builds.nin0.dev/vendroid/version.json")
-                val body = HttpClient.readAsText(resp.body.byteStream())
-                val latest = org.json.JSONObject(body).optInt("versionCode", 0)
-                val act = activity.get() ?: return@safeExecute
-                act.runOnUiThread {
-                    if (latest > com.nin0dev.vendroid.BuildConfig.VERSION_CODE) {
-                        act.showDiscordToast("VendroidEnhanced update available", "INFO")
-                    } else {
-                        act.showDiscordToast("VendroidEnhanced is up to date", "SUCCESS")
-                    }
-                }
-            } catch (ex: Exception) {
-                VDELog.e("VN", "updateVendroid failed", ex)
-                val act = activity.get()
-                act?.runOnUiThread {
-                    act.showDiscordToast("Update check failed", "ERROR")
-                }
-            } finally {
-                // Close to return the pooled connection (not disconnect()).
-                resp?.close()
-            }
-        }
-    }
-
-    @JavascriptInterface
     fun getString(token: String?, id: String?, defaultValue: String?): String {
         if (!isBridgeAuthorized(token)) return defaultValue ?: ""
         val safeId = id ?: return defaultValue ?: ""
         val safeDefault = defaultValue ?: ""
-        // Single access route for CSS cache values — delegate to getCssCache
+        // Single access route for CSS cache values: delegate to getCssCache
         // rather than reading the dedicated cache prefs a second way here.
         if (safeId.startsWith("css_cache_")) return getCssCache(token, safeId) ?: safeDefault
         return guardedPrefs("getString", safeId, safeDefault, false, false) { prefs ->
@@ -932,7 +649,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // change the verdict.
         if (!isBridgeAuthorized(token)) return
         val rawId = id?.trim()
-        val safeId = rawId?.let { r -> ICON_NAMES.find { it.equals(r, ignoreCase = true) } }
+        val safeId = rawId?.let { r -> IconAliasManager.ICON_NAMES.find { it.equals(r, ignoreCase = true) } }
         if (rawId == null || safeId == null) {
             val a = activity.get()
             // rawId is page-controlled and unbounded, and lands in a Toast
@@ -948,25 +665,25 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         }
         val act = activity.get() ?: return
         try {
-            synchronized(iconLock) {
+            synchronized(IconAliasManager.iconLock) {
                 // Verify the cache against PM before trusting it, so the guard
                 // and oldIcon below are truthful. Runs even on the
                 // already-active path so re-selecting the same icon cleans up
                 // leftover aliases.
                 try {
-                    reconcileIconState(act)
+                    IconAliasManager.reconcileIconState(act)
                 } catch (t: Throwable) {
                     // Reads inside are exception-safe; this is only a safety
                     // net so a bridge method can never crash the process.
                     VDELog.e("VN", "changeAppIcon: icon state reconcile failed", t)
                 }
-                if (safeId == currentIcon) {
+                if (safeId == IconAliasManager.currentIcon) {
                     act.runOnUiThread {
                         Toast.makeText(act, "Icon '$safeId' is already active", Toast.LENGTH_SHORT).show()
                     }
                     return
                 }
-                val oldIcon = currentIcon
+                val oldIcon = IconAliasManager.currentIcon
                 if (oldIcon == null) {
                     // Reconcile failed to establish a baseline (it logs the
                     // reason). Guessing "Main" could disable the alias about
@@ -984,16 +701,16 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 // Enable first: while both aliases are briefly enabled the
                 // launcher still has an entry; disabling first could leave none.
                 pm.setComponentEnabledSetting(
-                    iconComponent(pkg, safeId),
+                    IconAliasManager.iconComponent(pkg, safeId),
                     PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
                     PackageManager.DONT_KILL_APP
                 )
                 // The new alias is live in the launcher from here on, so the
                 // cache must claim it now, even if the cleanup below fails.
-                currentIcon = safeId
+                IconAliasManager.currentIcon = safeId
                 fun disableOld(): Boolean = try {
                     pm.setComponentEnabledSetting(
-                        iconComponent(pkg, oldIcon),
+                        IconAliasManager.iconComponent(pkg, oldIcon),
                         PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
                         PackageManager.DONT_KILL_APP
                     )
@@ -1030,9 +747,22 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         }
     }
 
+    /**
+     * Read-only counterpart to [changeAppIcon] for the settings-tab icon
+     * picker; reports the resolved launcher alias so the picker can
+     * preselect the active icon. The cache is reconciled at bridge
+     * construction (initCurrentIcon), so a null means reconcile failed:
+     * report the manifest default rather than guess a stale alias.
+     */
+    @JavascriptInterface
+    fun getCurrentAppIcon(token: String?): String {
+        if (!isBridgeAuthorized(token)) return "Main"
+        return synchronized(IconAliasManager.iconLock) { IconAliasManager.currentIcon } ?: "Main"
+    }
+
     @JavascriptInterface
     fun openQuickCss(token: String?, quickCss: String?) {
-        // Strict check — this opens a WebView with a JS interface, so a
+        // Strict check: this opens a WebView with a JS interface, so a
         // non-Discord whitelisted page must not invoke it. Called directly by
         // the required vendroidEnhancements plugin, which passes the current
         // QuickCSS from IndexedDB.
@@ -1234,7 +964,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 if (mainWv == null) {
                     // No main WebView: the CSS cannot be saved. Keep the
                     // editor open so the user's edits survive.
-                    VDELog.e("VN", "quickCssSet: main WebView unavailable — QuickCSS not saved")
+                    VDELog.e("VN", "quickCssSet: main WebView unavailable, QuickCSS not saved")
                     Toast.makeText(
                         activity,
                         "Couldn't save QuickCSS: main app window unavailable. Your edits are kept.",
@@ -1256,7 +986,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                             VDELog.e("VN", "quickCssSet: save not confirmed (evaluateJavascript result: $result)")
                             Toast.makeText(
                                 activity,
-                                "Couldn't save QuickCSS — Vencord isn't ready in the main window. Your edits are kept.",
+                                "Couldn't save QuickCSS: Vencord isn't ready in the main window. Your edits are kept.",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
@@ -1267,7 +997,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     VDELog.e("VN", "quickCssSet: evaluateJavascript failed", t)
                     Toast.makeText(
                         activity,
-                        "Couldn't save QuickCSS — Vencord isn't ready in the main window. Your edits are kept.",
+                        "Couldn't save QuickCSS: Vencord isn't ready in the main window. Your edits are kept.",
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -1373,7 +1103,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     private fun openFirewallEditor() {
-        // Strict check — this mutates the firewall config, so a non-Discord
+        // Strict check: this mutates the firewall config, so a non-Discord
         // page must not invoke it even if currentHostForBridge is stale.
         if (!isOnDiscordDomainStrict()) return
         val act = activity.get() ?: return

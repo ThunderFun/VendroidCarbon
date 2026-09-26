@@ -93,145 +93,6 @@ class VWebviewClient(
             dataUrl.startsWith("data:text/css", ignoreCase = true) ||
             dataUrl.startsWith("data:application/octet-stream", ignoreCase = true)
 
-    private val disableHighlightCss = "html{-webkit-tap-highlight-color:transparent}a,button,[role=\"button\"],input,textarea,select,[tabindex]:not([tabindex=\"-1\"]){outline:none}"
-
-    private val disableHighlightTag = "<style id=\"vendroid-disable-highlight\">$disableHighlightCss</style>"
-
-    /**
-     * Result of [injectFirewallAndCss].
-     *
-     * [runtimeEmbedded] reflects the same snapshot that performed the embed,
-     * so it always matches the served HTML. Callers must claim
-     * runtimeEmbeddedUrls from this flag, never from a fresh re-read of the
-     * HttpClient statics: a preload publishing between the embed snapshot and
-     * a re-read would claim runtimes the HTML lacks, and onPageStarted would
-     * then skip its typeof probe and missedInjection recovery.
-     */
-    private class InjectionResult(
-        val html: String?,
-        val runtimeEmbedded: Boolean
-    )
-
-    /**
-     * Injects the JS network firewall, CSP violation reporter, disable-highlight
-     * CSS, and — when both runtimes are in memory — the Vencord runtimes into a
-     * Discord main-frame shell at `</head>`.
-     *
-     * The runtimes are only embedded on Discord main-frames (matching the
-     * trust gate in [onPageStarted]); they must never run on whitelisted
-     * non-Discord pages, which would expose the bridge object. All blocks are
-     * inserted at a single `headIdx` from the ORIGINAL text, with the style
-     * placed first: the downloaded runtime may itself contain a literal
-     * `</head>`, so re-scanning the patched string could relocate the style
-     * into script text where it is never applied. Runtime content is escaped
-     * via [escapeScriptTagContent] so neither a `</script>` nor a `<!--` can
-     * stop the inline tag from terminating.
-     *
-     * @return an [InjectionResult] whose [InjectionResult.html] is the patched
-     *   HTML, or null when no `</head>` was found (callers serve the unpatched
-     *   body). A non-null html may still lack the runtime scripts;
-     *   [InjectionResult.runtimeEmbedded] is the embed verdict for that body.
-     */    private fun injectFirewallAndCss(
-        text: String,
-        urlString: String,
-        isDiscordMainFrame: Boolean
-    ): InjectionResult {
-        val headIdx = findHeadCloseIndex(text)
-        if (headIdx < 0) return InjectionResult(null, false)
-        // Gate on the local snapshot, not a fresh static re-read: a re-read of
-        // the statics here could race a mid-session null (clientMod switch)
-        // against the !! uses below. Callers propagate runtimeReady as the
-        // embed verdict (see InjectionResult).
-        val runtime = HttpClient.VencordRuntime
-        val mobileRuntime = HttpClient.VencordMobileRuntime
-        val runtimeReady = isDiscordMainFrame && !HttpClient.vencordDisabled &&
-            runtime != null && mobileRuntime != null
-        val firewallJs = JsPatches.NETWORK_FIREWALL_JS
-        val animJs = JsPatches.ANIMATION_PATCH_JS
-        val cspJs = JsPatches.CSP_VIOLATION_REPORTER_JS
-        val sb = StringBuilder(
-            text.length + firewallJs.length + animJs.length + cspJs.length +
-                (runtime?.length ?: 0) + (mobileRuntime?.length ?: 0) + 256
-        )
-        sb.append(text, 0, headIdx)
-        sb.append(disableHighlightTag)
-        // Embedded form of STARTUP_PATCHES_JS, so the patches run at parse
-        // time. The payload sets must match: once the embed is recorded,
-        // onPageStarted skips the evaluateJavascript fallback, so a patch
-        // missing from this tag never runs on the common path. The animation
-        // patch was once omitted here, and the background visibility spoof
-        // silently no-opped on every load. These strings go in raw; none may
-        // contain "</script" or "<!--".
-        sb.append("<script>$firewallJs;$animJs;$cspJs</script>")
-        if (runtimeReady) {
-            sb.append("<script>")
-                .append(escapeScriptTagContent(VencordNative.bridgeBootstrapJs()))
-                .append("</script>")
-                // Env shim must precede the bundle (see VENCORD_PRELUDE_JS).
-                .append("<script>").append(JsPatches.VENCORD_PRELUDE_JS).append(';')
-                .append(escapedRuntimeOf(runtime!!)).append(';')
-                .append(escapedMobileRuntimeOf(mobileRuntime!!)).append(";</script>")
-        }
-        sb.append(text, headIdx, text.length)
-        return InjectionResult(sb.toString(), runtimeReady)
-    }
-
-    /**
-     * Identity-keyed cache for escapeScriptTagContent(). The runtime strings
-     * held by HttpClient are ~1 MB and immutable until replaced, so keying on
-     * reference identity avoids re-scanning/re-copying them on every cached
-     * main-frame serve. A replaced runtime (clientMod switch, update) gets a
-     * new String instance, which misses the cache exactly once.
-     */    private class EscapedJs(val raw: String, val escaped: String)
-
-    @Volatile
-    private var escapedRuntime: EscapedJs? = null
-
-    @Volatile
-    private var escapedMobileRuntime: EscapedJs? = null
-
-    private fun escapedRuntimeOf(raw: String): String {
-        escapedRuntime?.let { if (it.raw === raw) return it.escaped }
-        val e = EscapedJs(raw, escapeScriptTagContent(raw))
-        escapedRuntime = e
-        return e.escaped
-    }
-
-    private fun escapedMobileRuntimeOf(raw: String): String {
-        escapedMobileRuntime?.let { if (it.raw === raw) return it.escaped }
-        val e = EscapedJs(raw, escapeScriptTagContent(raw))
-        escapedMobileRuntime = e
-        return e.escaped
-    }
-
-    /**
-     * Finds the real closing `</head>`, skipping matches inside raw-text
-     * elements (script, style, textarea, title) or HTML comments, where the
-     * literal text may legally appear. Returns -1 when none is found, in
-     * which case callers degrade to bridge injection in onPageStarted.
-     */
-    private fun findHeadCloseIndex(text: String): Int {
-        val rawTextOpeners = arrayOf("<script", "<style", "<textarea", "<title")
-        val rawTextClosers = arrayOf("</script", "</style", "</textarea", "</title")
-        var from = 0
-        while (true) {
-            val headIdx = text.indexOf("</head>", from, ignoreCase = true)
-            if (headIdx < 0) return -1
-            var hidden = false
-            for (i in rawTextOpeners.indices) {
-                val open = text.lastIndexOf(rawTextOpeners[i], headIdx, ignoreCase = true)
-                if (open < 0) continue
-                val close = text.lastIndexOf(rawTextClosers[i], headIdx, ignoreCase = true)
-                if (close < open) { hidden = true; break }
-            }
-            val commentOpen = text.lastIndexOf("<!--", headIdx)
-            val commentClose = text.lastIndexOf("-->", headIdx)
-            if (commentOpen > commentClose) hidden = true
-            if (!hidden) return headIdx
-            from = headIdx + 1
-        }
-    }
-
     override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
         val activity = activityRef.get()
         (activity as? com.nin0dev.vendroid.MainActivity)?.let {
@@ -244,7 +105,7 @@ class VWebviewClient(
 
         // If shouldInterceptRequest already embedded the firewall (and possibly
         // the runtimes) into this URL's HTML, skip the evaluateJavascript
-        // calls — the embedded scripts run at parse time. Otherwise inject the
+        // calls. The embedded scripts run at parse time. Otherwise inject the
         // combined firewall + animation patches in a single IPC call.
         if (!consumeFirewallEmbedded(url)) {
             view.evaluateJavascript(JsPatches.STARTUP_PATCHES_JS, null)
@@ -258,7 +119,7 @@ class VWebviewClient(
         }
         view.evaluateJavascript("typeof Vencord!=='undefined'&&typeof VencordMobile!=='undefined'") { result ->
             if (result?.trim() == "true") return@evaluateJavascript
-            // Bail if the hosting activity is gone — the WebView may have been
+            // Bail if the hosting activity is gone. The WebView may have been
             // destroyed (onDestroy), and calling evaluateJavascript on a
             // destroyed WebView throws IllegalStateException. This callback runs
             // asynchronously, so it can fire after onDestroy despite being
@@ -355,10 +216,10 @@ class VWebviewClient(
         // never read from disk here: shouldInterceptRequest runs on the
         // Chromium network thread, and a blocking read would stall the shared
         // worker.
-        val cached: MainFrameDiskCache.CachedMainFrame? = inMemoryShell(urlString)
+        val cached: MainFrameDiskCache.CachedMainFrame? = StaleMainFrame.inMemoryShell(urlString)
         val shell = cached ?: return null
         val text = try { String(shell.body, Charsets.UTF_8) } catch (_: Exception) { return null }
-        val result = injectFirewallAndCss(text, urlString, isDiscordMainFrame = true)
+        val result = ResponseHtmlInjector.injectFirewallAndCss(text, urlString, isDiscordMainFrame = true)
         val patched = result.html
         // No `</head>` (patched == null): serve the unpatched body and let
         // onPageStarted apply the scripts via the bridge.
@@ -366,7 +227,7 @@ class VWebviewClient(
 
         // Record that this URL's HTML already has the firewall/runtime
         // embedded so onPageStarted skips re-injecting them. Only claim
-        // "embedded" when it actually was — otherwise onPageStarted would skip
+        // "embedded" when it actually was. Otherwise onPageStarted would skip
         // its evaluateJavascript fallback and the page would run with no JS
         // firewall (fail-open). On overflow, clear so a new navigation is
         // still tracked. The removes drop claims stranded by a load aborted
@@ -692,7 +553,7 @@ class VWebviewClient(
                     val text = String(cached.body, Charsets.UTF_8)
                     // Derived from the request URL, not hardcoded: keep the
                     // serve path safe even if a cache writer misses its gate.
-                    val result = injectFirewallAndCss(
+                    val result = ResponseHtmlInjector.injectFirewallAndCss(
                         text, urlString,
                         isDiscordMainFrame = Constants.isDiscordAppOrigin(req.url.host ?: "")
                     )
@@ -960,7 +821,7 @@ class VWebviewClient(
             )
         } catch (_: Exception) {
             // Serving fewer bytes than Content-Length promises makes Chromium
-            // wait for bytes that never arrive — drop the framing headers.
+            // wait for bytes that never arrive, so drop the framing headers.
             modifiedHeaders.remove("content-length")
             modifiedHeaders.remove("content-encoding")
             ByteArray(0)
@@ -1005,7 +866,7 @@ class VWebviewClient(
             if (ctLower.contains("text/html")) {
                 try {
                     val text = bodyBytes.toString(Charsets.UTF_8)
-                    val result = injectFirewallAndCss(text, urlString, isDiscordMainFrame = isAppOrigin)
+                    val result = ResponseHtmlInjector.injectFirewallAndCss(text, urlString, isDiscordMainFrame = isAppOrigin)
                     val patched = result.html
                     if (patched != null && patched !== text) {
                         bodyBytes = patched.toByteArray(Charsets.UTF_8)
@@ -1088,9 +949,9 @@ class VWebviewClient(
                         val refreshed = MainFrameDiskCache.CachedMainFrame(
                             rawBodyBytes, reasonPhrase, headersToCache, System.currentTimeMillis()
                         )
-                        val shells = HashMap(preloadedShells)
+                        val shells = HashMap(StaleMainFrame.preloadedShells)
                         shells[urlString] = refreshed
-                        preloadedShells = shells
+                        StaleMainFrame.preloadedShells = shells
                     }
                 }
             }
@@ -1229,7 +1090,7 @@ class VWebviewClient(
         private val runtimeEmbeddedUrls = ConcurrentHashMap.newKeySet<String>()
         private const val MAX_RUNTIME_TRACKED = 16
 
-        // Privacy filter — blocks Discord telemetry, Sentry, fingerprinting,
+        // Privacy filter: blocks Discord telemetry, Sentry, fingerprinting,
         // and (optionally) typing indicators at the path level. Shared by
         // VWebviewClient.shouldInterceptRequest and the Service Worker client
         // in MainActivity so SW-fetched requests can't bypass it.
@@ -1375,7 +1236,7 @@ class VWebviewClient(
             //
             // NOTE: data:image/ is kept broad (not restricted to png/jpeg/etc.)
             // because as a SUBRESOURCE (<img>), data:image/svg+xml does NOT
-            // execute scripts — Discord relies on it for avatars/icons. The
+            // execute scripts. Discord relies on it for avatars/icons. The
             // SVG-script-execution risk applies only in navigation/subframe
             // contexts, handled by shouldOverrideUrlLoading.
             if (scheme == "data") {
@@ -1433,9 +1294,9 @@ class VWebviewClient(
             // Forge hosts are only trusted for user-theme CSS. Block all other
             // subresources so attacker content on those hosts can't exfiltrate.
             //
-            // Note: the CSS itself isn't inert — attribute-selector + url()
+            // Note: the CSS itself isn't inert. Attribute-selector + url()
             // exfiltration to a .css endpoint on an allowlisted forge host is
-            // possible. Accepted trust trade-off of remote-theme support.
+            // possible. Accepted as a trust trade-off of remote-theme support.
             if (lowerHost != null && isForgeHostCompanion(lowerHost)) {
                 val isCss = path?.endsWith(".css") == true
                 if (!isCss) return true
@@ -1455,88 +1316,15 @@ class VWebviewClient(
         private val diskCacheExecutor: java.util.concurrent.Executor =
             java.util.concurrent.Executors.newSingleThreadExecutor()
 
-        // Preloaded raw shells for every URL persisted last session (keyed by URL).
-        // Populated off-thread at cold start so shouldInterceptRequest never has
-        // to touch disk on the Chromium network thread. Written off-thread, read
-        // on the network thread → guarded by @Volatile (map replaced atomically).
-        @Volatile
-        private var preloadedShells: Map<String, MainFrameDiskCache.CachedMainFrame> = emptyMap()
-
-        /** Preloads all cached shells into memory. Called off-thread at cold start. */
-        fun preloadMainFrameCache() {
-            val shells = HashMap<String, MainFrameDiskCache.CachedMainFrame>()
-            for (url in MainFrameDiskCache.preloadableUrls()) {
-                val cached = MainFrameDiskCache.readMainFrame(url) ?: continue
-                shells[url] = cached
-            }
-            preloadedShells = shells
-        }
-
-        /** Drops the in-memory preloaded shells. Called by [MainFrameDiskCache.clear]. */
-        fun clearPreloadedShells() {
-            preloadedShells = emptyMap()
-        }
-
-        /** Looks up a shell from the in-memory preload, or null. */
-        private fun inMemoryShell(urlString: String): MainFrameDiskCache.CachedMainFrame? {
-            val shells = preloadedShells
-            val entry = shells[urlString]
-            if (entry == null || entry.body.isEmpty() ||
-                System.currentTimeMillis() - entry.fetchedAt > MainFrameDiskCache.MAX_AGE_MS
-            ) {
-                return null
-            }
-            return entry
-        }
+        // Delegates: the preloaded-shell store moved to StaleMainFrame;
+        // VendroidApp and MainFrameDiskCache call through VWebviewClient.
+        fun preloadMainFrameCache() = StaleMainFrame.preloadMainFrameCache()
+        fun clearPreloadedShells() = StaleMainFrame.clearPreloadedShells()
     }
 }
 
-/**
- * Escapes [s] for safe inlining inside an HTML `<script>` block by replacing
- * `</script` (case-insensitive) with `<\/script` and `<!--` with `<\!--`. The
- * parser no longer recognizes either sequence, while `\/` and `\!` evaluate
- * to `/` and `!` at runtime, so JS string and template-literal contents are
- * unchanged. (`\!` is a SyntaxError inside `u`-flagged regexes; the vendored
- * snapshot only has `<!--` inside a template literal.)
- *
- * `<!--` cannot end the element, but it puts the tokenizer into the
- * script-data escaped state, where a later `<script` enters the
- * double-escaped state. There the element's own `</script>` closer no longer
- * ends the tag. The rest of the document is swallowed as script text and the
- * embedded payload never runs. Bundles legitimately carry both sequences, so
- * both are escaped here rather than assumed absent. With `<!--` neutralized
- * the tokenizer never leaves plain script-data state, so bare `<script` is
- * inert and needs no rewriting.
- *
- * Scans [s] itself with ignoreCase matching, never a lowercased copy:
- * lowercasing can change string length (İ U+0130 becomes i + U+0307), so
- * offsets taken from the copy slice [s] at wrong positions, corrupting
- * the tail or leaving `</script` unescaped. Returns [s] itself when neither
- * token occurs, so clean payloads skip the copy.
- *
- * Internal so the contract tests in EscapeScriptTagContentTest can pin both
- * escapes.
- */
-internal fun escapeScriptTagContent(s: String): String {
-    var sb: StringBuilder? = null
-    var i = 0
-    while (true) {
-        val nextScript = s.indexOf("</script", i, ignoreCase = true)
-        val nextComment = s.indexOf("<!--", i)
-        val next = when {
-            nextScript < 0 -> nextComment
-            nextComment < 0 -> nextScript
-            else -> minOf(nextScript, nextComment)
-        }
-        if (next < 0) break
-        if (sb == null) sb = StringBuilder(s.length + 16)
-        if (next == nextScript) {
-            sb.append(s, i, next).append("<\\/script")
-            i = next + "</script".length
-        } else {
-            sb.append(s, i, next).append("<\\!--")
-            i = next + "<!--".length
-        }
-    }
-    return sb?.append(s, i, s.length)?.toString() ?: s
-}
+
+// Delegates to ResponseHtmlInjector; kept top-level so
+// EscapeScriptTagContentTest can call it unqualified.
+internal fun escapeScriptTagContent(s: String): String =
+    ResponseHtmlInjector.escapeScriptTagContent(s)

@@ -36,13 +36,11 @@ object FirewallConfig {
                 "codeberg.org", ".codeberg.org",
                 "codeberg.page", ".codeberg.page",
                 "githack.com", ".githack.com",
-                "vencord.dev", ".vencord.dev",
-                "git.nin0.dev", ".git.nin0.dev",
-                "vde-builds.nin0.dev", ".vde-builds.nin0.dev",
-                // Vendroid's own API (About-panel contributor list): the CSP
-                // allows it; without this entry the JS firewall rejects the fetch.
-                "vendroid.nin0.dev", ".vendroid.nin0.dev"
+                "vencord.dev", ".vencord.dev"
             )
+            // The retired operator hosts (git.nin0.dev, vde-builds.nin0.dev,
+            // vendroid.nin0.dev) stay removed: github.com and
+            // githubusercontent.com now serve the bundle and CSS.
         ),
         HCAPTCHA(
             "hcaptcha", "hCaptcha (login captcha)",
@@ -57,7 +55,7 @@ object FirewallConfig {
             listOf("cdn.jsdelivr.net", ".cdn.jsdelivr.net", "jsdelivr.net", ".jsdelivr.net")
         ),
 
-        // Third-party embed providers — disabled by default.
+        // Third-party embed providers. Disabled by default.
 
         YOUTUBE(
             "youtube", "YouTube (video embeds)",
@@ -249,7 +247,7 @@ object FirewallConfig {
     /** Persist a complete config update. Returns false if input was malformed. */
     fun save(disabledCats: Set<String>): Boolean {
         val p = prefs ?: return false
-        // Locked categories can never be disabled — drop any attempt to do so.
+        // Locked categories can never be disabled, so drop any attempt to do so.
         val validCats = disabledCats.filter { Category.fromId(it)?.locked == false }.toSet()
         p.edit()
             .putStringSet(KEY_DISABLED_CATEGORIES, validCats)

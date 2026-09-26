@@ -5,20 +5,36 @@ import java.util.concurrent.ConcurrentHashMap
 object Constants {
     /**
      * The Vencord/Equicord bundle and prefetched CSS are fetched over HTTPS
-     * from vde-builds.nin0.dev and raw.githubusercontent.com/VendroidEnhanced/...
-     * without SRI/signature verification, so updates need no per-build signing.
-     * Compromise of either host injects arbitrary code into every Discord
-     * session; the operator is the root of trust.
+     * from GitHub release URLs (github.com .../releases/latest/download/...)
+     * without SRI/signature verification, so updates need no per-build
+     * signing. Compromise of either GitHub's release pipeline or the CDN
+     * (release-assets.githubusercontent.com) injects arbitrary code into
+     * every Discord session; GitHub's release infrastructure is the root
+     * of trust. See SECURITY_TRACKER.md.
      */
-    const val JS_BUNDLE_URL = "https://vde-builds.nin0.dev/vencord/browser.js"
-    const val EQUICORD_BUNDLE_URL = "https://vde-builds.nin0.dev/equicord/browser.js"
+    const val JS_BUNDLE_URL =
+        "https://github.com/Vendicated/Vencord/releases/latest/download/browser.js"
+    const val EQUICORD_BUNDLE_URL =
+        "https://github.com/Equicord/Equicord/releases/latest/download/browser.js"
 
-    // The bundle is arbitrary code executed in the Discord origin; it may only
-    // be fetched from the operator-controlled build host.
-    // User/attacker-controlled hosts (github, gists, github.io, codeberg) are
-    // never permitted, even for a custom bundle URL.
+    /** CSS twin of [JS_BUNDLE_URL], published as a release asset on the
+     *  same rolling tag; prefetched natively and injected by
+     *  vencord_mobile.js on every page load. */
+    const val VENCORD_CSS_URL =
+        "https://github.com/Vendicated/Vencord/releases/latest/download/browser.css"
+    const val EQUICORD_CSS_URL =
+        "https://github.com/Equicord/Equicord/releases/latest/download/browser.css"
+
+    // The bundle is arbitrary code executed in the Discord origin; it may
+    // only be fetched from GitHub's release infrastructure. Both hosts are
+    // needed because /releases/latest/download/... 302-hops through
+    // github.com (releases/download/<tag>/...) onto the
+    // release-assets.githubusercontent.com CDN, and HttpClient re-validates
+    // every redirect hop against this set. User-controlled hosts (gists,
+    // github.io, codeberg) are never permitted, even for a custom URL.
     private val VENCORD_ALLOWED_HOSTS = hashSetOf(
-        "vde-builds.nin0.dev"
+        "github.com",
+        "release-assets.githubusercontent.com"
     )
 
     private val domainCache = BoundedHostCache()
@@ -58,7 +74,7 @@ object Constants {
 
     // Main-frame navigation allowlist: app origins plus hosts that navigate
     // in-app (discord.gg invites, Discord Activity hosts). Excludes raw-content
-    // CDN hosts (cdn.discordapp.com, media.discordapp.net) — those render as a
+    // CDN hosts (cdn.discordapp.com, media.discordapp.net). Those render as a
     // bare media document with no in-app back path, so they route to the popup.
     // Subresource loads (e.g. <img>) are governed separately by the firewall.
     fun isNavigationAllowedDomain(host: String): Boolean {
@@ -127,7 +143,7 @@ object Constants {
         }
 
     /**
-     * True only for the Discord web-app origins — the hosts that serve the web
+     * True only for the Discord web-app origins, the hosts that serve the web
      * client and legitimately receive the bridge runtimes and capability token.
      * Deliberately narrower than [isDiscordDomain]: subdomains such as
      * cdn.discordapp.com / media.discordapp.net are Discord-owned but must

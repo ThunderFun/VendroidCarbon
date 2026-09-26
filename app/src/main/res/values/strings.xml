@@ -5,8 +5,6 @@
     <string name="autocheck_vencord">Automatically update Vencord (Coming soon)</string>
     <string name="autocheck_vendroid">Automatically check for Vendroid updates</string>
     <string name="updates_title">Updates</string>
-    <!-- TODO: Remove or change this placeholder text -->
-    <string name="hello_blank_fragment">Hello blank fragment</string>
     <string name="discord_branch">Discord branch</string>
     <string name="stable">Stable</string>
     <string name="ptb">PTB</string>

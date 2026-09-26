@@ -127,7 +127,7 @@ class UrlNormalizerTest {
     // ------------------------------------------------------------------
 
     @Test fun mixedScript_latinAndCyrillic() {
-        // 'p' + Cyrillic 'а' + 'y' — homograph-style mix.
+        // 'p' + Cyrillic 'а' + 'y', a homograph-style mix.
         assertTrue(UrlNormalizer.containsMixedScript("pаypal"))
     }
 
@@ -144,7 +144,7 @@ class UrlNormalizerTest {
     }
 
     @Test fun mixedScript_latinAndCjkNotFlagged() {
-        // Latin + CJK is fine — CJK has no Latin confusables.
+        // Latin + CJK is fine. CJK has no Latin confusables.
         assertFalse(UrlNormalizer.containsMixedScript("hello中文"))
     }
 
@@ -281,7 +281,7 @@ class UrlNormalizerTest {
     }
 
     @Test fun normalize_nullSchemeNotMalformedButRejectedByCaller() {
-        // A Uri with no scheme — normalize should still produce something,
+        // A Uri with no scheme: normalize should still produce something,
         // and the caller (LinkHandler) rejects non-http(s) schemes.
         val uri = Uri.parse("javascript:alert(1)")
         val n = UrlNormalizer.normalize(uri)

@@ -76,7 +76,7 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         if (message.startsWith("[Vendroid]") || message.startsWith("[VDE]")) {
             val host = activityRef.get()?.currentHostForBridge
             if (host == null || !com.nin0dev.vendroid.utils.Constants.isDiscordAppOrigin(host)) {
-                // Drop without persisting — emitted by a non-app-origin page.
+                // Drop without persisting: emitted by a non-app-origin page.
                 return true
             }
             val level = when (msg.messageLevel()) {
@@ -85,7 +85,7 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
                 else -> VDELog.Level.INFO
             }
             VDELog.log(level, "JS", message)
-            // Do not also call Logger — that would double-log to VDELog.
+            // Do not also call Logger. That would double-log to VDELog.
             return true
         }
 
@@ -227,7 +227,7 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         }
 
         fullscreenContainer.visibility = View.GONE
-        // Restore to default layer type — the view is being removed, so
+        // Restore to default layer type: the view is being removed, so
         // the GPU texture it held can be released.
         localCustomView?.setLayerType(View.LAYER_TYPE_NONE, null)
         fullscreenContainer.removeView(localCustomView)

@@ -8,6 +8,7 @@ import android.view.View
 import android.webkit.WebView
 import com.nin0dev.vendroid.webview.HttpClient
 import com.nin0dev.vendroid.webview.clearBundleIdentityKeys
+import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.VDELog
 import java.io.File
@@ -221,11 +222,14 @@ class VendroidApp : Application() {
                     try {
                         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
                         val cssPrefs = getSharedPreferences("css_cache", Context.MODE_PRIVATE)
-                        val isEquicord = sPrefs.getString("clientMod", "vencord") == "equicord"
+                        val isEquicord = runCatching {
+                            sPrefs.getString("clientMod", "vencord") == "equicord"
+                        }.onFailure {
+                            VDELog.w("VDE", "clientMod type-poisoned; CSS prefetch assumes vencord")
+                        }.getOrDefault(false)
                         val cssUrls = listOf(
-                            if (isEquicord) "https://vde-builds.nin0.dev/equicord/browser.css"
-                            else "https://vde-builds.nin0.dev/vencord/browser.css",
-                            "https://raw.githubusercontent.com/VendroidEnhanced/random-files/refs/heads/main/moreFixes.css"
+                            if (isEquicord) Constants.EQUICORD_CSS_URL else Constants.VENCORD_CSS_URL,
+                            MORE_FIXES_CSS_URL
                         )
                         val editor = cssPrefs.edit()
                         val now = System.currentTimeMillis()
@@ -256,22 +260,20 @@ class VendroidApp : Application() {
                                 VDELog.w("VDE", "CSS prefetch rejected non-HTTPS URL: $url")
                                 continue
                             }
-                            // Use the shared pooled OkHttp client (reuses
-                            // TCP/TLS sessions) instead of a fresh
-                            // HttpURLConnection. sharedClient never auto-follows
-                            // redirects, so a 3xx surfaces as a code and is
-                            // rejected below, matching the old
-                            // instanceFollowRedirects=false behavior.
-                            HttpClient.sharedClient.newCall(
-                                okhttp3.Request.Builder().url(url).build()
-                            ).execute().use { resp ->
+                            // GitHub release URLs 302-hop (github.com →
+                            // release-assets.githubusercontent.com) and the
+                            // shared client never auto-follows redirects, so
+                            // the prefetch resolves them itself and
+                            // re-validates each hop against the bundle host
+                            // allowlist. A bare 3xx check would silently
+                            // disable the CSS cache and push every page load
+                            // onto the slower in-page fetch.
+                            HttpClient.executeVencordGetResolvingRedirect(url, null).use { resp ->
                                 val code = resp.code
                                 if (code in 200..299) {
                                     val css = HttpClient.readAsText(resp.body.byteStream())
                                     editor.putString(key, css)
                                     editor.putLong("${key}_ts", now)
-                                } else if (code in 300..399) {
-                                    VDELog.w("VDE", "CSS prefetch rejected redirect ($code) from $url")
                                 } else {
                                     VDELog.w("VDE", "CSS prefetch HTTP $code from $url")
                                 }
@@ -289,6 +291,40 @@ class VendroidApp : Application() {
                 }
                 }.start()
             }
+
+            // 3b. Sweep stale CSS cache entries. Keys are URL-hash addressed
+            // (css_cache_vde_<url.hashCode>), so entries written for retired
+            // hosts (vde-builds.nin0.dev) are never read again and would
+            // linger forever. Remove everything the current URL set would
+            // not produce; the prefetch above (or the in-page fallback)
+            // repopulates. Runs unconditionally, not gated on the risk
+            // warning or safe mode: local-only prefs work, no network.
+            Thread {
+                try {
+                    val cssPrefs = getSharedPreferences("css_cache", Context.MODE_PRIVATE)
+                    val isEquicord = runCatching {
+                        bootPrefs.getString("clientMod", "vencord") == "equicord"
+                    }.getOrDefault(false)
+                    val expectedKeys = setOf(
+                        "css_cache_vde_" + (if (isEquicord) Constants.EQUICORD_CSS_URL else Constants.VENCORD_CSS_URL).hashCode(),
+                        "css_cache_vde_" + MORE_FIXES_CSS_URL.hashCode()
+                    )
+                    val editor = cssPrefs.edit()
+                    var removed = 0
+                    for (key in cssPrefs.all.keys) {
+                        if (key.startsWith("css_cache_vde_") && key !in expectedKeys) {
+                            editor.remove(key)
+                            removed++
+                        }
+                    }
+                    if (removed > 0) {
+                        editor.apply()
+                        VDELog.i("VDE", "CSS cache sweep removed $removed stale entr${if (removed == 1) "y" else "ies"}")
+                    }
+                } catch (ex: Exception) {
+                    VDELog.e("VDE", "CSS cache sweep failed", ex)
+                }
+            }.start()
 
             // 4. Warm up the Chromium cookie DB so MainActivity does not pay
             // the cost on its first CookieManager.getInstance() call.
@@ -318,6 +354,12 @@ class VendroidApp : Application() {
         @Volatile
         var prewarmedWebView: WebView? = null
             internal set
+
+        /** Shared moreFixes.css URL, injected by vencord_mobile.js on every
+         *  page load; kept here so the prefetch and the stale-cache sweep
+         *  address the same key the runtime derives. */
+        internal const val MORE_FIXES_CSS_URL =
+            "https://raw.githubusercontent.com/VendroidEnhanced/random-files/refs/heads/main/moreFixes.css"
 
         /**
          * One-shot notice flag for MainActivity, set when

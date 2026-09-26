@@ -59,10 +59,10 @@ class BundleLocationGateTest {
 
     @Test
     fun customPathOnAllowedHost_passes() {
-        // The developer workflow: a different build on the operator host.
+        // The developer workflow: a different build on an allowed host.
         assertNull(
             HttpClient.bundleLocationFetchProblem(
-                "https://vde-builds.nin0.dev/branch/browser.js?tag=dev"
+                "https://github.com/Vendicated/Vencord/releases/download/devbuild/browser.js?tag=dev"
             )
         )
     }
@@ -87,7 +87,7 @@ class BundleLocationGateTest {
     fun plainHttpOnAllowedHost_rejected() {
         assertEquals(
             "must use HTTPS",
-            HttpClient.bundleLocationFetchProblem("http://vde-builds.nin0.dev/vencord/browser.js")
+            HttpClient.bundleLocationFetchProblem("http://github.com/Vendicated/Vencord/releases/latest/download/browser.js")
         )
     }
 
@@ -97,7 +97,7 @@ class BundleLocationGateTest {
         // the heal removes values that could never fetch.
         assertEquals(
             "must use HTTPS",
-            HttpClient.bundleLocationFetchProblem("HTTPS://vde-builds.nin0.dev/vencord/browser.js")
+            HttpClient.bundleLocationFetchProblem("HTTPS://github.com/Vendicated/Vencord/releases/latest/download/browser.js")
         )
     }
 
@@ -108,7 +108,7 @@ class BundleLocationGateTest {
         // up later as an IllegalArgumentException from Request.Builder().
         assertEquals(
             "not a fetchable URL",
-            HttpClient.bundleLocationFetchProblem("https://vde-builds.nin0.dev:99999/browser.js")
+            HttpClient.bundleLocationFetchProblem("https://github.com:99999/browser.js")
         )
     }
 
@@ -117,7 +117,7 @@ class BundleLocationGateTest {
         // The userinfo delimits before the host for both parsers: the
         // fetch would target evil.com.
         val problem = HttpClient.bundleLocationFetchProblem(
-            "https://vde-builds.nin0.dev@evil.com/browser.js"
+            "https://github.com@evil.com/browser.js"
         )
         assertTrue(problem!!.contains("not in the allowed list"))
         assertTrue(problem.contains("evil.com"))
@@ -129,12 +129,12 @@ class BundleLocationGateTest {
         // value, or both parsers read the host as allowlisted and OkHttp
         // would fetch an allowed host.
         val adversarial = listOf(
-            "https://vde-builds.nin0.dev\\@evil.com/browser.js",
-            "https://vde-builds.nin0.dev\n.evil.com/browser.js",
-            "https://vde-builds.nin0.dev\t.evil.com/browser.js",
-            "https://vde-builds.nin0.dev.evil.com/browser.js",
-            "https://vde-builds.nin0.dev:65536/browser.js",
-            "https://vde-builds.nin0.dev:/browser.js"
+            "https://github.com\\@evil.com/browser.js",
+            "https://github.com\n.evil.com/browser.js",
+            "https://github.com\t.evil.com/browser.js",
+            "https://github.com.evil.com/browser.js",
+            "https://github.com:65536/browser.js",
+            "https://github.com:/browser.js"
         )
         for (location in adversarial) {
             val problem = HttpClient.bundleLocationFetchProblem(location)
@@ -169,9 +169,9 @@ class BundleLocationGateTest {
 
     @Test
     fun customLocation_isNormalized() {
-        sPrefs.edit().putString("vencordLocation", "  https://vde-builds.nin0.dev/branch/browser.js/  ").commit()
+        sPrefs.edit().putString("vencordLocation", "  https://github.com/Vendicated/Vencord/releases/download/devbuild/browser.js/  ").commit()
         assertEquals(
-            "https://vde-builds.nin0.dev/branch/browser.js",
+            "https://github.com/Vendicated/Vencord/releases/download/devbuild/browser.js",
             HttpClient.resolveBundleLocation(sPrefs)
         )
     }

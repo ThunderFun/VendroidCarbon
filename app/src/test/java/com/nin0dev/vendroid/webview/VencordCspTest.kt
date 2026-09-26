@@ -1,5 +1,6 @@
 package com.nin0dev.vendroid.webview
 
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -33,6 +34,36 @@ class VencordCspTest {
         val src = connectSrc()
         assertTrue(src.contains("https://*.discord.com"))
         assertTrue(src.contains("wss://*.discord.gg"))
+    }
+
+    @Test fun connectSrc_allowsUpstreamBundleHosts() {
+        // The in-page CSS re-fetch fallback hits the GitHub release hosts
+        // (the 302 hop chain ends on release-assets.githubusercontent.com).
+        val src = connectSrc()
+        assertTrue("missing github.com: $src", src.contains("https://github.com"))
+        assertTrue(
+            "missing release-assets host: $src",
+            src.contains("https://release-assets.githubusercontent.com")
+        )
+    }
+
+    @Test fun connectSrc_dropsRetiredOperatorHosts() {
+        val src = connectSrc()
+        assertFalse("vde-builds.nin0.dev must be gone: $src", src.contains("vde-builds.nin0.dev"))
+        assertFalse("vendroid.nin0.dev must be gone: $src", src.contains("vendroid.nin0.dev"))
+    }
+
+    @Test fun connectSrc_keepsVencordBadges() {
+        assertTrue(connectSrc().contains("https://badges.vencord.dev"))
+    }
+
+    @Test fun scriptAndStyleSrc_needNoBundleHosts() {
+        // Bundle and CSS are inline-injected, so the host swap lives
+        // entirely in connect-src.
+        val script = csp.split("; ").first { it.startsWith("script-src") }
+        val style = csp.split("; ").first { it.startsWith("style-src") }
+        assertFalse(script.contains("github"))
+        assertFalse(style.contains("github.com"))
     }
 
     @Test fun objectSrcLockedDown() {

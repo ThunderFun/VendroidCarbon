@@ -14,7 +14,6 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
-import java.util.Locale
 import java.util.concurrent.TimeUnit
 import okhttp3.ConnectionPool
 import okhttp3.HttpUrl
@@ -30,9 +29,9 @@ object HttpClient {
 
     /**
      * Maximum redirect hops followed manually. Each hop can consume the full
-     * connect+read timeouts (30s), and updateVencord holds a bridge call
-     * while the loop runs, so the cap bounds worst-case latency. Further
-     * hops throw IOException and hit the cached-bundle fallback.
+     * connect+read timeouts (30s), and fetchVencord runs the loop inline on
+     * the startup path, so the cap bounds worst-case latency. Further hops
+     * throw IOException and hit the cached-bundle fallback.
      */
     private const val MAX_REDIRECT_HOPS = 5
 
@@ -85,7 +84,7 @@ object HttpClient {
 
     /**
      * True once a bundle fetch or revalidation has completed in this process
-     * (via [fetchVencord] or the JS-bridge update path). The warm-navigation
+     * (via [fetchVencord]). The warm-navigation
      * fast path keys on this rather than `VencordRuntime != null`, which the
      * disk preloads also set and which says nothing about freshness. Across
      * process death the same idea carries via [PREF_LAST_BUNDLE_CHECK] and
@@ -95,10 +94,10 @@ object HttpClient {
     private var bundleCheckedThisSession = false
 
     /**
-     * Serializes bundle file and prefs writes between the startup path and
-     * the JS-bridge update path, so the file, ETag, and patch flags always
-     * describe the same download. Also orders the startup path's runtime
-     * publish with the write; see [vencordRuntimeLock] for the lock order.
+     * Serializes bundle file and prefs writes between the startup fetch and
+     * download paths, so the file, ETag, and patch flags always describe the
+     * same download. Also orders the startup path's runtime publish with the
+     * write; see [vencordRuntimeLock] for the lock order.
      */
     private val bundleWriteLock = Any()
 
@@ -199,83 +198,6 @@ object HttpClient {
     fun runtimeSnapshot(): Pair<String?, String?> =
         synchronized(vencordRuntimeLock) { VencordRuntime to VencordMobileRuntime }
 
-    // Vencord bundle patches applied at download time. The Slate/command-browser
-    // fix is applied at runtime in vencord_mobile.js. Each patch carries a
-    // marker string present in its own replacement, so applyPatches() can skip
-    // it when already patched. This makes the patch idempotent: the pattern is
-    // anchored on the closing quote and the marker check runs first, so
-    // re-applying cannot grow the replacement.
-    private data class BundlePatch(
-        val pattern: Regex,
-        val replacement: String,
-        val marker: String
-    )
-
-    /**
-     * The bundle's `//# sourceURL=file:///VencordWeb` pragma makes Chromium
-     * treat bundle code as cross-origin on the evaluateJavascript path, so
-     * uncaught errors are masked to "Script error." with lineno 0. Relabeling
-     * to a same-origin URL keeps attribution while disabling the masking.
-     * Comment-only tokens: no semantic effect. The dynamic per-module pragmas
-     * are relabeled for the same reason.
-     */
-    private const val SAME_ORIGIN_SOURCE_URL = "https://discord.com/vencord-web.js"
-    private val vencordRuntimePatches: List<BundlePatch> = listOf(
-        BundlePatch(
-            Regex.escape("\"chat input type must be set\"").toRegex(),
-            "\"chat input type must be set__VENDROID_DISABLED\"",
-            "chat input type must be set__VENDROID_DISABLED"
-        ),
-        BundlePatch(
-            Regex.escape("//# sourceURL=file:///VencordWeb").toRegex(),
-            "//# sourceURL=$SAME_ORIGIN_SOURCE_URL",
-            SAME_ORIGIN_SOURCE_URL
-        ),
-        BundlePatch(
-            Regex.escape("//# sourceURL=file:///ExtractedWebpackModule").toRegex(),
-            "//# sourceURL=https://discord.com/vencord-ext-module",
-            "https://discord.com/vencord-ext-module"
-        ),
-        BundlePatch(
-            Regex.escape("//# sourceURL=file:///WebpackModule").toRegex(),
-            "//# sourceURL=https://discord.com/vencord-module",
-            "https://discord.com/vencord-module"
-        ),
-        // Prunes splashScreen, discordBranch, and the developer-modal
-        // allowRemoteDebugging toggle from the eq.js settings tree. The gate
-        // blocks all three and nothing native consumes them, so their rows
-        // would flip in the UI without persisting. The fourth unprefixed
-        // key, desktopMode, is allowed in VencordNative instead of pruned.
-        //
-        // A deletion has no natural marker, so the replacement is a comment
-        // token: it keeps the object literal valid and supplies the marker
-        // applyPatches needs to stay idempotent. Patterns anchor on the
-        // pristine upstream bundle, not the patched eq.js snapshot in the
-        // repo root; if upstream re-bundles and a pattern stops matching,
-        // applyPatches logs "Patch matched nothing" and
-        // HttpClientBundlePatchTest fails on the vendored snapshot.
-        BundlePatch(
-            Regex.escape(
-                "allowRemoteDebugging:{label:\"Allow remote debugging\",type:\"toggle\",description:\"Expose WebView to remote Chrome DevTools. You will be able to inspect the WebView on a browser using chrome://inspect. This does not give any access outside of your local network\",defaultValue:!1},"
-            ).toRegex(),
-            "/*vde-prune-remdbg*/",
-            "vde-prune-remdbg"
-        ),
-        BundlePatch(
-            Regex.escape(
-                "discordBranch:{type:\"select\",label:\"Discord branch\",description:\"The Discord branch to load\",options:[{key:\"stable\",label:\"Stable\"},{key:\"canary\",label:\"Canary\"},{key:\"ptb\",label:\"PTB\"}],defaultValue:\"stable\"},"
-            ).toRegex(),
-            "/*vde-prune-branch*/",
-            "vde-prune-branch"
-        ),
-        BundlePatch(
-            Regex.escape(
-                "splashScreen:{label:\"Splash screen\",type:\"select\",description:\"Splash screen to show at app launch\",defaultValue:\"viggy\",options:[{key:\"viggy\",label:\"Viggy, by Shoritsu\"},{key:\"shiggy\",label:\"Shiggy, by naga_U\"},{key:\"oneko\",label:\"Oneko\"}]},"
-            ).toRegex(),
-            "/*vde-prune-splash*/",
-            "vde-prune-splash"
-        )
-    )
 
     /** SharedPreferences key recording that the on-disk bundle is already patched. */
     const val PREF_BUNDLE_PATCHED = "vencordBundlePatched"
@@ -318,15 +240,6 @@ object HttpClient {
     /** SharedPreferences key of the app version that last fetched the bundle. */
     const val PREF_LAST_BUNDLE_UPDATE = "lastMajorUpdateThatUserHasUpdatedVencord"
 
-    /**
-     * Identity of the current patch list, persisted alongside
-     * [PREF_BUNDLE_PATCHED]. Derived from the patch definitions so editing
-     * [vencordRuntimePatches] without a versionCode bump still invalidates
-     * the flag and re-patches the on-disk bundle.
-     */
-    private val bundlePatchSetKey: String =
-        vencordRuntimePatches.joinToString("|") { it.pattern.pattern + "->" + it.replacement }
-            .hashCode().toString()
 
     /**
      * String read that treats a wrong-typed value as absent. The bridge
@@ -367,19 +280,17 @@ object HttpClient {
             VDELog.w("HTTP", "Bundle patch flag wrong-typed; re-patching")
             false
         }
-        return patched && stringPrefOrNull(sPrefs, PREF_BUNDLE_PATCH_SET) == bundlePatchSetKey
+        return patched && stringPrefOrNull(sPrefs, PREF_BUNDLE_PATCH_SET) == BundlePatcher.bundlePatchSetKey
     }
 
     /** Resolves the effective bundle URL from prefs, honoring clientMod. */
     fun resolveBundleLocation(sPrefs: SharedPreferences): String {
         // Choke point: a wrong-typed clientMod must never escape onto the
-        // startup fetch path in fetchVencord or into
-        // VencordNative.updateVencord's @JavascriptInterface body. Either
-        // consumer crashing killed the process on every cold start. The
-        // setBool STRING_SETTING_KEYS guard stops new poison and
-        // VendroidApp's boot-time heal removes old; this catch contains any
-        // future regression to a logged default instead of an uncaught
-        // ClassCastException.
+        // startup fetch path in fetchVencord; a crash there killed the
+        // process on every cold start. The setBool STRING_SETTING_KEYS
+        // guard stops new poison and VendroidApp's boot-time heal removes
+        // old; this catch contains any future regression to a logged
+        // default instead of an uncaught ClassCastException.
         val clientMod = try {
             sPrefs.getString("clientMod", "vencord")
         } catch (e: ClassCastException) {
@@ -430,8 +341,7 @@ object HttpClient {
      * forcing revalidation as before.
      *
      * Shared with the boot-time heal (VendroidApp.healUnusableVencordLocation)
-     * and VencordNative.updateVencord so the gate, the heal, and the bridge
-     * update path cannot drift apart.
+     * so the fetch gate and the heal cannot drift apart.
      */
     internal fun bundleLocationFetchProblem(location: String): String? {
         val uriHost = Uri.parse(location).host
@@ -562,10 +472,10 @@ object HttpClient {
         val patched = applyPatches(raw)
         // Content that actually got patched here is patched in memory only;
         // only a full marker set proves the on-disk file is current.
-        if (vencordRuntimePatches.all { raw.contains(it.marker) }) {
+        if (BundlePatcher.vencordRuntimePatches.all { raw.contains(it.marker) }) {
             sPrefs.edit()
                 .putBoolean(PREF_BUNDLE_PATCHED, true)
-                .putString(PREF_BUNDLE_PATCH_SET, bundlePatchSetKey)
+                .putString(PREF_BUNDLE_PATCH_SET, BundlePatcher.bundlePatchSetKey)
                 .apply()
         }
         return patched
@@ -717,11 +627,11 @@ object HttpClient {
                     if (responseCode !in 200..299) {
                         throw bundleHttpFailure(responseCode, vencordLocation)
                     }
-                    downloadStoreAndSync(resp, vendroidFile, sPrefs, publishToRuntime = true, bundleLocation = vencordLocation)
+                    downloadStoreAndSync(resp, vendroidFile, sPrefs, bundleLocation = vencordLocation)
                 }
 
                 responseCode in 200..299 -> {
-                    downloadStoreAndSync(resp, vendroidFile, sPrefs, publishToRuntime = true, bundleLocation = vencordLocation)
+                    downloadStoreAndSync(resp, vendroidFile, sPrefs, bundleLocation = vencordLocation)
                 }
 
                 else -> {
@@ -823,8 +733,12 @@ object HttpClient {
      * Resolves a redirect Location against the current hop's URL (relative
      * references per RFC 3986) and gates the target on HTTPS + the host
      * allowlist.
+     *
+     * internal + pure so VencordHostAllowlistTest can pin the per-hop
+     * re-validation contract (every hop of the GitHub 302 chain must clear
+     * this gate) without network.
      */
-    private fun resolveRedirectTarget(currentUrl: String, location: String): HttpUrl {
+    internal fun resolveRedirectTarget(currentUrl: String, location: String): HttpUrl {
         // Hop 1 is the caller's raw bundle location, so failure messages
         // redact it (see bundleHttpFailure).
         if (location.isBlank()) {
@@ -904,24 +818,20 @@ object HttpClient {
     /**
      * Single writer for the Vencord bundle: sanity-checks and patches the
      * response body, atomically installs it, and syncs the ETag / patch flag /
-     * patch-set / last-update bookkeeping under the bundle write lock. Shared
-     * by the startup path and the JS-bridge update path so their post-write
-     * state cannot drift apart.
+     * patch-set / last-update bookkeeping under the bundle write lock.
      *
      * Caller must have validated HTTPS + host allowlist and owns closing
      * [resp].
      *
-     * @param publishToRuntime when true, the in-memory runtime is replaced
-     *   immediately (startup path) via [setVencordRuntimeIfEnabled], which
-     *   respects the safe-mode kill switch. The JS-bridge update path passes
-     *   false so the running bundle stays until the user restarts.
+     * The in-memory runtime is replaced immediately via
+     * [setVencordRuntimeIfEnabled], which respects the safe-mode kill switch
+     * (a raised switch saves to disk only).
      */
     @Throws(IOException::class)
     fun downloadStoreAndSync(
         resp: Response,
         vendroidFile: File,
         sPrefs: SharedPreferences,
-        publishToRuntime: Boolean,
         bundleLocation: String
     ) {
         if (resp.code !in 200..299) {
@@ -946,9 +856,9 @@ object HttpClient {
         // the "Cached bundle ... sha256=" preload line hashes on the next start.
         val hash = shortSha256(patched)
         synchronized(bundleWriteLock) {
-            // Unique temp name: startup and the JS-bridge update path write the
-            // same bundle on different executors, and a shared "vencord.js.tmp"
-            // let one writer's rename install the other's truncated file.
+            // Unique temp name so concurrent download attempts cannot clobber
+            // each other's file; a shared "vencord.js.tmp" once let one
+            // writer's rename install another writer's truncated file.
             val tmpFile = File(vendroidFile.parent, "${vendroidFile.name}.${System.nanoTime()}.tmp")
             try {
                 tmpFile.writeText(patched)
@@ -987,12 +897,12 @@ object HttpClient {
             // Persist the patch state so a later cold start skips the ~1MB
             // regex scan instead of re-running applyPatches.
             e.putBoolean(PREF_BUNDLE_PATCHED, true)
-            e.putString(PREF_BUNDLE_PATCH_SET, bundlePatchSetKey)
+            e.putString(PREF_BUNDLE_PATCH_SET, BundlePatcher.bundlePatchSetKey)
             e.apply()
             // Flag-guarded setter: a stalled disk-load CAS must not overwrite
             // this fresher download, and a raised kill switch must block the
             // publish.
-            if (publishToRuntime && !setVencordRuntimeIfEnabled(patched)) {
+            if (!setVencordRuntimeIfEnabled(patched)) {
                 VDELog.w("HTTP", "Safe mode raised; bundle saved to disk only, runtime not published")
             }
             bundleCheckedThisSession = true
@@ -1008,57 +918,10 @@ object HttpClient {
     private fun looksLikeBundle(content: String): Boolean =
         content.length >= 64 * 1024 && !content.trimStart().startsWith("<")
 
+    // Delegates to BundlePatcher; kept so HttpClientBundlePatchTest keeps
+    // pinning HttpClient.applyPatches and @JvmStatic callers stay binary-safe.
     @JvmStatic
-    fun applyPatches(content: String): String {
-        if (vencordRuntimePatches.isEmpty()) return content
-        VDELog.d("HTTP", "Applying ${vencordRuntimePatches.size} patches")
-        // Few patches means sequential replace is simpler than mapping
-        // combined-regex matches back to individual patches. Each replace
-        // copies ~1MB, acceptable for 2-3 patches at download time.
-        var result = content
-        for (patch in vencordRuntimePatches) {
-            VDELog.d("HTTP", "Patch: ${patch.pattern.pattern}")
-            // Skip already-patched content so a re-apply (e.g. the persisted
-            // flag was cleared) never double-suffixes the replacement.
-            if (result.contains(patch.marker)) continue
-            var matchCount = 0
-            // Lambda replacement: the returned string is inserted literally,
-            // so '$' or '\' in a replacement (common in minified JS) is never
-            // interpreted as a group reference.
-            result = patch.pattern.replace(result) {
-                matchCount++
-                patch.replacement
-            }
-            if (matchCount == 0) {
-                VDELog.w("HTTP", "Patch matched nothing; upstream bundle may have changed: ${patch.marker}")
-            }
-        }
-        return result
-    }
-
-    /**
-     * Opens an HTTPS connection to [url] and verifies the response is 2xx.
-     *
-     * Lifecycle: the caller owns the returned [Response] and must close it
-     * (`resp.close()` or `resp.body?.close()`) in a `finally` so the pooled
-     * connection is returned.
-     *
-     * Throws [IOException] on non-HTTPS input, redirects/errors (3xx/4xx/5xx,
-     * as [HttpException]), or network failure.
-     */
-    @Throws(IOException::class)
-    fun fetch(url: String): Response {
-        if (!url.startsWith("https://")) {
-            throw IOException("Non-HTTPS URL rejected: ${url.substringBefore("://")}://")
-        }
-        val resp = sharedClient.newCall(Request.Builder().url(url).build()).execute()
-        if (resp.code >= 300) {
-            val ex = HttpException(resp)
-            resp.close()
-            throw ex
-        }
-        return resp
-    }
+    fun applyPatches(content: String): String = BundlePatcher.applyPatches(content)
 
     @Throws(IOException::class)
     fun readAsText(inputStream: InputStream, initialSize: Int = 8192, maxBytes: Int = MAX_READ_BYTES): String {
@@ -1108,17 +971,6 @@ object HttpClient {
             bos.write(buf, 0, n)
         }
         return bos.toByteArray()
-    }
-
-    class HttpException(resp: Response) : IOException() {
-        // No catch needed: resp.message and url.host are non-null in OkHttp.
-        override val message: String? = String.format(
-                Locale.ENGLISH,
-                "HTTP %d: %s (%s)",
-                resp.code,
-                resp.message,
-                resp.request.url.host
-        )
     }
 }
 

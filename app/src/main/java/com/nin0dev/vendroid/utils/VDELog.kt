@@ -77,7 +77,7 @@ object VDELog {
                     val prev = File(f.parentFile, "vde_logs.prev.txt")
                     prev.delete()
                     if (f.renameTo(prev)) {
-                        // Rename succeeded — safe to start a fresh (truncated) file.
+                        // Rename succeeded. Safe to start a fresh (truncated) file.
                         openWriterLocked(append = false)
                     } else {
                         // Rename failed; preserve the previous session's log by
