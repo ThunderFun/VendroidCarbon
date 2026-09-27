@@ -1,64 +1,90 @@
 package com.nin0dev.vendroid
 
+import android.app.ActivityManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
+import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Process
+import android.view.View
+import android.widget.ScrollView
+import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import android.webkit.CookieManager
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.card.MaterialCardView
+import com.nin0dev.vendroid.utils.SettingKeys
 import com.nin0dev.vendroid.utils.ShareHelper
 import com.nin0dev.vendroid.utils.VDELog
+import com.nin0dev.vendroid.webview.HttpClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
 class RecoveryActivity : AppCompatActivity() {
+
+    companion object {
+        /**
+         * When true, onCreate runs the restart sequence (kill :web, start
+         * MainActivity) without building the recovery UI. Used by
+         * VencordNative.restartApp: the WebView bridge runs in :web, which
+         * cannot kill itself without racing its own singleTask relaunch, so
+         * the switcher's "Restart now" hands off to this activity, whose
+         * process survives the kill.
+         */
+        const val EXTRA_RELAUNCH_MAIN = "com.nin0dev.vendroid.RELAUNCH_MAIN"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Trampoline: restart immediately, no UI.
+        if (intent?.getBooleanExtra(EXTRA_RELAUNCH_MAIN, false) == true) {
+            restartWith { }
+            return
+        }
 
         setContentView(R.layout.activity_recovery)
 
         // Show last-boot state from the boot-verify probe, if available.
-        findViewById<android.widget.TextView>(R.id.last_boot_state).apply {
-            val state = getSharedPreferences("settings", Context.MODE_PRIVATE)
+        findViewById<TextView>(R.id.last_boot_state).apply {
+            val state = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
                 .getString(MainActivity.PREF_LAST_BOOT_STATE, null)
             if (state.isNullOrEmpty()) {
-                visibility = android.view.View.GONE
+                visibility = View.GONE
             } else {
-                visibility = android.view.View.VISIBLE
+                visibility = View.VISIBLE
                 text = "Last boot: $state"
             }
         }
 
         findViewById<MaterialCardView>(R.id.start_normally).setOnClickListener {
             it.isClickable = false
-            // Kill before commit (see killWebProcess), then clear a stale
-            // safeMode flag so "Start normally" boots normally.
-            killWebProcess()
-            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-            sPrefs.edit().putBoolean("safeMode", false).commit()
-            startActivity(Intent(this, MainActivity::class.java))
-            finish()
+            // Clear both one-shot recovery flags so "Start normally" boots
+            // clean and re-enables themes.
+            restartWith { e ->
+                e.putBoolean(SettingKeys.KEY_SAFE_MODE, false)
+                e.putBoolean(SettingKeys.KEY_DISABLE_THEMES, false)
+            }
         }
         findViewById<MaterialCardView>(R.id.safe_mode).setOnClickListener {
             it.isClickable = false
-            // Kill before commit (see killWebProcess).
-            killWebProcess()
-            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-            sPrefs.edit().putBoolean("safeMode", true).commit()
-            startActivity(Intent(this, MainActivity::class.java))
-            finish()
+            restartWith { e -> e.putBoolean(SettingKeys.KEY_SAFE_MODE, true) }
+        }
+        // One-shot: the next boot suppresses user themes (Vencord still
+        // loads) so the user can remove the broken theme in Vencord's Themes
+        // panel; themes return on the next normal start.
+        findViewById<MaterialCardView>(R.id.disable_themes).setOnClickListener {
+            it.isClickable = false
+            restartWith { e -> e.putBoolean(SettingKeys.KEY_DISABLE_THEMES, true) }
         }
         findViewById<MaterialCardView>(R.id.force_update).setOnClickListener {
             it.isClickable = false
-            // Kill before commit (see killWebProcess).
-            killWebProcess()
-            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-            sPrefs.edit().putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0).commit()
-            startActivity(Intent(this, MainActivity::class.java))
-            finish()
+            restartWith { e -> e.putInt(HttpClient.PREF_LAST_BUNDLE_UPDATE, 0) }
         }
         findViewById<MaterialCardView>(R.id.view_logs).setOnClickListener {
             it.isClickable = false
@@ -96,24 +122,24 @@ class RecoveryActivity : AppCompatActivity() {
 
     }
 
-    private fun showLogDialog(text: String): androidx.appcompat.app.AlertDialog {
-        val scrollView = android.widget.ScrollView(this).apply {
+    private fun showLogDialog(text: String): AlertDialog {
+        val scrollView = ScrollView(this).apply {
             setPadding(48, 32, 48, 32)
         }
-        val textView = android.widget.TextView(this).apply {
+        val textView = TextView(this).apply {
             this.text = text
             setTextIsSelectable(true)
-            typeface = android.graphics.Typeface.MONOSPACE
+            typeface = Typeface.MONOSPACE
             textSize = 12f
         }
         scrollView.addView(textView)
-        return androidx.appcompat.app.AlertDialog.Builder(this)
+        return AlertDialog.Builder(this)
             .setTitle("VendroidEnhanced Logs")
             .setView(scrollView)
             .setPositiveButton("Close", null)
             .setNeutralButton("Copy") { _, _ ->
-                val clipboard = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("VDE Logs", text))
+                val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("VDE Logs", text))
             }
             .setNegativeButton("Share") { _, _ ->
                 ShareHelper.shareLogs(this, text)
@@ -123,6 +149,26 @@ class RecoveryActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+    }
+
+    /**
+     * Shared restart sequence for the recovery buttons. Kills the :web
+     * process, applies [edit] to the settings prefs, then restarts
+     * MainActivity.
+     *
+     * Kill before write, commit() rather than apply(). Both deliberate.
+     * Killing first means a warm :web process can't flush a stale apply()
+     * over the new value. commit() is synchronous, so the change is on disk
+     * before MainActivity restarts. Full rationale in [killWebProcess].
+     */
+    private fun restartWith(edit: (SharedPreferences.Editor) -> Unit) {
+        killWebProcess()
+        val sPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
+        val editor = sPrefs.edit()
+        edit(editor)
+        editor.commit()
+        startActivity(Intent(this, MainActivity::class.java))
+        finish()
     }
 
     /**
@@ -139,12 +185,12 @@ class RecoveryActivity : AppCompatActivity() {
      */
     private fun killWebProcess() {
         try {
-            val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
             // On API 22+ runningAppProcesses() returns only this app's own
             // processes, which is exactly what we need here.
             am.runningAppProcesses?.forEach { proc ->
                 if (proc.processName == "$packageName:web") {
-                    android.os.Process.killProcess(proc.pid)
+                    Process.killProcess(proc.pid)
                 }
             }
         } catch (t: Throwable) {

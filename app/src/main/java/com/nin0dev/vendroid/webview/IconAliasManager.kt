@@ -3,6 +3,7 @@ package com.nin0dev.vendroid.webview
 import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
+import android.widget.Toast
 import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.utils.VDELog
 
@@ -124,6 +125,104 @@ internal object IconAliasManager {
                 VDELog.w("VN", "Icon repair: disabled stale enabled launcher alias '$name'")
             } catch (t: Throwable) {
                 VDELog.e("VN", "Icon repair: could not disable stale launcher alias '$name'", t)
+            }
+        }
+    }
+
+    /**
+     * Body of [VencordNative.changeAppIcon]. Resolves [rawId] against
+     * [ICON_NAMES] (case-insensitive, after trimming) and switches the
+     * launcher alias. The caller has already authorized the bridge token and
+     * run the strict Discord-domain gate. Runs under [iconLock].
+     */
+    internal fun applyIconChange(act: MainActivity, rawId: String?) {
+        val trimmed = rawId?.trim()
+        val safeId = trimmed?.let { r -> ICON_NAMES.find { it.equals(r, ignoreCase = true) } }
+        if (trimmed == null || safeId == null) {
+            // rawId is page-controlled and unbounded, and lands in a Toast
+            // (which gets parcellized), so bound it.
+            val why = if (trimmed == null) "null id" else "unknown id '${trimmed.take(64)}'"
+            act.runOnUiThread { Toast.makeText(act, "Icon change: $why", Toast.LENGTH_SHORT).show() }
+            return
+        }
+        try {
+            synchronized(iconLock) {
+                // Verify the cache against PM before trusting it, so the guard
+                // and oldIcon below are truthful. Runs even on the
+                // already-active path so re-selecting the same icon cleans up
+                // leftover aliases.
+                try {
+                    reconcileIconState(act)
+                } catch (t: Throwable) {
+                    // Reads inside are exception-safe; this is only a safety
+                    // net so a bridge method can never crash the process.
+                    VDELog.e("VN", "changeAppIcon: icon state reconcile failed", t)
+                }
+                if (safeId == currentIcon) {
+                    act.runOnUiThread {
+                        Toast.makeText(act, "Icon '$safeId' is already active", Toast.LENGTH_SHORT).show()
+                    }
+                    return
+                }
+                val oldIcon = currentIcon
+                if (oldIcon == null) {
+                    // Reconcile failed to establish a baseline (it logs the
+                    // reason). Guessing "Main" could disable the alias about
+                    // to be enabled and leave the launcher with no entry. No
+                    // PM writes have happened yet, so abort; the next attempt
+                    // reconciles again.
+                    VDELog.e("VN", "changeAppIcon: no resolved icon baseline; aborting")
+                    act.runOnUiThread {
+                        Toast.makeText(act, "Icon change failed: icon state unavailable", Toast.LENGTH_LONG).show()
+                    }
+                    return
+                }
+                val pm = act.packageManager
+                val pkg = act.applicationContext
+                // Enable first: while both aliases are briefly enabled the
+                // launcher still has an entry; disabling first could leave none.
+                pm.setComponentEnabledSetting(
+                    iconComponent(pkg, safeId),
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                    PackageManager.DONT_KILL_APP
+                )
+                // The new alias is live in the launcher from here on, so the
+                // cache must claim it now, even if the cleanup below fails.
+                currentIcon = safeId
+                fun disableOld(): Boolean = try {
+                    pm.setComponentEnabledSetting(
+                        iconComponent(pkg, oldIcon),
+                        PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                        PackageManager.DONT_KILL_APP
+                    )
+                    true
+                } catch (t: Throwable) {
+                    VDELog.e("VN", "changeAppIcon: disabling old icon '$oldIcon' failed", t)
+                    false
+                }
+                // One retry covers transient binder failures. If it still
+                // fails, reconcileIconState heals the leftover alias on the
+                // next icon change or app start.
+                val cleanupFailed = !disableOld() && !disableOld()
+                act.runOnUiThread {
+                    Toast.makeText(
+                        act,
+                        if (cleanupFailed)
+                            "Icon switched to $safeId, but the old icon could not be removed. Opening the icon switcher again (even on the same icon) repairs it."
+                        else
+                            "Icon changed to $safeId. Restart launcher if it doesn't update.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        } catch (t: Throwable) {
+            // Safety net: an exception escaping a @JavascriptInterface method
+            // kills the process. On exit the cache is either unchanged (the
+            // enable threw before any commit) or already claims the live
+            // alias.
+            VDELog.e("VN", "changeAppIcon failed for id=$safeId", t)
+            act.runOnUiThread {
+                Toast.makeText(act, "Icon change failed: ${t.message ?: t.javaClass.simpleName}", Toast.LENGTH_LONG).show()
             }
         }
     }

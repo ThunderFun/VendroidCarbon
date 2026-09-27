@@ -1,12 +1,18 @@
 package com.nin0dev.vendroid
 
 import android.annotation.SuppressLint
+import android.Manifest
 import android.app.Dialog
+import android.app.AlertDialog
 import android.content.Context
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.content.res.Resources
+import android.graphics.Color
+import android.graphics.PixelFormat
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -14,21 +20,30 @@ import android.os.Handler
 import android.os.Looper
 import java.io.File
 import android.view.View
+import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebChromeClient
 import android.widget.Toast
-import com.google.gson.Gson
 import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.FirewallConfig
-import com.nin0dev.vendroid.utils.JsPatches
+import com.nin0dev.vendroid.utils.SettingKeys
 import com.nin0dev.vendroid.utils.VDELog
+import com.nin0dev.vendroid.utils.getBooleanSafe
+import com.nin0dev.vendroid.utils.vdeGson
 import com.nin0dev.vendroid.ui.LoadingScreenManager
 import com.nin0dev.vendroid.webview.BarColorManager
 import com.nin0dev.vendroid.webview.HttpClient
 import com.nin0dev.vendroid.webview.HttpClient.fetchVencord
+import com.nin0dev.vendroid.webview.LinkHandler
 import com.nin0dev.vendroid.webview.MainFrameDiskCache
+import com.nin0dev.vendroid.webview.NavigationPolicy
+import com.nin0dev.vendroid.webview.RuntimeInjector
 import com.nin0dev.vendroid.webview.UrlNormalizer
 import com.nin0dev.vendroid.webview.VChromeClient
 import com.nin0dev.vendroid.webview.VWebviewClient
@@ -40,6 +55,12 @@ import java.util.concurrent.RejectedExecutionException
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.edit
+import androidx.activity.OnBackPressedCallback
+import androidx.annotation.RequiresApi
+import androidx.webkit.ServiceWorkerClientCompat
+import androidx.webkit.ServiceWorkerControllerCompat
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 
 class MainActivity : AppCompatActivity() {
     private var wvInitialized = false
@@ -147,13 +168,13 @@ class MainActivity : AppCompatActivity() {
     private val fetchExecutor = Executors.newSingleThreadExecutor()
 
     private fun migrateSettings() {
-        val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-        // runCatching: migratedSettings itself can arrive wrong-typed (restored
+        val sPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
+        // getBooleanSafe: migratedSettings itself can arrive wrong-typed (restored
         // or hand-edited XML). Treating it as unmigrated is safe; the apply()
         // below overwrites it with a real Boolean.
-        if (runCatching { sPrefs.getBoolean("migratedSettings", false) }.getOrDefault(false)) return
+        if (sPrefs.getBooleanSafe(SettingKeys.KEY_MIGRATED_SETTINGS, false)) return
         val ed = sPrefs.edit()
-        ed.putBoolean("migratedSettings", true)
+        ed.putBoolean(SettingKeys.KEY_MIGRATED_SETTINGS, true)
 
         // Flag, derived values, and legacy-key removals share one apply(): a
         // lost batch re-runs the whole migration instead of leaving the flag
@@ -162,17 +183,17 @@ class MainActivity : AppCompatActivity() {
         for (key in migration.uncoercible) {
             VDELog.w("Main", "$key type-poisoned; using default")
         }
-        ed.putBoolean("checkVDEUpdates", migration.checkVDEUpdates)
+        ed.putBoolean(SettingKeys.KEY_CHECK_VDE_UPDATES, migration.checkVDEUpdates)
         // Both toggles were historically controlled by the single legacy
         // checkVendroidUpdates flag; keep them in sync during migration so an
         // existing user does not silently lose one.
-        ed.putBoolean("checkAnnouncements", migration.checkVDEUpdates)
+        ed.putBoolean(SettingKeys.KEY_CHECK_ANNOUNCEMENTS, migration.checkVDEUpdates)
         // Derive clientMod from the legacy boolean only if unset; re-runs
         // (reinstall/flag wipe) must not clobber an existing choice.
-        migration.clientMod?.let { ed.putString("clientMod", it) }
+        migration.clientMod?.let { ed.putString(SettingKeys.KEY_CLIENT_MOD, it) }
 
-        ed.remove("checkVendroidUpdates")
-        ed.remove("equicord")
+        ed.remove(SettingKeys.KEY_CHECK_VENDROID_UPDATES)
+        ed.remove(SettingKeys.KEY_EQUICORD)
         ed.remove("splash")
 
         ed.apply()
@@ -190,7 +211,7 @@ class MainActivity : AppCompatActivity() {
             Constants.invalidateFirewallCaches()
         }
         // Load settings once and reuse throughout onCreate.
-        val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val sPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
         // migrateSettings early-returns once migratedSettings is set. Its
         // reads are guarded; this catch exists so a future unguarded read
         // degrades to defaults instead of crash-looping cold start.
@@ -204,11 +225,11 @@ class MainActivity : AppCompatActivity() {
         // (VendroidApp.healUnusableVencordLocation). First-entry gate, same
         // pattern as safeMode below: the flag persists until a MainActivity
         // runs, so launching RecoveryActivity first just delays the notice.
-        // The heal writes the flag as a Boolean; runCatching contains any
+        // The heal writes the flag as a Boolean; getBooleanSafe contains any
         // future regression instead of crash-looping cold start.
-        if (runCatching { sPrefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false) }
-                .onFailure { VDELog.w("Main", "heal notice flag type-poisoned; ignoring: $it") }
-                .getOrDefault(false)) {
+        if (sPrefs.getBooleanSafe(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false) {
+                VDELog.w("Main", "heal notice flag type-poisoned; ignoring: $it")
+            }) {
             Toast.makeText(
                 this,
                 "Removed custom Vencord source (no longer permitted); the official bundle is used instead",
@@ -223,12 +244,12 @@ class MainActivity : AppCompatActivity() {
         // First-run security disclosure. Do not load Discord, the WebView, or
         // any injected code until the user accepts the risks of a modified
         // Discord client running third-party code.
-        // runCatching: a poisoned value would crash-loop the :web cold start,
+        // getBooleanSafe: a poisoned value would crash-loop the :web cold start,
         // and no recovery action rewrites this key. Defaulting to false
         // re-shows the warning; accepting overwrites the key with a real Boolean.
-        if (!runCatching { sPrefs.getBoolean("riskWarningAccepted", false) }
-                .onFailure { VDELog.w("Main", "riskWarningAccepted type-poisoned; showing warning: $it") }
-                .getOrDefault(false)) {
+        if (!sPrefs.getBooleanSafe(SettingKeys.KEY_RISK_WARNING_ACCEPTED, false) {
+                VDELog.w("Main", "riskWarningAccepted type-poisoned; showing warning: $it")
+            }) {
             showFirstRunWarning(sPrefs)
             return
         }
@@ -241,12 +262,12 @@ class MainActivity : AppCompatActivity() {
      * Persists acceptance so this only shows once.
      */
     private fun showFirstRunWarning(sPrefs: SharedPreferences) {
-        val dialog = android.app.AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle(R.string.risk_warning_title)
             .setMessage(R.string.risk_warning_body)
             .setCancelable(false) // block bypass via outside tap / back
             .setPositiveButton(R.string.risk_warning_accept) { _, _ ->
-                sPrefs.edit().putBoolean("riskWarningAccepted", true).apply()
+                sPrefs.edit().putBoolean(SettingKeys.KEY_RISK_WARNING_ACCEPTED, true).apply()
                 proceedWithStartup(sPrefs)
             }
             .setNegativeButton(android.R.string.cancel) { _, _ -> finish() }
@@ -255,7 +276,7 @@ class MainActivity : AppCompatActivity() {
             unregisterDialog(dialog)
             // Teardown dismissal must not re-enter finish() on a dying activity.
             if (isFinishing || isDestroyed) return@setOnDismissListener
-            if (!runCatching { sPrefs.getBoolean("riskWarningAccepted", false) }.getOrDefault(false)) finish()
+            if (!sPrefs.getBooleanSafe(SettingKeys.KEY_RISK_WARNING_ACCEPTED, false)) finish()
         }
         registerDialog(dialog)
         dialog.show()
@@ -264,7 +285,7 @@ class MainActivity : AppCompatActivity() {
     /** The body of the original onCreate, run only after the risk warning is
      *  accepted. */
     private fun proceedWithStartup(sPrefs: SharedPreferences) {
-        window.setFormat(android.graphics.PixelFormat.OPAQUE)
+        window.setFormat(PixelFormat.OPAQUE)
 
         val editor = sPrefs.edit()
 
@@ -315,7 +336,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Registers the back-press handler that proxies to the Discord JS app. */
     private fun setupBackPress() {
-        onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (wv != null) {
                     val isFullscreen = chromeClient.isFullscreen
@@ -349,7 +370,7 @@ class MainActivity : AppCompatActivity() {
         // The layout's @id/webview is a plain View placeholder so setContentView
         // does not inflate a WebView (Chromium init) before clients are wired up.
         val placeholder = findViewById<View>(R.id.webview)
-        val parent = placeholder?.parent as? android.view.ViewGroup
+        val parent = placeholder?.parent as? ViewGroup
         val params = placeholder?.layoutParams
         val index = if (parent != null) parent.indexOfChild(placeholder) else -1
         val prewarmed = VendroidApp.prewarmedWebView
@@ -359,7 +380,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             WebView(this)
         }
-        wv!!.setBackgroundColor(android.graphics.Color.parseColor("#121214"))
+        wv!!.setBackgroundColor(Color.parseColor("#121214"))
         // Keep the id so VChromeClient / VencordNative still find the WebView.
         wv!!.id = R.id.webview
         if (parent != null && params != null && index >= 0) {
@@ -373,24 +394,31 @@ class MainActivity : AppCompatActivity() {
         wv!!.setWebViewClient(webViewClient)
         wv!!.setWebChromeClient(chromeClient)
 
+        applyWebViewSettings(wv!!.settings, sPrefs)
+        applyWebViewViewFlags(wv!!)
+
+        CookieManager.getInstance().setAcceptThirdPartyCookies(wv!!, false)
+    }
+
+    /** Applies the WebSettings half of [installWebView]'s setup. */
+    private fun applyWebViewSettings(s: WebSettings, sPrefs: SharedPreferences) {
         // getBoolean throws on a non-Boolean value under desktopMode; fall
         // back to the default so stale or type-poisoned prefs cannot crash
         // cold start.
-        if (runCatching { sPrefs.getBoolean("desktopMode", false) }.getOrDefault(false)) {
-            wv!!.settings.userAgentString =
+        if (sPrefs.getBooleanSafe(SettingKeys.KEY_DESKTOP_MODE, false)) {
+            s.userAgentString =
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         }
         // Sync the UA cache VWebviewClient uses for intercepted fetches.
-        VWebviewClient.updateWebViewUserAgent(wv!!.settings.userAgentString)
-        val s = wv!!.settings
+        VWebviewClient.updateWebViewUserAgent(s.userAgentString)
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
         s.allowFileAccess = false
         s.allowContentAccess = false
 
-        s.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+        s.cacheMode = WebSettings.LOAD_DEFAULT
         s.mediaPlaybackRequiresUserGesture = false
-        s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+        s.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         s.setBuiltInZoomControls(false)
         s.setUseWideViewPort(true)
         s.setLoadWithOverviewMode(true)
@@ -400,26 +428,27 @@ class MainActivity : AppCompatActivity() {
         // visibly smoother scrolling on long message lists.
         s.offscreenPreRaster = true
 
-        wv!!.overScrollMode = View.OVER_SCROLL_NEVER
-        wv!!.isVerticalScrollBarEnabled = false
-        wv!!.isHorizontalScrollBarEnabled = false
-        wv!!.isLongClickable = false
-        wv!!.isHapticFeedbackEnabled = false
-        wv!!.isScrollContainer = true
+        // Disable Safe Browsing
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) {
+            WebSettingsCompat.setSafeBrowsingEnabled(s, false)
+        }
+    }
+
+    /** Applies the View-level half of [installWebView]'s setup. */
+    private fun applyWebViewViewFlags(wv: WebView) {
+        wv.overScrollMode = View.OVER_SCROLL_NEVER
+        wv.isVerticalScrollBarEnabled = false
+        wv.isHorizontalScrollBarEnabled = false
+        wv.isLongClickable = false
+        wv.isHapticFeedbackEnabled = false
+        wv.isScrollContainer = true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            wv!!.defaultFocusHighlightEnabled = false
+            wv.defaultFocusHighlightEnabled = false
         }
 
         // Keep the Chromium renderer at IMPORTANT priority and never waive it
         // when hidden, so the OS cannot kill or throttle it and touch stays fast.
-        wv!!.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
-
-        // Disable Safe Browsing
-        if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.SAFE_BROWSING_ENABLE)) {
-            androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(s, false)
-        }
-
-        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv!!, false)
+        wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
     }
 
     /** Syncs the feature-toggle flags (read once at startup) to the live
@@ -427,32 +456,31 @@ class MainActivity : AppCompatActivity() {
     private fun syncFeatureToggles(sPrefs: SharedPreferences) {
         // Read into a @Volatile field so shouldInterceptRequest does not hit
         // SharedPreferences per request.
-        // runCatching: a String-typed key left by an older build would crash
+        // getBooleanSafe: a String-typed key left by an older build would crash
         // startup here, before the bridge's write-path recovery can purge it.
         // The first setBool from the settings panel overwrites the bad value.
-        val blockTyping = runCatching { sPrefs.getBoolean("vendroid_blockTypingIndicator", false) }
-            .onFailure { VDELog.w("Main", "vendroid_blockTypingIndicator type-poisoned; using default: $it") }
-            .getOrDefault(false)
+        val blockTyping = sPrefs.getBooleanSafe(SettingKeys.KEY_VENDROID_BLOCK_TYPING_INDICATOR, false) {
+            VDELog.w("Main", "vendroid_blockTypingIndicator type-poisoned; using default: $it")
+        }
         VWebviewClient.updateTypingBlock(blockTyping)
 
         // Sync the external-link confirmation toggle to the link popup.
-        // runCatching: a String-typed key left by an older build would crash
+        // getBooleanSafe: a String-typed key left by an older build would crash
         // startup here, before the bridge's write-path recovery can purge it.
-        val confirmLinks = runCatching { sPrefs.getBoolean("vendroid_confirmExternalLinks", true) }
-            .getOrDefault(true)
-        com.nin0dev.vendroid.webview.LinkHandler.updateConfirmExternalLinks(confirmLinks)
+        val confirmLinks = sPrefs.getBooleanSafe(SettingKeys.KEY_VENDROID_CONFIRM_EXTERNAL_LINKS, true)
+        LinkHandler.updateConfirmExternalLinks(confirmLinks)
     }
 
     /** Intercepts Service Worker fetch events (API 24+), which bypass
      *  WebViewClient.shouldInterceptRequest entirely. */
     private fun configureServiceWorker() {
-        if (androidx.webkit.WebViewFeature.isFeatureSupported(
-                androidx.webkit.WebViewFeature.SERVICE_WORKER_BASIC_USAGE)) {
-            androidx.webkit.ServiceWorkerControllerCompat.getInstance()
+        if (WebViewFeature.isFeatureSupported(
+                WebViewFeature.SERVICE_WORKER_BASIC_USAGE)) {
+            ServiceWorkerControllerCompat.getInstance()
                 .setServiceWorkerClient(
-                    object : androidx.webkit.ServiceWorkerClientCompat() {
-                        @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.LOLLIPOP)
-                        override fun shouldInterceptRequest(request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
+                    object : ServiceWorkerClientCompat() {
+                        @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
+                        override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? {
                             // Reuse the shared gate so the SW path cannot drift
                             // from the WebView client.
                             return VWebviewClient.shouldBlockForRequest(request)
@@ -471,16 +499,35 @@ class MainActivity : AppCompatActivity() {
      *  Runs on the UI thread; disk I/O is delegated to
      *  [loadVencordRuntimesFromDisk]. */
     private fun loadVencordRuntimes(sPrefs: SharedPreferences, editor: SharedPreferences.Editor) {
-        // runCatching: a String-typed safeMode key (restored or hand-edited
+        // getBooleanSafe: a String-typed safeMode key (restored or hand-edited
         // XML) would crash-loop :web cold start. The fallback is TRUE, not
         // the file's usual false: false means "load Vencord", which would
         // silently ignore the user's recovery request forever, since nothing
         // rewrites a poisoned key. True fails safe and routes into the else
         // branch, where the one-shot reset below overwrites the poison with
-        // a real Boolean.
-        if (!HttpClient.vencordDisabled && !runCatching { sPrefs.getBoolean("safeMode", false) }
-                .onFailure { VDELog.w("Main", "safeMode type-poisoned; failing safe: $it") }
-                .getOrDefault(true)) {
+        // a real Boolean. Read once for both branches; nothing rewrites the
+        // key before the one-shot reset below.
+        val safeMode = sPrefs.getBooleanSafe(SettingKeys.KEY_SAFE_MODE, false, poisonDefault = true) {
+            VDELog.w("Main", "safeMode type-poisoned; failing safe: $it")
+        }
+        // One-shot recovery flag for the "Disable themes" card. VendroidApp
+        // already raised the in-memory gate at process start, so this read
+        // only drives the toast and the reset; it sits outside the branch
+        // below because a themes-disabled session loads Vencord normally.
+        // Poison reads as true, mirroring the safeMode read above.
+        val disableThemes = sPrefs.getBooleanSafe(
+            SettingKeys.KEY_DISABLE_THEMES, false, poisonDefault = true
+        ) {
+            VDELog.w("Main", "disableThemes type-poisoned; failing safe: $it")
+        }
+        if (disableThemes) {
+            Toast.makeText(this, "User themes disabled for this session", Toast.LENGTH_SHORT)
+                .show()
+            VDELog.w("Main", "User themes disabled for this session; resetting one-shot flag")
+            editor.putBoolean(SettingKeys.KEY_DISABLE_THEMES, false)
+            editor.apply()
+        }
+        if (!HttpClient.vencordDisabled && !safeMode) {
             vencordNative = VencordNative(WeakReference(this), wv!!)
             wv?.addJavascriptInterface(vencordNative, "VencordMobileNative")
             // Usually a no-op: VendroidApp.onCreate() preloads both runtimes
@@ -505,31 +552,29 @@ class MainActivity : AppCompatActivity() {
             HttpClient.setVencordMobileRuntime(null)
             // First-entry gate: the kill switch persists across recreations,
             // the pref does not, so only the first run toasts and resets.
-            // Guarded like the read above. It cannot throw in practice: the
-            // else branch is only reachable after this process already read
-            // the key, and the cached type cannot change mid-process.
-            // Defense-in-depth against a future reorder. TRUE keeps the
-            // reset below reachable on poison, so the key still heals.
-            if (runCatching { sPrefs.getBoolean("safeMode", false) }
-                    .onFailure { VDELog.w("Main", "safeMode type-poisoned; failing safe: $it") }
-                    .getOrDefault(true)) {
+            // Reads the single safeMode val above; poison reads as true, so
+            // this reset still runs and the key heals.
+            if (safeMode) {
                 Toast.makeText(this, "Safe mode enabled, Vencord won't be loaded", Toast.LENGTH_SHORT)
                     .show()
                 VDELog.w("Main", "Safe mode enabled; Vencord will not load")
-                editor.putBoolean("safeMode", false)
+                editor.putBoolean(SettingKeys.KEY_SAFE_MODE, false)
                 editor.apply()
             }
         }
     }
 
     /**
-     * Schedules the bundle freshness check [BUNDLE_CHECK_DEFER_MS] past the
-     * boot window instead of running it at startup. The disk-preloaded
-     * runtime already boots the page, so the outcome never gates first paint;
-     * its only outputs are freshness bookkeeping and, on a new bundle, a
-     * mid-session publish that applies on the next navigation. Deferring
-     * keeps the connection setup (a fresh TCP/TLS to a second host) and any
-     * 200 download out of the most latency-sensitive window of the boot.
+     * Schedules the bundle freshness check past the boot window instead of
+     * running it at startup, keeping the second-host TCP/TLS setup and any
+     * 200 download out of the most latency-sensitive window of boot. The
+     * deferral is safe only while a runtime can paint without the network,
+     * since the check produces just freshness bookkeeping and, on a new
+     * bundle, a mid-session publish applied on the next navigation. When no
+     * runtime is loadable (a clientMod switch deleted the bundle, an app
+     * version bump skipped the disk preload, a fresh install), the fetch
+     * starts with boot instead; a deferral would leave first paint un-modded
+     * until the missedInjection reload. [bundleCheckDelayMs] owns the verdict.
      *
      * The posted Runnable captures only locals plus a WeakReference:
      * referencing [fetchExecutor] in the lambda would resolve it through the
@@ -545,6 +590,13 @@ class MainActivity : AppCompatActivity() {
     private fun scheduleDeferredBundleCheck() {
         val executor = fetchExecutor
         val weakSelf = WeakReference(this)
+        val sPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
+        // Cheap pref reads; the delay must be decided before postDelayed.
+        val delayMs = bundleCheckDelayMs(
+            runtimeInMemory = HttpClient.VencordRuntime != null,
+            needsRedownload = HttpClient.needsBundleRedownload(sPrefs),
+            bundleFileExists = File(filesDir, "vencord.js").exists()
+        )
         Handler(Looper.getMainLooper()).postDelayed({
             val act = weakSelf.get()
             if (act == null || act.isFinishing || act.isDestroyed) return@postDelayed
@@ -575,7 +627,7 @@ class MainActivity : AppCompatActivity() {
                 // unreachable via the lifecycle (see the liveness note above),
                 // kept so a future caller cannot crash the main thread.
             }
-        }, BUNDLE_CHECK_DEFER_MS)
+        }, delayMs)
     }
 
     /** Loads whichever runtimes are still missing, off the UI thread. */
@@ -589,6 +641,33 @@ class MainActivity : AppCompatActivity() {
         fetchExecutor.execute { runSafetyNetLoad(sPrefs, res, dir, weakSelf) }
     }
 
+    /** Loads the app shell and re-anchors the bridge host to it. Returns the
+     *  shell URL so callers can mirror it into currentUrlForBridge where the
+     *  bridge must name the shell before the document commits. */
+    private fun loadAppShell(): String {
+        wv!!.loadUrl(Constants.APP_SHELL_URL)
+        currentHostForBridge = Constants.APP_SHELL_HOST
+        return Constants.APP_SHELL_URL
+    }
+
+    /**
+     * Deep-link policy shared by [resolveInitialUrl] and [handleUrl]:
+     * NavigationPolicy.decide on a main-frame navigation, with a SHOW_POPUP
+     * verdict routed to the link popup. Returns the verdict; the load/defer
+     * handling stays with the callers (cold start loads the shell, a running
+     * session defers via pendingDeepLink or drops).
+     */
+    private fun decideDeepLinkWithPopup(url: Uri): NavigationPolicy.Action {
+        // Route through NavigationPolicy so path rules (e.g. /blog -> popup)
+        // apply to deep links like in-WebView navigations, instead of
+        // bypassing them via a direct loadUrl.
+        val action = NavigationPolicy.decide(url, true)
+        if (action == NavigationPolicy.Action.SHOW_POPUP) {
+            LinkHandler(this).showLinkPopup(url)
+        }
+        return action
+    }
+
     /** Resolves the initial URL from a deep link intent or the last resume
      *  URL. The caller defuses a consumed deep-link launch (setIntent) so
      *  recreation cannot re-run it. */
@@ -599,12 +678,8 @@ class MainActivity : AppCompatActivity() {
             // Deep-link gate, see Constants.isDeepLinkHandledDomain.
             if (host != null && Constants.isDeepLinkHandledDomain(host)) {
                 val target = data.toString()
-                // Route through NavigationPolicy so path rules (e.g. /blog ->
-                // popup) apply to deep links like in-WebView navigations,
-                // instead of bypassing them via a direct loadUrl.
-                val action = com.nin0dev.vendroid.webview.NavigationPolicy.decide(data, true)
-                if (action
-                    == com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
+                val action = decideDeepLinkWithPopup(data)
+                if (action == NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
                     wv!!.loadUrl(target)
                     currentUrlForBridge = target
                     // A discord.gg invite 302s to an app origin; onPageStarted
@@ -612,37 +687,31 @@ class MainActivity : AppCompatActivity() {
                     currentHostForBridge = host
                     return target
                 }
-                // Path/domain rule (e.g. /blog or a CDN host): show the popup
-                // and load the app shell. IGNORE skips the popup.
-                if (action
-                    == com.nin0dev.vendroid.webview.NavigationPolicy.Action.SHOW_POPUP) {
-                    com.nin0dev.vendroid.webview.LinkHandler(this).showLinkPopup(data)
-                }
-                currentUrlForBridge = "https://discord.com/app"
-                currentHostForBridge = "discord.com"
-                wv!!.loadUrl("https://discord.com/app")
-                return "https://discord.com/app"
+                // Path/domain rule (e.g. /blog or a CDN host): the popup was
+                // already shown by [decideDeepLinkWithPopup] (IGNORE skips
+                // it). Either way, load the app shell.
+                // Popup variant: this path also re-anchors currentUrlForBridge;
+                // set it before loadUrl (as before) so a bridge read before the
+                // commit names the shell, not a stale page.
+                currentUrlForBridge = Constants.APP_SHELL_URL
+                return loadAppShell()
             }
             // Non-Discord deep link (or no data): load the default app shell.
-            wv!!.loadUrl("https://discord.com/app")
-            currentHostForBridge = "discord.com"
-            return "https://discord.com/app"
+            return loadAppShell()
         }
         // Remember-last-channel off: load the app shell instead of a saved
         // position, and drop any saved URL so re-enabling can't restore one.
-        // runCatching: a String-typed key left by an older build would crash
+        // getBooleanSafe: a String-typed key left by an older build would crash
         // startup here, before the bridge's write-path recovery can purge it.
-        if (!runCatching { sPrefs.getBoolean("vendroid_rememberLastChannel", false) }
-                .onFailure { VDELog.w("Main", "vendroid_rememberLastChannel type-poisoned; using default: $it") }
-                .getOrDefault(false)) {
-            if (sPrefs.contains("lastUrl")) {
-                sPrefs.edit { remove("lastUrl") }
+        if (!sPrefs.getBooleanSafe(SettingKeys.KEY_VENDROID_REMEMBER_LAST_CHANNEL, false) {
+                VDELog.w("Main", "vendroid_rememberLastChannel type-poisoned; using default: $it")
+            }) {
+            if (sPrefs.contains(SettingKeys.KEY_LAST_URL)) {
+                sPrefs.edit { remove(SettingKeys.KEY_LAST_URL) }
             }
-            wv!!.loadUrl("https://discord.com/app")
-            currentHostForBridge = "discord.com"
-            return "https://discord.com/app"
+            return loadAppShell()
         }
-        val lastUrl = sPrefs.getString("lastUrl", null)
+        val lastUrl = sPrefs.getString(SettingKeys.KEY_LAST_URL, null)
         if (lastUrl != null) {
             val host = Uri.parse(lastUrl).host
             // The restore below calls loadUrl(), which bypasses
@@ -657,13 +726,9 @@ class MainActivity : AppCompatActivity() {
             }
             // Stale non-app URL (e.g. /blog/...): fall back to /app rather
             // than reloading a page with no back history.
-            wv!!.loadUrl("https://discord.com/app")
-            currentHostForBridge = "discord.com"
-            return "https://discord.com/app"
+            return loadAppShell()
         }
-        wv!!.loadUrl("https://discord.com/app")
-        currentHostForBridge = "discord.com"
-        return "https://discord.com/app"
+        return loadAppShell()
     }
 
     private fun handleUrl(url: Uri?) {
@@ -674,22 +739,22 @@ class MainActivity : AppCompatActivity() {
         // Deep-link gate, see Constants.isDeepLinkHandledDomain.
         if (host == null || !Constants.isDeepLinkHandledDomain(host)) return
         val path = url.path ?: ""
-        // Route through NavigationPolicy like the cold-start path
-        // (resolveInitialUrl). Otherwise a /blog link drives the
+        // Shared policy with the cold-start path (resolveInitialUrl).
+        // Otherwise a /blog link drives the
         // SPA to a page with no back path, and a cdn.discordapp.com link
         // builds a garbage transitionTo route from the URL's path.
-        val action = com.nin0dev.vendroid.webview.NavigationPolicy.decide(url, true)
-        if (action == com.nin0dev.vendroid.webview.NavigationPolicy.Action.IGNORE) {
+        val action = decideDeepLinkWithPopup(url)
+        if (action == NavigationPolicy.Action.IGNORE) {
             return
         }
-        if (action != com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
-            // Path/domain rule triggered (e.g. /blog or a CDN host): show the
-            // link popup and stay on the current page (cold start has no
-            // current page, so it loads the shell instead). Leave the bridge
-            // URL/host fields alone so they keep naming the live page; a
-            // non-app-origin host fails VencordNative's domain checks closed.
+        if (action != NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
+            // Path/domain rule triggered (e.g. /blog or a CDN host): the
+            // popup was already shown by [decideDeepLinkWithPopup]; stay on
+            // the current page (cold start has no current page, so it loads
+            // the shell instead). Leave the bridge URL/host fields alone so
+            // they keep naming the live page; a non-app-origin host fails
+            // VencordNative's domain checks closed.
             VDELog.d("Main", "Deep link policy popup: ${UrlNormalizer.redactForLog(url.toString())}")
-            com.nin0dev.vendroid.webview.LinkHandler(this).showLinkPopup(url)
             return
         }
         if (!Constants.isDiscordAppOrigin(host)) {
@@ -734,7 +799,7 @@ class MainActivity : AppCompatActivity() {
             // fails silently instead of throwing a ReferenceError.
             wv!!.evaluateJavascript(
                 "if(window.Vencord&&Vencord.Webpack&&Vencord.Webpack.Common)" +
-                    "{Vencord.Webpack.Common.NavigationRouter.transitionTo(${gson.toJson(path)})}",
+                    "{Vencord.Webpack.Common.NavigationRouter.transitionTo(${vdeGson.toJson(path)})}",
                 null
             )
         }
@@ -761,7 +826,7 @@ class MainActivity : AppCompatActivity() {
         val androidPerms = grantable.mapNotNull {
             when (it) {
                 PermissionRequest.RESOURCE_AUDIO_CAPTURE ->
-                    android.Manifest.permission.RECORD_AUDIO
+                    Manifest.permission.RECORD_AUDIO
                 else -> null
             }
         }.toTypedArray()
@@ -771,7 +836,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val missing = androidPerms.filter {
-            checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
         }.toTypedArray()
         if (missing.isEmpty()) {
             VDELog.i("Voice", "Granting WebView capture (runtime permission already held)")
@@ -810,7 +875,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val granted = grantResults.isNotEmpty() &&
-            grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+            grantResults.all { it == PackageManager.PERMISSION_GRANTED }
         if (granted) {
             VDELog.i("Voice", "Android microphone permission granted; granting WebView capture")
             try {
@@ -845,14 +910,14 @@ class MainActivity : AppCompatActivity() {
             // MainFrameDiskCache.isResumableRoute predicate, shared with the
             // disk-cache gate) and only while remember-last-channel is on; a
             // saved /blog page would reload with empty back history.
-            val prefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-            // runCatching: a String-typed key left by an older build would
+            val prefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
+            // getBooleanSafe: a String-typed key left by an older build would
             // crash onPause. Falling back to off skips the persist.
             if (host != null && MainFrameDiskCache.isResumableRoute(url) &&
-                runCatching { prefs.getBoolean("vendroid_rememberLastChannel", false) }
-                    .onFailure { VDELog.w("Main", "vendroid_rememberLastChannel type-poisoned; using default: $it") }
-                    .getOrDefault(false)) {
-                prefs.edit() { putString("lastUrl", url) }
+                prefs.getBooleanSafe(SettingKeys.KEY_VENDROID_REMEMBER_LAST_CHANNEL, false) {
+                    VDELog.w("Main", "vendroid_rememberLastChannel type-poisoned; using default: $it")
+                }) {
+                prefs.edit() { putString(SettingKeys.KEY_LAST_URL, url) }
             }
         }
         // Spoof document.hidden and pause CSS animations so the React app
@@ -913,7 +978,7 @@ class MainActivity : AppCompatActivity() {
         wv?.pauseTimers()
         wv?.stopLoading()
         wvInitialized = false
-        (wv?.parent as? android.view.ViewGroup)?.removeView(wv)
+        (wv?.parent as? ViewGroup)?.removeView(wv)
         // wv is nulled immediately (see the threading-model note on wv):
         // callbacks flushed after destroy() see null and no-op.
         wv?.destroy()
@@ -952,7 +1017,7 @@ class MainActivity : AppCompatActivity() {
         // never runs. The probe result callback re-checks liveness itself.
         val w = wv ?: return
         val expectedHost = Uri.parse(currentUrlForBridge ?: return).host
-            ?.let { gson.toJson(it) } ?: return
+            ?.let { vdeGson.toJson(it) } ?: return
         // The renderer must already sit on the expected Discord host. A
         // mismatch means a provisional document (mid-navigation commit)
         // with no guaranteed quota-managed storage yet; evaluating the
@@ -987,6 +1052,7 @@ class MainActivity : AppCompatActivity() {
                     // embed's shared script tag aborted partway). Inject only
                     // the missing part.
                     try { w.evaluateJavascript(mobileRuntime + ";", null) }
+                    // WebView torn down since the probe; the scheduled boot re-verify still runs.
                     catch (_: IllegalStateException) {}
                     // The page-finished probe may have already persisted a fail
                     // with the mobile runtime absent; re-verify after the repair.
@@ -1001,17 +1067,7 @@ class MainActivity : AppCompatActivity() {
                         return@evaluateJavascript
                     }
                     VDELog.i("Main", "Injecting Vencord runtime (${runtime.length} chars, mobile=${mobileRuntime.length} chars)")
-                    try {
-                        // Capability-token bootstrap must run first so the token
-                        // is in scope before the runtimes call the bridge. It is
-                        // idempotent if the document already ran it.
-                        w.evaluateJavascript(VencordNative.bridgeBootstrapJs() + ";", null)
-                        // Env shim precedes the bundle (see VENCORD_PRELUDE_JS).
-                        w.evaluateJavascript(JsPatches.VENCORD_PRELUDE_JS + ";" + runtime + ";", null)
-                        w.evaluateJavascript(mobileRuntime + ";", null)
-                    } catch (_: IllegalStateException) {
-                        // WebView destroyed between the checks and these calls.
-                    }
+                    RuntimeInjector.injectViaBridge(w, runtime, mobileRuntime)
                     // Verify the runtimes actually booted (separate eval so it
                     // runs even if the bundle eval died mid-script).
                     scheduleBootVerify("eval-inject")
@@ -1055,49 +1111,45 @@ class MainActivity : AppCompatActivity() {
             return
         }
         BootVerify.runProbe(w, source) { ok, verdict ->
-            persistBootState(ok, verdict)
+            persistBootState { build -> (if (ok) "ok" else "fail") + " $build | " + verdict.take(140) }
         }
     }
 
-    /** Persists a short human-readable boot summary for the recovery screen. */
-    private fun persistBootState(ok: Boolean, verdict: String) {
+    /** Persists a short human-readable boot summary for the recovery screen.
+     *  [formatState] renders the summary from the current bundle build tag.
+     *  Best-effort: any failure is swallowed. */
+    private fun persistBootState(formatState: (build: String) -> String) {
         try {
-            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+            val sPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
             val build = sPrefs.getString(HttpClient.PREF_BUNDLE_BUILD, null) ?: "unknown-build"
-            val state = (if (ok) "ok" else "fail") + " $build | " + verdict.take(140)
+            val state = formatState(build)
             if (sPrefs.getString(PREF_LAST_BOOT_STATE, null) == state) return
             sPrefs.edit().putString(PREF_LAST_BOOT_STATE, state).apply()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            // A failed pref write must not disturb boot verification.
+        }
     }
 
     /** Persists the safe-mode marker for the recovery screen. */
     private fun persistSafeModeBootState() {
-        try {
-            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-            val build = sPrefs.getString(HttpClient.PREF_BUNDLE_BUILD, null) ?: "unknown-build"
-            val state = "safe-mode (Vencord disabled) $build"
-            if (sPrefs.getString(PREF_LAST_BOOT_STATE, null) == state) return
-            sPrefs.edit().putString(PREF_LAST_BOOT_STATE, state).apply()
-        } catch (_: Exception) {}
+        persistBootState { build -> "safe-mode (Vencord disabled) $build" }
     }
 
     fun showDiscordToast(message: String, type: String) {
-        // message is JSON-encoded via gson.toJson before interpolation, but type
+        // message is JSON-encoded via vdeGson.toJson before interpolation, but type
         // is concatenated raw. Keep the allowList strict; widening it would
         // allow JS injection via the unencoded type.
         val allowedTypes = setOf("SUCCESS", "ERROR", "INFO", "WARN")
         val safeType = if (type in allowedTypes) type else "INFO"
         wv?.post(Runnable {
             wv?.evaluateJavascript(
-                "toasts=Vencord.Webpack.Common.Toasts; toasts.show({id: toasts.genId(), message: ${gson.toJson(message)}, type: toasts.Type.$safeType, options: {position: toasts.Position.BOTTOM,}})",
+                "toasts=Vencord.Webpack.Common.Toasts; toasts.show({id: toasts.genId(), message: ${vdeGson.toJson(message)}, type: toasts.Type.$safeType, options: {position: toasts.Position.BOTTOM,}})",
                 null
             )
         })
     }
 
     companion object {
-        private val gson = Gson()
-
         /** SharedPreferences key for the last boot state summary (recovery screen). */
         const val PREF_LAST_BOOT_STATE = "lastBootState"
 
@@ -1119,14 +1171,14 @@ class MainActivity : AppCompatActivity() {
          * the legacy keys right after; callers must log uncoercible keys.
          */
         internal fun computeSettingsMigration(all: Map<String, Any?>): SettingsMigrationPlan {
-            val checkUpdates = coerceLegacyBoolean(all["checkVendroidUpdates"])
-            val equicord = coerceLegacyBoolean(all["equicord"])
+            val checkUpdates = coerceLegacyBoolean(all[SettingKeys.KEY_CHECK_VENDROID_UPDATES])
+            val equicord = coerceLegacyBoolean(all[SettingKeys.KEY_EQUICORD])
             val clientMod = when {
-                all["clientMod"] != null -> null // already set; never clobber
+                all[SettingKeys.KEY_CLIENT_MOD] != null -> null // already set; never clobber
                 equicord == true -> "equicord"
                 else -> "vencord"
             }
-            val uncoercible = listOf("checkVendroidUpdates", "equicord").filter { key ->
+            val uncoercible = listOf(SettingKeys.KEY_CHECK_VENDROID_UPDATES, SettingKeys.KEY_EQUICORD).filter { key ->
                 all[key] != null && coerceLegacyBoolean(all[key]) == null
             }
             return SettingsMigrationPlan(checkUpdates ?: true, clientMod, uncoercible)
@@ -1160,6 +1212,21 @@ class MainActivity : AppCompatActivity() {
         private const val BUNDLE_CHECK_DEFER_MS = 10_000L
 
         /**
+         * Delay for [scheduleDeferredBundleCheck]; see that KDoc for the
+         * rationale. [deferMs] when this boot can paint with a runtime
+         * without the network (one already in memory, or a loadable on-disk
+         * bundle the disk preload is about to publish); 0 otherwise, so the
+         * fetch starts with boot.
+         */
+        internal fun bundleCheckDelayMs(
+            runtimeInMemory: Boolean,
+            needsRedownload: Boolean,
+            bundleFileExists: Boolean,
+            deferMs: Long = BUNDLE_CHECK_DEFER_MS
+        ): Long =
+            if (runtimeInMemory || (!needsRedownload && bundleFileExists)) deferMs else 0L
+
+        /**
          * Body of [loadVencordRuntimesFromDisk]. Companion-scoped and internal
          * so unit tests can drive it synchronously, and so the queued lambda
          * captures no activity.
@@ -1174,7 +1241,7 @@ class MainActivity : AppCompatActivity() {
          */
         internal fun runSafetyNetLoad(
             sPrefs: SharedPreferences,
-            res: android.content.res.Resources,
+            res: Resources,
             dir: File,
             weakSelf: WeakReference<MainActivity>
         ) {

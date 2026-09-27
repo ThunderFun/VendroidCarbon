@@ -1,6 +1,7 @@
 package com.nin0dev.vendroid.webview
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -93,7 +94,7 @@ class LinkHandler(context: Context) {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         try {
             activity.startActivity(chooser)
-        } catch (_: android.content.ActivityNotFoundException) {
+        } catch (_: ActivityNotFoundException) {
             // No browser installed; shouldOverrideUrlLoading already blocked in-WebView nav.
         }
     }
@@ -111,7 +112,7 @@ class LinkHandler(context: Context) {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         try {
             activity.startActivity(Intent.createChooser(intent, null).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (_: android.content.ActivityNotFoundException) {
+        } catch (_: ActivityNotFoundException) {
             // No share targets available.
         }
     }

@@ -7,6 +7,8 @@
             if (!sections || sections.length === 0) return;
             var section = sections[sections.length - 1];
 
+            // Injector order is render order; the switcher stays first.
+            injectClientModSwitcherIfMissing(section);
             injectAppIconPickerIfMissing(section);
             injectLogsRowIfMissing(section);
             injectFirewallRowIfMissing(section);
@@ -33,6 +35,132 @@
             (section.firstChild ? 'margin-top:40px;' : '');
         header.textContent = title;
         section.appendChild(header);
+    }
+
+    // "Client mod" switcher (Vencord ⇄ Equicord). The row only reads and
+    // writes the clientMod pref; setString can silently early-return (rate
+    // limiter, token check), so the dots reconcile to the persisted value
+    // after each write. The switch takes effect on the next cold start,
+    // hence the "Restart now" affordance.
+    function injectClientModSwitcherIfMissing(section) {
+        try {
+            if (section.querySelector('[data-vde-client-mod-switcher]')) return;
+            ensureSectionHeader(section, 'client-mod', 'Client mod');
+
+            var wrap = document.createElement('div');
+            wrap.setAttribute('data-vde-client-mod-switcher', '1');
+            wrap.style.cssText = 'width:100%;';
+
+            var desc = document.createElement('div');
+            desc.className = 'vde-component-setting-description';
+            desc.style.cssText = 'color:var(--text-muted);margin-bottom:10px;';
+            desc.textContent = 'Choose which client mod bundle the app loads. Equicord is a Vencord fork with more plugins. Switching re-downloads the bundle on the next app start.';
+            wrap.appendChild(desc);
+
+            // Restart prompt; hidden until a switch actually lands.
+            var restartNote = document.createElement('div');
+            restartNote.style.cssText = 'display:none;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;';
+            var restartText = document.createElement('span');
+            restartText.style.cssText = 'color:var(--header-primary);font-size:13px;flex:1 1 auto;';
+            var restartBtn = document.createElement('button');
+            restartBtn.type = 'button';
+            restartBtn.textContent = 'Restart now';
+            restartBtn.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;padding:6px 14px;background:var(--brand-primary,#5865f2);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;flex:none;-webkit-tap-highlight-color:transparent;';
+            restartBtn.addEventListener('click', function() {
+                try { VencordMobileNative.requestNative('restartApp'); } catch(e) {
+                    console.error('[Vendroid] restartApp failed: ' + e.message);
+                }
+            });
+            restartNote.appendChild(restartText);
+            restartNote.appendChild(restartBtn);
+            wrap.appendChild(restartNote);
+
+            var list = document.createElement('div');
+            list.style.cssText = 'display:flex;flex-direction:column;width:100%;';
+            wrap.appendChild(list);
+
+            var rows = [];
+            function setDotState(dot, selected) {
+                dot.style.border = selected ? '6px solid var(--brand-primary,#5865f2)' : '2px solid var(--interactive-muted,#72767d)';
+                dot.style.background = selected ? '#fff' : 'transparent';
+            }
+
+            function renderSelection(active) {
+                rows.forEach(function (entry) {
+                    setDotState(entry.dot, entry.name === active);
+                });
+            }
+
+            // Anything but "equicord" reads as Vencord, matching
+            // resolveBundleLocation.
+            function currentMod() {
+                try {
+                    var v = VencordMobileNative.getString('clientMod', 'vencord');
+                    return v === 'equicord' ? 'equicord' : 'vencord';
+                } catch (e) {
+                    return 'vencord';
+                }
+            }
+
+            function showRestartPending(mod) {
+                restartText.textContent = 'Restart the app to finish switching to ' + (mod === 'equicord' ? 'Equicord' : 'Vencord') + '.';
+                restartNote.style.display = 'flex';
+            }
+
+            ['Vencord', 'Equicord'].forEach(function (name) {
+                var value = name.toLowerCase();
+                var row = document.createElement('div');
+                row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;cursor:pointer;-webkit-tap-highlight-color:transparent;';
+
+                var label = document.createElement('div');
+                label.style.cssText = 'color:var(--header-primary);font-size:14px;font-weight:500;';
+                label.textContent = name;
+                row.appendChild(label);
+
+                var dot = document.createElement('span');
+                dot.style.cssText = 'width:20px;height:20px;border-radius:50%;flex:none;box-sizing:border-box;';
+                row.appendChild(dot);
+
+                row.addEventListener('click', function () {
+                    // Debounce double-taps; the 700ms window outlasts the
+                    // bridge's 500ms write rate limit.
+                    if (list.getAttribute('data-busy') === '1') return;
+                    var active = currentMod();
+                    if (value === active) return;
+                    list.setAttribute('data-busy', '1');
+                    try {
+                        VencordMobileNative.setString('clientMod', value);
+                    } catch (e) {
+                        console.error('[Vendroid] setString clientMod failed: ' + e.message);
+                    }
+                    // Re-read: a rejected write must not leave an unapplied
+                    // selection on screen.
+                    var persisted = currentMod();
+                    renderSelection(persisted);
+                    if (persisted === value) {
+                        showRestartPending(persisted);
+                    } else {
+                        console.error('[Vendroid] setString clientMod rejected; selection unchanged');
+                    }
+                    setTimeout(function () { list.removeAttribute('data-busy'); }, 700);
+                });
+
+                list.appendChild(row);
+                rows.push({ name: value, dot: dot });
+            });
+
+            renderSelection(currentMod());
+
+            var divider = document.createElement('div');
+            divider.className = 'vde-divider-setting';
+            divider.style.cssText = 'width:100%;height:1px;border-top:thin solid var(--background-modifier-accent);margin-top:20px;margin-bottom:20px;';
+            wrap.appendChild(divider);
+
+            section.appendChild(wrap);
+            console.warn('[Vendroid] Client mod switcher injected into Vendroid settings');
+        } catch (e) {
+            console.error('[Vendroid] injectClientModSwitcherIfMissing error: ' + e.message);
+        }
     }
 
     // One launcher activity-alias per icon (IconAliasManager.ICON_NAMES).

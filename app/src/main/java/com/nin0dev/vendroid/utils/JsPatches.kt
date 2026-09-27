@@ -140,13 +140,28 @@ object JsPatches {
      * is safe.
      *
      * Fallback path: injectFirewallAndCss embeds the same three patches at
-     * `</head>` and consumeFirewallEmbedded() skips this call when the embed
-     * landed. This string serves pages where no `</head>` was found or the
+     * `</head>` and EmbeddedUrlClaims.consumeFirewall() skips this call when the
+     * embed landed. This string serves pages where no `</head>` was found or the
      * embed threw. Keep the compositions identical; dropping a patch from
      * either side silently disables it on that path.
      */
     val STARTUP_PATCHES_JS: String
         get() = NETWORK_FIREWALL_JS + ";" + ANIMATION_PATCH_JS + ";" + CSP_VIOLATION_REPORTER_JS
+
+    /**
+     * [VENCORD_PRELUDE_JS] prefixed with the user-theme gate flag. The flag
+     * must be set before the prelude runs: the prelude installs the
+     * VencordNative setter trap that neuters uploaded themes only when the
+     * flag is on. Both injection paths (RuntimeInjector's eval chain and
+     * ResponseHtmlInjector's `</head>` embed) must call this function, not
+     * use the raw prelude, or that path runs without the trap.
+     *
+     * Callers pass the in-memory gate (HttpClient.userCssDisabled), not the
+     * pref: MainActivity resets the pref one-shot while the gate stays
+     * raised for the life of the process.
+     */
+    fun vencordPreludeJs(userThemesDisabled: Boolean): String =
+        "window.VENCORD_USER_THEMES_DISABLED=$userThemesDisabled;" + VENCORD_PRELUDE_JS
 
     /**
      * Environment prelude that must run BEFORE the Vencord bundle on every
@@ -180,6 +195,30 @@ object JsPatches {
             "'use strict';" +
             "if(window.__vdeEnvShim)return;" +
             "window.__vdeEnvShim=1;" +
+            // User-theme gate (recovery session only; flag set by
+            // vencordPreludeJs). The bundle publishes window.VencordNative
+            // with a plain assignment, so an accessor setter installed here
+            // intercepts the assigned object and blanks themes.getThemeData,
+            // making uploaded themes resolve to empty CSS. Remote theme links
+            // are handled natively (the forge-host CSS gate in
+            // VWebviewClient). Must never throw, or the rest of the env shim
+            // (localStorage fallback, getDisplayMedia/setSinkId shims) is
+            // skipped. typeof VencordNative is "undefined" until the bundle
+            // assigns; vencord_mobile.js's quickCss poll keys on exactly
+            // that, so do not "fix" it.
+            "try{if(window.VENCORD_USER_THEMES_DISABLED&&!window.__vdeThemeGate){" +
+                "window.__vdeThemeGate=1;" +
+                "var vdeThemeNative;" +
+                "Object.defineProperty(window,'VencordNative',{configurable:true," +
+                    "get:function(){return vdeThemeNative;}," +
+                    "set:function(v){vdeThemeNative=v;" +
+                        "try{if(v&&v.themes&&typeof v.themes.getThemeData==='function'){" +
+                            "v.themes.getThemeData=function(){return Promise.resolve('');};" +
+                            "console.warn('[Vendroid] User themes suppressed for this session')" +
+                        "}}catch(e){console.error('[Vendroid] theme gate install failed',e)}" +
+                    "}" +
+                "});" +
+            "}}catch(e){console.error('[Vendroid] theme gate install failed',e)}" +
             // Boot-probe snapshot (boot0): storage health at injection time,
             // before any page script ran.
             "try{window.__vdeLsBoot=typeof window.localStorage}catch(_){window.__vdeLsBoot='throws'}" +

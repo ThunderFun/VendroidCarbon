@@ -3,6 +3,7 @@ package com.nin0dev.vendroid
 import android.webkit.WebView
 import com.nin0dev.vendroid.utils.VDELog
 import com.nin0dev.vendroid.webview.UrlNormalizer
+import org.json.JSONArray
 
 internal object BootVerify {
     // Boot-verify probe: checks for Vencord/VencordMobile globals and any
@@ -57,7 +58,7 @@ internal object BootVerify {
     /** Un-quotes the JSON string returned by evaluateJavascript. */
     private fun unquoteJsResult(raw: String): String =
         try {
-            org.json.JSONArray("[$raw]").getString(0)
+            JSONArray("[$raw]").getString(0)
         } catch (_: Exception) {
             raw.trim('"')
         }

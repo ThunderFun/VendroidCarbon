@@ -3,6 +3,7 @@ package com.nin0dev.vendroid.utils
 import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Process
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
@@ -12,7 +13,11 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 object VDELog {
     enum class Level { DEBUG, INFO, WARN, ERROR }
@@ -48,7 +53,7 @@ object VDELog {
     // buffer is capped independently; under a flood (e.g. the report-only CSP
     // reporter) the ring buffer keeps the last N entries even if the disk sink
     // is deliberately throttled.
-    private val pendingWrites = java.util.concurrent.atomic.AtomicInteger(0)
+    private val pendingWrites = AtomicInteger(0)
     private const val MAX_PENDING_WRITES = 2000
 
     fun init(context: Context, persistToFile: Boolean) {
@@ -64,7 +69,7 @@ object VDELog {
             // rotation race (both processes used to rotate vde_logs.txt).
             return
         }
-        val thread = HandlerThread("VDELog-writer", android.os.Process.THREAD_PRIORITY_BACKGROUND)
+        val thread = HandlerThread("VDELog-writer", Process.THREAD_PRIORITY_BACKGROUND)
         thread.start()
         handler = Handler(thread.looper)
         // Rotate the previous session's file aside (rather than truncating it)
@@ -88,9 +93,11 @@ object VDELog {
                 } else {
                     openWriterLocked(append = false)
                 }
-                val header = "--- Session: ${dateFmt.format(Instant.now().atZone(zone))} (PID=${android.os.Process.myPid()}) ---\n"
+                val header = "--- Session: ${dateFmt.format(Instant.now().atZone(zone))} (PID=${Process.myPid()}) ---\n"
                 writeLineLocked(header)
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                // Disk init failed for this session; the in-memory ring buffer still works.
+            }
         }
     }
 
@@ -137,8 +144,8 @@ object VDELog {
 
     // Bounded so hostile console spam of distinct large numbers cannot grow it.
     private const val MAX_SNOWFLAKE_ALIASES = 128
-    private val snowflakeAliases = java.util.concurrent.ConcurrentHashMap<String, String>()
-    private val snowflakeCounter = java.util.concurrent.atomic.AtomicInteger(0)
+    private val snowflakeAliases = ConcurrentHashMap<String, String>()
+    private val snowflakeCounter = AtomicInteger(0)
 
     /**
      * Replaces Discord snowflakes with stable aliases ("[sn1]", "[sn2]",
@@ -192,7 +199,9 @@ object VDELog {
         handler?.post {
             try {
                 openWriterLocked(append = false)
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                // Reopen failure leaves the previous session's file in place.
+            }
         }
     }
 
@@ -204,7 +213,9 @@ object VDELog {
                 try {
                     writer?.flush()
                     writer?.close()
-                } catch (_: Exception) {}
+                } catch (_: Exception) {
+                    // Already shutting down; the unwritten tail is lost either way.
+                }
                 writer = null
             }
             h.looper.quitSafely()
@@ -216,12 +227,14 @@ object VDELog {
         // Flush on the handler thread so the on-disk file is current.
         val h = handler
         if (h != null) {
-            val latch = java.util.concurrent.CountDownLatch(1)
+            val latch = CountDownLatch(1)
             h.post {
+                // Flush failed; the read below returns whatever reached disk.
                 try { writer?.flush() } catch (_: Exception) {}
                 latch.countDown()
             }
-            try { latch.await(2, java.util.concurrent.TimeUnit.SECONDS) } catch (_: InterruptedException) {}
+            // Interrupted: proceed rather than hang; the file may be one line stale.
+            try { latch.await(2, TimeUnit.SECONDS) } catch (_: InterruptedException) {}
         }
         return try {
             val f = logFile ?: return "No log file."
@@ -253,6 +266,7 @@ object VDELog {
             rotateIfNeededLocked()
         } catch (_: Exception) {
             // Writer may be in a bad state; force a reopen on the next line.
+            // close() failure changes nothing; writer is nulled below.
             try { writer?.close() } catch (_: Exception) {}
             writer = null
         }
@@ -277,10 +291,13 @@ object VDELog {
     private fun openWriterLocked(append: Boolean) {
         try {
             writer?.close()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            // Nothing to salvage from a writer this call is about to replace.
+        }
         writer = null
         val f = logFile ?: return
         if (!append) {
+            // Pre-truncate is best-effort; the writer below reopens without append, which truncates.
             try { f.writeText("") } catch (_: Exception) {}
             currentFileBytes = 0
         } else {
@@ -316,7 +333,9 @@ object VDELog {
             // If rotation failed, reopen in append mode so logging continues.
             try {
                 openWriterLocked(append = true)
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                // Recovery failed too; logging stays down until the next write reopens it.
+            }
         }
     }
 }

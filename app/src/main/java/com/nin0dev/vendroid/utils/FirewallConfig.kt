@@ -2,6 +2,7 @@ package com.nin0dev.vendroid.utils
 
 import android.content.Context
 import android.content.SharedPreferences
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -151,7 +152,7 @@ object FirewallConfig {
     // UninitializedPropertyAccessException. The singleton's init requirement
     // must not couple to an uncaught runtime exception.
     private var prefs: SharedPreferences? = null
-    private val initialized = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val initialized = AtomicBoolean(false)
     @Volatile private var cachedSnapshot: Set<String> = emptySet()
     @Volatile private var cachedJsSnapshot: Set<String> = emptySet()
 

@@ -7,13 +7,17 @@ import android.net.Uri
 import android.widget.Toast
 import androidx.core.content.edit
 import com.nin0dev.vendroid.BuildConfig
-import com.nin0dev.vendroid.R
+import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.utils.Constants
+import com.nin0dev.vendroid.utils.SettingKeys
 import com.nin0dev.vendroid.utils.VDELog
+import com.nin0dev.vendroid.utils.getStringSafe
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import okhttp3.ConnectionPool
 import okhttp3.HttpUrl
@@ -22,6 +26,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.net.HttpURLConnection
+import java.security.MessageDigest
 
 object HttpClient {
     // Generous ceiling for any text body read into memory (bundle, CSS).
@@ -83,6 +88,23 @@ object HttpClient {
     var vencordDisabled: Boolean = false
 
     /**
+     * Session switch for the recovery "Disable themes" action. Raised at
+     * process start by VendroidApp.applyUserCssGate from the one-shot
+     * "disableThemes" pref; never cleared for the life of the process, and
+     * not re-read from the pref because MainActivity resets it one-shot at
+     * startup (same shape as [vencordDisabled]).
+     *
+     * While raised, user theme CSS is suppressed in two layers: the network
+     * gate in VWebviewClient blocks forge-host theme stylesheets, and the
+     * runtime prelude traps VencordNative.themes.getThemeData so uploaded
+     * themes resolve to empty CSS. Vencord itself (plugins, bridge, settings
+     * panel) loads normally; operator-controlled stylesheets are exempt from
+     * the network gate.
+     */
+    @Volatile
+    var userCssDisabled: Boolean = false
+
+    /**
      * True once a bundle fetch or revalidation has completed in this process
      * (via [fetchVencord]). The warm-navigation
      * fast path keys on this rather than `VencordRuntime != null`, which the
@@ -100,6 +122,13 @@ object HttpClient {
      * write; see [vencordRuntimeLock] for the lock order.
      */
     private val bundleWriteLock = Any()
+
+    /**
+     * Executor for the clientMod switch prefetch. Single-threaded and FIFO;
+     * each job re-resolves the pref when it runs, so rapid switches still land
+     * on the newest selection. Process-lifetime, like the OkHttp client.
+     */
+    private val modSwitchPrefetchExecutor = Executors.newSingleThreadExecutor()
 
     /**
      * Serializes runtime publishes and the pair-read behind [runtimeSnapshot].
@@ -289,13 +318,10 @@ object HttpClient {
         // startup fetch path in fetchVencord; a crash there killed the
         // process on every cold start. The setBool STRING_SETTING_KEYS
         // guard stops new poison and VendroidApp's boot-time heal removes
-        // old; this catch contains any future regression to a logged
+        // old; this guard contains any future regression to a logged
         // default instead of an uncaught ClassCastException.
-        val clientMod = try {
-            sPrefs.getString("clientMod", "vencord")
-        } catch (e: ClassCastException) {
-            VDELog.w("HTTP", "clientMod pref wrong-typed (${e.javaClass.simpleName}); using default")
-            "vencord"
+        val clientMod = sPrefs.getStringSafe(SettingKeys.KEY_CLIENT_MOD, "vencord") {
+            VDELog.w("HTTP", "clientMod pref wrong-typed (${it.javaClass.simpleName}); using default")
         }
         val defaultUrl = if (clientMod == "equicord") {
             Constants.EQUICORD_BUNDLE_URL
@@ -304,7 +330,7 @@ object HttpClient {
         }
         // Same guard as the clientMod read above.
         val customLocation = try {
-            sPrefs.getString("vencordLocation", null)
+            sPrefs.getString(SettingKeys.KEY_VENCORD_LOCATION, null)
         } catch (e: ClassCastException) {
             VDELog.w("HTTP", "vencordLocation pref wrong-typed (${e.javaClass.simpleName}); using default")
             null
@@ -412,6 +438,30 @@ object HttpClient {
         sPrefs.edit { clearBundleIdentityKeys() }
     }
 
+    /** Age past which an orphaned `vencord.js.<nano>.tmp` is certainly debris
+     *  (a download cannot legitimately take an hour), not a live writer. */
+    private const val TEMP_BUNDLE_MAX_AGE_MS = 60 * 60 * 1000L
+
+    /**
+     * Deletes temp bundles from downloads killed mid-write. [downloadStoreAndSync]
+     * removes its tmp in a finally block, which a Process.kill skips; without
+     * this sweep each kill leaks a full-size copy in filesDir. Age-gated so a
+     * concurrent download's tmp is never deleted out from under it.
+     */
+    private fun sweepStaleBundleTemps(vendroidFile: File, nowMs: Long) {
+        try {
+            val dir = vendroidFile.parentFile ?: return
+            val prefix = "${vendroidFile.name}."
+            dir.listFiles { f ->
+                f.isFile && f.name.startsWith(prefix) && f.name.endsWith(".tmp")
+            }?.forEach { tmp ->
+                if (nowMs - tmp.lastModified() > TEMP_BUNDLE_MAX_AGE_MS) tmp.delete()
+            }
+        } catch (_: Exception) {
+            // Best-effort; leftover tmps are inert and the sweep retries.
+        }
+    }
+
     /**
      * Extract the build tag from the bundle's leading comment header
      * (e.g. "// Vencord a1b2c3d" -> "Vencord@a1b2c3d").
@@ -428,7 +478,7 @@ object HttpClient {
     /** First 12 hex chars of the content's SHA-256; "unknown" on failure. */
     private fun shortSha256(content: String): String =
         try {
-            java.security.MessageDigest.getInstance("SHA-256")
+            MessageDigest.getInstance("SHA-256")
                 .digest(content.toByteArray(Charsets.UTF_8))
                 .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
                 .take(12)
@@ -481,18 +531,45 @@ object HttpClient {
         return patched
     }
 
-    @JvmStatic
-    @Throws(IOException::class)
-    fun fetchVencord(activity: Activity) {
+    /**
+     * Outcome of [planFetch], handed to [fetchVencord]'s download tail.
+     * [vencordLocation] and [vendroidFile] are non-null exactly when
+     * [skipReason] is null. planFetch evaluates the kill switch before
+     * resolving the location, so skip plans carry no tail inputs.
+     * [skipReason] is documentary only; planFetch logs the specifics.
+     * [needsRedownload] and [customUrl] record the redownload decision.
+     */
+    private data class FetchPlan(
+        val needsRedownload: Boolean,
+        val customUrl: Boolean,
+        val skipReason: String?,
+        val vencordLocation: String?,
+        val vendroidFile: File?
+    )
+
+    /**
+     * Decision preamble of [fetchVencord]: the safe-mode kill switch, the
+     * bundle location gate, corrupt-cache healing, the version-bump
+     * redownload decisions, and the freshness skip. Its side effects stay
+     * here: heal deletion, cache invalidation, the revalidate Toast, and on
+     * a skip the freshness bookkeeping plus the injection trigger. A
+     * non-null [FetchPlan.skipReason] means the download tail must not run.
+     */
+    private fun planFetch(activity: Activity, sPrefs: SharedPreferences): FetchPlan {
         // Self-gate on the kill switch so no caller can trigger a bundle
         // download in a safe-mode session. The publish in
         // [downloadStoreAndSync] re-checks under vencordRuntimeLock, which
         // also covers safe mode entered mid-fetch.
         if (vencordDisabled) {
             VDELog.i("HTTP", "fetchVencord skipped: safe mode kill switch raised")
-            return
+            return FetchPlan(
+                needsRedownload = false,
+                customUrl = false,
+                skipReason = "safe-mode kill switch raised",
+                vencordLocation = null,
+                vendroidFile = null
+            )
         }
-        val sPrefs = activity.getSharedPreferences("settings", Context.MODE_PRIVATE)
         val vencordLocation = resolveBundleLocation(sPrefs)
         val vencordHost = Uri.parse(vencordLocation).host
         // Log only the host, not the full URL (a custom URL could carry a token
@@ -506,6 +583,9 @@ object HttpClient {
             )
         }
         val vendroidFile = File(activity.filesDir, "vencord.js")
+        // Reclaim temp debris from downloads killed mid-write; the common
+        // case is a process restart during the clientMod switch prefetch.
+        sweepStaleBundleTemps(vendroidFile, System.currentTimeMillis())
         // Discard a zero-length file (interrupted write) or an oversized one
         // (botched write; readBundleFromDisk refuses it). Deleting makes the
         // failure self-healing: the fetch below installs a fresh bundle rather
@@ -570,10 +650,40 @@ object HttpClient {
             // missedInjection set. This call is then the only recovery trigger
             // until the next navigation; it is idempotent.
             activity.runOnUiThread {
-                (activity as? com.nin0dev.vendroid.MainActivity)?.injectVencordIfReady()
+                (activity as? MainActivity)?.injectVencordIfReady()
             }
-            return
+            return FetchPlan(
+                needsRedownload = needsRedownload,
+                customUrl = customUrl,
+                skipReason = "bundle check skippable (session flag or freshness window)",
+                vencordLocation = null,
+                vendroidFile = null
+            )
         }
+
+        return FetchPlan(
+            needsRedownload = needsRedownload,
+            customUrl = customUrl,
+            skipReason = null,
+            vencordLocation = vencordLocation,
+            vendroidFile = vendroidFile
+        )
+    }
+
+    /**
+     * Startup bundle fetch: [planFetch]'s decision preamble followed by the
+     * download tail (ETag-conditional GET, 304/2xx/error branching, fallback
+     * to the cached bundle, store-and-publish).
+     */
+    @JvmStatic
+    @Throws(IOException::class)
+    fun fetchVencord(activity: Activity) {
+        val sPrefs = activity.getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
+        val plan = planFetch(activity, sPrefs)
+        if (plan.skipReason != null) return
+        // Non-null by planFetch's invariant; see FetchPlan.
+        val vencordLocation = plan.vencordLocation ?: return
+        val vendroidFile = plan.vendroidFile ?: return
 
         // A validator is only ever sent to the URL whose response issued it.
         val storedEtag = storedEtagFor(sPrefs, vencordLocation, vencordLocation)
@@ -677,7 +787,43 @@ object HttpClient {
             resp?.close()
         }
         activity.runOnUiThread {
-            (activity as? com.nin0dev.vendroid.MainActivity)?.injectVencordIfReady()
+            (activity as? MainActivity)?.injectVencordIfReady()
+        }
+    }
+
+    /**
+     * Prefetches the bundle for the just-persisted clientMod while the old
+     * session is still alive, so the next cold start usually boots modded
+     * without the missedInjection reload. Called by VencordNative.setString
+     * after a successful clientMod write.
+     *
+     * Failures are expected (offline, or the process dies mid-fetch) and
+     * degrade to the boot check fetching immediately; see
+     * MainActivity.bundleCheckDelayMs. A download that lands after the user
+     * switched again is discarded by the location guard in
+     * [downloadStoreAndSync].
+     *
+     * Never throws. Failures are caught and logged because an uncaught
+     * Throwable on this thread kills the process.
+     */
+    @JvmStatic
+    fun prefetchBundleAfterModSwitch(activity: Activity) {
+        if (vencordDisabled) return
+        try {
+            modSwitchPrefetchExecutor.execute {
+                // The queued fetch can outlive the activity; skip rather than
+                // read prefs through a dead Activity. The next boot's
+                // immediate check is the fallback.
+                if (activity.isFinishing || activity.isDestroyed) return@execute
+                try {
+                    fetchVencord(activity)
+                } catch (e: Exception) {
+                    VDELog.e("HTTP", "clientMod switch prefetch failed", e)
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            // Defensive: the executor is process-lifetime, but a future
+            // shutdown must not crash the bridge thread.
         }
     }
 
@@ -856,6 +1002,23 @@ object HttpClient {
         // the "Cached bundle ... sha256=" preload line hashes on the next start.
         val hash = shortSha256(patched)
         synchronized(bundleWriteLock) {
+            // A clientMod switch can land while this response is in flight,
+            // and installing a bundle fetched for the previous location would
+            // pin the old mod on disk. Drop the response; the switch's own
+            // prefetch or the next boot's immediate check installs the right
+            // bundle.
+            //
+            // Return rather than throw; fetchVencord's IOException fallback
+            // re-reads vendroidFile and would publish the same stale bundle
+            // this guard just refused.
+            if (resolveBundleLocation(sPrefs) != bundleLocation) {
+                VDELog.w(
+                    "HTTP",
+                    "Discarding bundle download: location changed mid-fetch " +
+                        "(fetched=${UrlNormalizer.redactForLog(bundleLocation)})"
+                )
+                return
+            }
             // Unique temp name so concurrent download attempts cannot clobber
             // each other's file; a shared "vencord.js.tmp" once let one
             // writer's rename install another writer's truncated file.
@@ -923,31 +1086,21 @@ object HttpClient {
     @JvmStatic
     fun applyPatches(content: String): String = BundlePatcher.applyPatches(content)
 
+    /**
+     * Reads the stream as UTF-8 text. Delegates to [readAsBytes], which owns
+     * the bounded-read loop, so the [maxBytes] cap and the [initialSize]
+     * clamp apply here too.
+     */
     @Throws(IOException::class)
-    fun readAsText(inputStream: InputStream, initialSize: Int = 8192, maxBytes: Int = MAX_READ_BYTES): String {
-        // Use a pre-sized ByteArrayOutputStream to avoid ~17 StringBuilder
-        // resizes when reading a ~1MB response.
-        val bos = ByteArrayOutputStream(initialSize.coerceAtLeast(8192))
-        // Bound the read so a compromised/streaming host cannot balloon memory
-        // or disk. The cap is generous (well above the ~1MB bundle / small CSS)
-        // but finite; exceeding it fails closed rather than OOMing.
-        val buf = ByteArray(8192)
-        var total = 0
-        while (true) {
-            val n = inputStream.read(buf)
-            if (n < 0) break
-            total += n
-            if (total > maxBytes) throw IOException("Response exceeds $maxBytes byte limit")
-            bos.write(buf, 0, n)
-        }
-        return bos.toString("UTF-8")
-    }
+    fun readAsText(inputStream: InputStream, initialSize: Int = 8192, maxBytes: Int = MAX_READ_BYTES): String =
+        String(readAsBytes(inputStream, maxBytes = maxBytes, initialSize = initialSize), Charsets.UTF_8)
 
     /**
      * Reads the stream into a byte array, capping at [maxBytes] (default
      * [MAX_READ_BYTES]) and throwing [IOException] on overflow so callers fail
-     * closed instead of ballooning memory. Mirrors the cap in [readAsText] for
-     * the paths that need the raw bytes (WebView serve / disk cache).
+     * closed instead of ballooning memory. Owns the bounded-read loop;
+     * [readAsText] delegates here, so this cap also bounds every text read.
+     * The raw bytes go to the WebView serve and disk-cache paths.
      */
     @Throws(IOException::class)
     fun readAsBytes(

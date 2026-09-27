@@ -15,12 +15,16 @@ import androidx.annotation.RequiresApi
 import androidx.webkit.WebResourceResponseCompat
 import androidx.webkit.WebViewFeature
 import com.nin0dev.vendroid.BuildConfig
+import com.nin0dev.vendroid.MainActivity
+import com.nin0dev.vendroid.VendroidApp
 import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.JsPatches
 import com.nin0dev.vendroid.utils.VDELog
 import java.io.ByteArrayInputStream
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import java.lang.ref.WeakReference
 import okhttp3.HttpUrl
 import okhttp3.Request
@@ -32,6 +36,11 @@ class VWebviewClient(
 ) : WebViewClient() {
     private val appContext: Context = context.applicationContext
     private val activityRef: WeakReference<Activity> = if (context is Activity) WeakReference(context) else WeakReference(null)
+
+    // Single accessor for the host-activity cast: one WeakReference read plus
+    // safe cast per use, so call sites never re-implement the dance.
+    private val mainActivity: MainActivity? get() = activityRef.get() as? MainActivity
+
     private val linkHandler: LinkHandler = LinkHandler(context)
 
     private class CachedResponse(
@@ -64,7 +73,7 @@ class VWebviewClient(
         // inline onload script and data:text/html is full HTML. The subresource
         // path treats data:image/ as inert (Discord relies on it for
         // avatars/icons), but a subframe navigating there must not run script.
-        if (!request.isForMainFrame && url.scheme == "data" && !isInertDataUrl(url.toString())) {
+        if (!request.isForMainFrame && url.scheme == "data" && !isInertDataPayload(url.toString())) {
             return true
         }
         // Non-allowlisted links go to the link popup (Copy / Open / Share / Cancel).
@@ -80,22 +89,8 @@ class VWebviewClient(
         }
     }
 
-    /**
-     * True if a `data:` URL is inert as a DOCUMENT (cannot execute script).
-     * `data:image/svg+xml` is NOT inert in a navigation context (SVG documents
-     * run inline `onload` script); `data:text/html` is raw HTML.
-     *
-     * Uses ignoreCase startsWith instead of lowercasing the whole URL: data:
-     * payloads can be hundreds of KB, and a full-string lowercase copies them.
-     */    private fun isInertDataUrl(dataUrl: String): Boolean =
-        dataUrl.startsWith("data:font/", ignoreCase = true) ||
-            dataUrl.startsWith("data:application/font", ignoreCase = true) ||
-            dataUrl.startsWith("data:text/css", ignoreCase = true) ||
-            dataUrl.startsWith("data:application/octet-stream", ignoreCase = true)
-
     override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-        val activity = activityRef.get()
-        (activity as? com.nin0dev.vendroid.MainActivity)?.let {
+        mainActivity?.let {
             it.currentUrlForBridge = url
             it.currentHostForBridge = Uri.parse(url).host
             it.navigationInProgress = true
@@ -107,13 +102,13 @@ class VWebviewClient(
         // the runtimes) into this URL's HTML, skip the evaluateJavascript
         // calls. The embedded scripts run at parse time. Otherwise inject the
         // combined firewall + animation patches in a single IPC call.
-        if (!consumeFirewallEmbedded(url)) {
+        if (!EmbeddedUrlClaims.consumeFirewall(url)) {
             view.evaluateJavascript(JsPatches.STARTUP_PATCHES_JS, null)
         }
 
         // If the runtimes weren't embedded (cold start before they were in
         // memory, or a route served without them), inject them now via the bridge.
-        if (consumeRuntimeEmbedded(url)) {
+        if (EmbeddedUrlClaims.consumeRuntime(url)) {
             // Already parsed as part of the document.
             return
         }
@@ -124,7 +119,7 @@ class VWebviewClient(
             // destroyed WebView throws IllegalStateException. This callback runs
             // asynchronously, so it can fire after onDestroy despite being
             // scheduled here.
-            val activity = activityRef.get() as? com.nin0dev.vendroid.MainActivity
+            val activity = mainActivity
             if (activity == null || activity.isFinishing || activity.isDestroyed) return@evaluateJavascript
             // Only inject on Discord pages; the runtimes hook webpack and expose
             // the bridge object, so whitelisted non-Discord pages must not run them.
@@ -133,17 +128,9 @@ class VWebviewClient(
             val runtime = HttpClient.VencordRuntime
             val mobileRuntime = HttpClient.VencordMobileRuntime
             if (!HttpClient.vencordDisabled && runtime != null && mobileRuntime != null) {
-                // Evaluate separately to avoid building a ~1 MB string on the UI
-                // thread. The capability-token bootstrap must run first so the
-                // token is in scope (closure-captured, not a window global)
-                // before the runtimes call the bridge.
-                try {
-                    view.evaluateJavascript(VencordNative.bridgeBootstrapJs() + ";", null)
-                    view.evaluateJavascript(JsPatches.VENCORD_PRELUDE_JS + ";" + runtime + ";", null)
-                    view.evaluateJavascript(mobileRuntime + ";", null)
-                } catch (_: IllegalStateException) {
-                    // WebView was destroyed between the liveness check and these calls.
-                }
+                // Result deliberately ignored: the log below fires whether or
+                // not the WebView died mid-eval, matching the old inline chain.
+                RuntimeInjector.injectViaBridge(view, runtime, mobileRuntime)
                 VDELog.i("WV", "Runtime injected via bridge for ${UrlNormalizer.redactForLog(url)}")
                 activity.scheduleBootVerify("page-start-eval")
             } else if (!HttpClient.vencordDisabled) {
@@ -156,8 +143,8 @@ class VWebviewClient(
 
     override fun onPageFinished(view: WebView, url: String) {
         super.onPageFinished(view, url)
-        val activity = activityRef.get()
-        (activity as? com.nin0dev.vendroid.MainActivity)?.let {
+        val activity = mainActivity
+        activity?.let {
             it.currentUrlForBridge = url
             it.currentHostForBridge = Uri.parse(url).host
             it.navigationInProgress = false
@@ -165,27 +152,29 @@ class VWebviewClient(
         VDELog.d("WV", "Page finished: ${UrlNormalizer.redactForLog(url)}")
 
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
-            (activity as? com.nin0dev.vendroid.MainActivity)?.loadingScreen?.scheduleDismiss(500)
+            activity.loadingScreen?.scheduleDismiss(500)
         }
-        (activity as? com.nin0dev.vendroid.MainActivity)?.scheduleBootVerify("page-finished")
+        activity?.scheduleBootVerify("page-finished")
     }
 
     /**
-     * Check if the firewall JS was already embedded in the HTML for [url]
-     * by a prior shouldInterceptRequest pass.  Consumes the flag (removes it)
-     * so it's only used once per URL.
-     */    private fun consumeFirewallEmbedded(url: String): Boolean {
-        return firewallEmbeddedUrls.remove(url)
-    }
-
-    /**
-     * Check if the Vencord runtimes were already embedded into the HTML for
-     * [url] by a prior shouldInterceptRequest pass. Consumes the flag so it's
-     * only used once per URL. Returns false if they were not embedded (e.g. not
-     * in memory at serve time), letting [onPageStarted] fall through to bridge
-     * injection.
-     */    private fun consumeRuntimeEmbedded(url: String): Boolean {
-        return runtimeEmbeddedUrls.remove(url)
+     * Records or clears this URL's firewall/runtime injection claims to match
+     * what the served body actually contains. Only claim "embedded" when it
+     * actually was. Otherwise onPageStarted would skip its
+     * evaluateJavascript fallback and the page would run with no JS firewall
+     * (fail-open). On overflow, clear so a new navigation is still tracked.
+     * The removes drop claims stranded by a load aborted between
+     * shouldInterceptRequest and onPageStarted: the next visit to this URL
+     * must not consume a claim for a body that lacks the scripts.
+     *
+     * Shared by the stale-shell serve, the LRU main-frame serve, and the
+     * fetch tail (injectAndRecordClaims).
+     */
+    private fun updateInjectionClaims(urlString: String, firewallEmbedded: Boolean, runtimeEmbedded: Boolean) {
+        if (firewallEmbedded) EmbeddedUrlClaims.recordFirewall(urlString)
+        else EmbeddedUrlClaims.clearFirewall(urlString)
+        if (runtimeEmbedded) EmbeddedUrlClaims.recordRuntime(urlString)
+        else EmbeddedUrlClaims.clearRuntime(urlString)
     }
 
     /**
@@ -225,26 +214,9 @@ class VWebviewClient(
         // onPageStarted apply the scripts via the bridge.
         val bodyBytes = (patched ?: text).toByteArray(Charsets.UTF_8)
 
-        // Record that this URL's HTML already has the firewall/runtime
-        // embedded so onPageStarted skips re-injecting them. Only claim
-        // "embedded" when it actually was. Otherwise onPageStarted would skip
-        // its evaluateJavascript fallback and the page would run with no JS
-        // firewall (fail-open). On overflow, clear so a new navigation is
-        // still tracked. The removes drop claims stranded by a load aborted
-        // between shouldInterceptRequest and onPageStarted: the next visit to
-        // this URL must not consume a claim for a body that lacks the scripts.
-        if (patched != null) {
-            if (firewallEmbeddedUrls.size >= MAX_FIREWALL_TRACKED) firewallEmbeddedUrls.clear()
-            firewallEmbeddedUrls.add(urlString)
-        } else {
-            firewallEmbeddedUrls.remove(urlString)
-        }
+        updateInjectionClaims(urlString, firewallEmbedded = patched != null, runtimeEmbedded = result.runtimeEmbedded)
         if (result.runtimeEmbedded) {
-            if (runtimeEmbeddedUrls.size >= MAX_RUNTIME_TRACKED) runtimeEmbeddedUrls.clear()
-            runtimeEmbeddedUrls.add(urlString)
             VDELog.i("WV", "Embedded Vencord runtime into stale main frame: ${UrlNormalizer.redactForLog(urlString)}")
-        } else {
-            runtimeEmbeddedUrls.remove(urlString)
         }
         // Background revalidate; skip if one is already in flight for this URL.
         if (revalidatingUrls.add(urlString)) {
@@ -314,6 +286,10 @@ class VWebviewClient(
      * Rebuilds the response headers for a stale-served shell. Preserves the
      * security headers (CSP/HSTS) stored with the raw HTML and sets an accurate
      * Content-Length for the re-injected body.
+     *
+     * The LRU serve path instead overrides the cached header map in place
+     * (see serveCachedMainFrame). The two derivations are not equivalent; do
+     * not merge them.
      */
     private fun buildStaleHeaders(
         bodySize: Int,
@@ -331,33 +307,44 @@ class VWebviewClient(
         return headers
     }
 
-    // OkHttp throws IllegalArgumentException on these reserved (hop-by-hop /
-    // session) headers. They are managed by the HTTP client itself and
-    // normally not surfaced in getRequestHeaders(), but we drop them
-    // defensively.
-    private val OKHTTP_RESTRICTED_HEADERS = setOf(
-        "host", "content-length", "transfer-encoding", "connection", "keep-alive",
-        "proxy-authorization", "te", "trailer", "upgrade"
-    )
-
-    // Credential-bearing request headers that must never be forwarded across
-    // an origin change, so a cross-origin redirect cannot leak the origin's
-    // session/authorization to the target. (proxy-authorization is already in
-    // OKHTTP_RESTRICTED_HEADERS.)
-    private val CREDENTIAL_HEADERS = setOf(
-        "cookie", "authorization", "proxy-authorization", "authentication-info"
-    )
+    /**
+     * Adds [headers] to this builder, skipping in order:
+     *  1. OkHttp-reserved (hop-by-hop/session) headers, see
+     *     [OKHTTP_RESTRICTED_HEADERS];
+     *  2. accept-encoding, so OkHttp's transparent gzip handling is used (the
+     *     app relies on this when rewriting Content-Length/Content-Encoding);
+     *  3. conditional headers ([STRIPPED_CONDITIONAL_HEADERS]), folded into
+     *     the cache key (see cacheKey);
+     *  4. credential headers ([CREDENTIAL_HEADERS]) when [crossOrigin]:
+     *     never forwarded across an origin change;
+     *  5. content-type when [dropContentType]: the converted request carries
+     *     no body; forwarding the old body's Content-Type would advertise one.
+     *
+     * One copy shared by [okHttpRequestBuilder] and [resolveRedirects]; a
+     * drift between the sites silently forwards hop-by-hop headers or
+     * conditional validators.
+     */
+    private fun Request.Builder.addFilteredHeaders(
+        headers: Iterable<Pair<String, String>>,
+        crossOrigin: Boolean = false,
+        dropContentType: Boolean = false
+    ) {
+        for ((key, value) in headers) {
+            val lowerKey = key.lowercase()
+            if (lowerKey in OKHTTP_RESTRICTED_HEADERS) continue
+            if (lowerKey == "accept-encoding") continue
+            if (lowerKey in STRIPPED_CONDITIONAL_HEADERS) continue
+            if (crossOrigin && lowerKey in CREDENTIAL_HEADERS) continue
+            if (dropContentType && lowerKey == "content-type") continue
+            addHeader(key, value)
+        }
+    }
 
     /**
-     * Builds an OkHttp [Request.Builder] from a [WebResourceRequest], applying
-     * the same header filters as the previous HttpURLConnection path:
-     *  - drop OkHttp-reserved (hop-by-hop) headers,
-     *  - drop accept-encoding so OkHttp's transparent gzip handling is used
-     *    (the app relies on this when rewriting Content-Length/Content-Encoding),
-     *  - for theme CSS, also drop the conditional headers (folded into the cache key),
-     *  - add the WebView UA when the request carries none (Chromium never
-     *    surfaces User-Agent in requestHeaders; without this, OkHttp sends
-     *    its okhttp/x.y.z default and a desktopMode override is lost),
+     * Builds an OkHttp [Request.Builder] from a [WebResourceRequest]. Adds
+     * the WebView UA when the request carries none (Chromium never surfaces
+     * User-Agent in requestHeaders; without this, OkHttp sends its
+     * okhttp/x.y.z default and a desktopMode override is lost).
      *
      * Redirects are not handled here; the caller resolves 3xx manually through
      * the allowlist gate (see [resolveRedirects]).
@@ -369,13 +356,7 @@ class VWebviewClient(
             rb.header("Cache-Control", "no-cache")
             rb.header("Pragma", "no-cache")
         }
-        for ((key, value) in req.requestHeaders) {
-            val lowerKey = key.lowercase()
-            if (lowerKey in OKHTTP_RESTRICTED_HEADERS) continue
-            if (lowerKey == "accept-encoding") continue
-            if (lowerKey in STRIPPED_CONDITIONAL_HEADERS) continue
-            rb.addHeader(key, value)
-        }
+        rb.addFilteredHeaders(req.requestHeaders.map { it.toPair() })
         val ua = webViewUserAgent
         if (ua != null && req.requestHeaders.keys.none { it.equals("user-agent", ignoreCase = true) }) {
             rb.header("User-Agent", ua)
@@ -482,17 +463,11 @@ class VWebviewClient(
         val methodChanged = nextMethod != currentMethod
         val rb = Request.Builder().url(target)
         applyMethodAndBody(rb, nextMethod)
-        for ((key, value) in response.request.headers) {
-            val lowerKey = key.lowercase()
-            if (lowerKey in OKHTTP_RESTRICTED_HEADERS) continue
-            if (lowerKey == "accept-encoding") continue
-            if (lowerKey in STRIPPED_CONDITIONAL_HEADERS) continue
-            if (crossOrigin && lowerKey in CREDENTIAL_HEADERS) continue
-            // The converted request carries no body; forwarding the old
-            // body's Content-Type would advertise one.
-            if (methodChanged && lowerKey == "content-type") continue
-            rb.addHeader(key, value)
-        }
+        rb.addFilteredHeaders(
+            response.request.headers,
+            crossOrigin = crossOrigin,
+            dropContentType = methodChanged
+        )
         val follow = HttpClient.sharedClient.newCall(rb.build()).execute()
         return try {
             val next = resolveRedirects(isMainFrame, follow, urlString, depth + 1, seen)
@@ -507,6 +482,78 @@ class VWebviewClient(
         }
     }
 
+    /**
+     * Serves a theme-CSS hit from the in-memory LRU, or null to fall through
+     * to the fetch tail (which refills the entry).
+     */
+    private fun serveCachedThemeCss(responseCacheKey: String): WebResourceResponse? {
+        themeCssCache.get(responseCacheKey)?.let { cached ->
+            // An empty body must never be served; drop and refetch.
+            if (cached.body.isEmpty()) {
+                themeCssCache.remove(responseCacheKey)
+                return null
+            }
+            if (System.currentTimeMillis() - cached.fetchedAt < THEME_CSS_TTL_MS) {
+                return WebResourceResponse("text/css", "utf-8", cached.statusCode, cached.reasonPhrase, cached.headers, ByteArrayInputStream(cached.body))
+            }
+            themeCssCache.remove(responseCacheKey)
+        }
+        return null
+    }
+
+    /**
+     * Serves a main-frame hit from the in-memory LRU, or null to fall through
+     * to the stale-shell delegate and then the fetch tail.
+     *
+     * The cache stores the RAW body, so inject the firewall / runtimes at
+     * serve time with the current config (same model as the disk cache). This
+     * way a tightened firewall applies on the very next serve instead of
+     * serving a stale embed.
+     *
+     * This path overrides the cached header map in place; the stale path
+     * instead re-reads its stored headers case-insensitively and rebuilds
+     * (see buildStaleHeaders). The two derivations are not equivalent; do not
+     * merge them.
+     */
+    private fun serveCachedMainFrame(
+        cached: CachedResponse,
+        responseCacheKey: String,
+        urlString: String,
+        reqHost: String?
+    ): WebResourceResponse? {
+        // An empty body must never be served; drop and refetch.
+        if (cached.body.isEmpty()) {
+            mainFrameCache.remove(responseCacheKey)
+            return null
+        }
+        if (System.currentTimeMillis() - cached.fetchedAt < MAIN_FRAME_TTL_MS) {
+            val text = String(cached.body, Charsets.UTF_8)
+            // Derived from the request URL, not hardcoded: keep the
+            // serve path safe even if a cache writer misses its gate.
+            val result = ResponseHtmlInjector.injectFirewallAndCss(
+                text, urlString,
+                isDiscordMainFrame = Constants.isDiscordAppOrigin(reqHost ?: "")
+            )
+            val patched = result.html
+            val serveBytes = (patched ?: text).toByteArray(Charsets.UTF_8)
+            // Snapshot verdict and stranded-claim removes; see
+            // InjectionResult and updateInjectionClaims.
+            updateInjectionClaims(urlString, firewallEmbedded = patched != null, runtimeEmbedded = result.runtimeEmbedded)
+            // Cached headers are already lowercase (fetch path
+            // canonicalizes); the puts below replace in place rather
+            // than adding a second, mixed-case line.
+            val headers = HashMap(cached.headers)
+            headers["content-type"] = "text/html"
+            headers["content-length"] = serveBytes.size.toString()
+            return WebResourceResponse(
+                "text/html", "utf-8", cached.statusCode, cached.reasonPhrase,
+                headers, ByteArrayInputStream(serveBytes)
+            )
+        }
+        mainFrameCache.remove(responseCacheKey)
+        return null
+    }
+
     @RequiresApi(Build.VERSION_CODES.N)
     override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
         // Scheme + host + privacy gate shared with the Service Worker client.
@@ -519,17 +566,7 @@ class VWebviewClient(
         val responseCacheKey = cacheKey(req, urlString)
 
         if (isThemeCss) {
-            themeCssCache.get(responseCacheKey)?.let { cached ->
-                // An empty body must never be served; drop and refetch.
-                if (cached.body.isEmpty()) {
-                    themeCssCache.remove(responseCacheKey)
-                    return@let
-                }
-                if (System.currentTimeMillis() - cached.fetchedAt < THEME_CSS_TTL_MS) {
-                    return WebResourceResponse("text/css", "utf-8", cached.statusCode, cached.reasonPhrase, cached.headers, ByteArrayInputStream(cached.body))
-                }
-                themeCssCache.remove(responseCacheKey)
-            }
+            serveCachedThemeCss(responseCacheKey)?.let { return it }
         }
 
         // Only GET main frames participate in the main-frame caches. The LRU
@@ -540,51 +577,7 @@ class VWebviewClient(
         // GET-gated at their write sites instead; see fetchAndProcessResponse.
         if (isMainFrame && req.method == "GET") {
             mainFrameCache.get(responseCacheKey)?.let { cached ->
-                // An empty body must never be served; drop and refetch.
-                if (cached.body.isEmpty()) {
-                    mainFrameCache.remove(responseCacheKey)
-                    return@let
-                }
-                if (System.currentTimeMillis() - cached.fetchedAt < MAIN_FRAME_TTL_MS) {
-                    // The cache stores the RAW body, so inject the firewall /
-                    // runtimes at serve time with the current config (same model
-                    // as the disk cache). This way a tightened firewall applies
-                    // on the very next serve instead of serving a stale embed.
-                    val text = String(cached.body, Charsets.UTF_8)
-                    // Derived from the request URL, not hardcoded: keep the
-                    // serve path safe even if a cache writer misses its gate.
-                    val result = ResponseHtmlInjector.injectFirewallAndCss(
-                        text, urlString,
-                        isDiscordMainFrame = Constants.isDiscordAppOrigin(req.url.host ?: "")
-                    )
-                    val patched = result.html
-                    val serveBytes = (patched ?: text).toByteArray(Charsets.UTF_8)
-                    // Snapshot verdict and stranded-claim removes; see
-                    // InjectionResult and serveStaleMainFrame.
-                    if (patched != null) {
-                        if (firewallEmbeddedUrls.size >= MAX_FIREWALL_TRACKED) firewallEmbeddedUrls.clear()
-                        firewallEmbeddedUrls.add(urlString)
-                    } else {
-                        firewallEmbeddedUrls.remove(urlString)
-                    }
-                    if (result.runtimeEmbedded) {
-                        if (runtimeEmbeddedUrls.size >= MAX_RUNTIME_TRACKED) runtimeEmbeddedUrls.clear()
-                        runtimeEmbeddedUrls.add(urlString)
-                    } else {
-                        runtimeEmbeddedUrls.remove(urlString)
-                    }
-                    // Cached headers are already lowercase (fetch path
-                    // canonicalizes); the puts below replace in place rather
-                    // than adding a second, mixed-case line.
-                    val headers = HashMap(cached.headers)
-                    headers["content-type"] = "text/html"
-                    headers["content-length"] = serveBytes.size.toString()
-                    return WebResourceResponse(
-                        "text/html", "utf-8", cached.statusCode, cached.reasonPhrase,
-                        headers, ByteArrayInputStream(serveBytes)
-                    )
-                }
-                mainFrameCache.remove(responseCacheKey)
+                serveCachedMainFrame(cached, responseCacheKey, urlString, req.url.host)?.let { return it }
             }
 
             // Stale-while-revalidate disk cache: on a cold start (empty in-memory
@@ -654,18 +647,6 @@ class VWebviewClient(
         return urlLower.contains("vencord") || urlLower.contains("equicord") || urlLower.contains("vendroid")
     }
 
-    private val FORGE_HOSTS_EXACT = hashSetOf(
-        "github.com", "raw.githubusercontent.com", "codeberg.org",
-        "githack.com", "raw.githack.com", "cdn.githack.com", "cbcdn.githack.com"
-    )
-
-    private val forgeHostCache = ConcurrentHashMap<String, Boolean>()
-
-    private fun isForgeHost(host: String): Boolean =
-        forgeHostCache.computeIfAbsent(host) { h ->
-            h in FORGE_HOSTS_EXACT || h.endsWith(".github.io") || h.endsWith(".codeberg.page") || h.endsWith(".githack.com")
-        } ?: false
-
     private fun shouldInterceptForCspStripping(req: WebResourceRequest): Boolean {
         val scheme = req.url.scheme ?: return false
         if (scheme != "http" && scheme != "https") return false
@@ -717,6 +698,28 @@ class VWebviewClient(
     }
 
     @RequiresApi(Build.VERSION_CODES.N)
+    /**
+     * Mutable carrier threaded through the fetchAndProcessResponse stage
+     * helpers below. Fields are reassigned as the pipeline advances
+     * (header fold, MIME pin, bounded read, raw persist, injection, cache
+     * write, cookie delivery); the orchestrator owns the instance and no
+     * stage's intermediate state escapes this class.
+     */
+    private class ProcessedResponse(
+        val statusCode: Int,
+        val headers: HashMap<String, String>
+    ) {
+        val setCookies = ArrayList<String>(2)
+        // Lowercase server-declared media type, captured by the header fold
+        // before MIME normalization; read by the persist and cache stages.
+        var declaredCt: String? = null
+        var reasonPhrase: String = ""
+        var contentType: String = "application/octet-stream"
+        var body: ByteArray = ByteArray(0)
+        // Pre-injection snapshot of [body]: what the MAIN_FRAME caches store.
+        var rawBody: ByteArray = ByteArray(0)
+    }
+
     private fun fetchAndProcessResponse(
         isForMainFrame: Boolean,
         response: Response,
@@ -738,47 +741,70 @@ class VWebviewClient(
         // raw Discord-domain check in Constants. Every injection and
         // cache-write decision below keys on it.
         val isAppOrigin = Constants.isDiscordAppOrigin(host)
-        val isMainFrame = isForMainFrame
 
         val statusCode = response.code
+        val state = ProcessedResponse(
+            statusCode,
+            headers = HashMap(response.headers.size.coerceAtLeast(16))
+        )
 
+        foldHeadersAndCsp(response, isAppOrigin, isForMainFrame, isCss, state)
+
+        // HTTP/2 has no reason phrase (OkHttp returns ""), so the old "OK"
+        // fallback reported a 404 as "404 OK". Use the standard IANA phrase
+        // for known codes and leave the rest empty, as h2 does.
+        state.reasonPhrase = response.message.takeIf { it.isNotEmpty() }
+            ?: STANDARD_REASON_PHRASES[statusCode].orEmpty()
+
+        pinMainFrameMime(isAppOrigin, isForMainFrame, state)
+        readBodyBounded(response, state)
+        persistRawMainFrame(response, urlString, isAppOrigin, isForMainFrame, state)
+        injectAndRecordClaims(urlString, host, isAppOrigin, isForMainFrame, state)
+        cacheResult(response, urlString, cacheKey, cacheTarget, isAppOrigin, state)
+        return deliverCookiesAndBuild(response, state)
+    }
+
+    /** Header fold + CSP policy switch stage of [fetchAndProcessResponse]. */
+    private fun foldHeadersAndCsp(
+        response: Response,
+        isAppOrigin: Boolean,
+        isMainFrame: Boolean,
+        isCss: Boolean,
+        state: ProcessedResponse
+    ) {
         // Fold duplicate header names (see ResponseHeaderMerge); Set-Cookie
         // values are diverted to setCookies and re-attached below.
-        val setCookies = ArrayList<String>(2)
-        val modifiedHeaders = HashMap<String, String>(response.headers.size.coerceAtLeast(16))
         for ((key, value) in response.headers) {
             val lowerKey = key.lowercase()
             if (isAppOrigin && lowerKey == "content-security-policy") {
                 if (BuildConfig.ENFORCE_STRICT_CSP) {
                     // Enforce the strict policy; the browser itself blocks
                     // exfiltration (connect-src) to non-allowlisted hosts.
-                    modifiedHeaders["content-security-policy"] = VencordCsp.build()
+                    state.headers["content-security-policy"] = VencordCsp.build()
                 } else {
                     // Report-only: keep the enforced policy loose and attach the
                     // strict policy as Report-Only to collect violations first.
                     val stripped = stripVencordIncompatibleCsp(value)
-                    if (stripped.isNotEmpty()) modifiedHeaders["content-security-policy"] = stripped
+                    if (stripped.isNotEmpty()) state.headers["content-security-policy"] = stripped
                     if (isMainFrame) {
-                        modifiedHeaders["content-security-policy-report-only"] = VencordCsp.build()
+                        state.headers["content-security-policy-report-only"] = VencordCsp.build()
                     }
                 }
                 continue
             }
             if (isAppOrigin && lowerKey == "content-security-policy-report-only") continue
-            ResponseHeaderMerge.merge(modifiedHeaders, setCookies, lowerKey, value)
+            ResponseHeaderMerge.merge(state.headers, state.setCookies, lowerKey, value)
         }
         // Server-declared media type, captured before the MIME normalization
         // below: the 2xx app-origin pin forces content-type to text/html, so
-        // a later read of modifiedHeaders can no longer tell a shell from a
+        // a later read of the headers can no longer tell a shell from a
         // JSON endpoint body.
-        val declaredCt = modifiedHeaders["content-type"]?.lowercase()
-        if (isCss) modifiedHeaders["content-type"] = "text/css"
-        // HTTP/2 has no reason phrase (OkHttp returns ""), so the old "OK"
-        // fallback reported a 404 as "404 OK". Use the standard IANA phrase
-        // for known codes and leave the rest empty, as h2 does.
-        val reasonPhrase = response.message.takeIf { it.isNotEmpty() }
-            ?: STANDARD_REASON_PHRASES[statusCode].orEmpty()
+        state.declaredCt = state.headers["content-type"]?.lowercase()
+        if (isCss) state.headers["content-type"] = "text/css"
+    }
 
+    /** App-origin main-frame MIME pinning stage of [fetchAndProcessResponse]. */
+    private fun pinMainFrameMime(isAppOrigin: Boolean, isMainFrame: Boolean, state: ProcessedResponse) {
         // WebResourceResponse's mimeType must be a bare media type. The
         // charset goes in the separate "encoding" arg; a MIME carrying it
         // ("text/html; charset=utf-8") makes WebView render the document as
@@ -787,29 +813,32 @@ class VWebviewClient(
         // body has already been fully read, so those framing headers are
         // stale at any status code.
         if (isAppOrigin && isMainFrame) {
-            if (statusCode in 200..299) {
+            if (state.statusCode in 200..299) {
                 // The app shell is always HTML. Pin a clean MIME so the
                 // injection gate below agrees.
-                modifiedHeaders["content-type"] = "text/html"
+                state.headers["content-type"] = "text/html"
             } else {
                 // Error pages keep the server's media type, bare; the API
                 // answers errors in JSON, and forcing text/html would
                 // mislabel them. A dropped or empty type still falls back to
                 // HTML, since the octet-stream default below would turn the
                 // page into a download.
-                modifiedHeaders["content-type"] =
-                    ResponseHeaderMerge.bareMediaType(modifiedHeaders["content-type"]) ?: "text/html"
+                state.headers["content-type"] =
+                    ResponseHeaderMerge.bareMediaType(state.headers["content-type"]) ?: "text/html"
             }
-            modifiedHeaders.remove("content-encoding")
-            modifiedHeaders.remove("content-length")
+            state.headers.remove("content-encoding")
+            state.headers.remove("content-length")
         }
         // Re-read so the served MIME matches what the block above wrote.
-        val effectiveContentType = modifiedHeaders.getOrDefault("content-type", "application/octet-stream")
+        state.contentType = state.headers.getOrDefault("content-type", "application/octet-stream")
+    }
 
+    /** Bounded body read stage of [fetchAndProcessResponse]. */
+    private fun readBodyBounded(response: Response, state: ProcessedResponse) {
         // OkHttp has no errorStream; byteStream() yields the error page for 4xx/5xx
         // and an empty stream for no-body responses (204/304/HEAD). Read once for
         // all status codes.
-        var bodyBytes = try {
+        state.body = try {
             // Read the body through a bounded reader so a compromised/oversized
             // host cannot balloon heap here (mirrors HttpClient.readAsText's
             // cap). Seed the buffer from the declared content length (clamped)
@@ -822,14 +851,23 @@ class VWebviewClient(
         } catch (_: Exception) {
             // Serving fewer bytes than Content-Length promises makes Chromium
             // wait for bytes that never arrive, so drop the framing headers.
-            modifiedHeaders.remove("content-length")
-            modifiedHeaders.remove("content-encoding")
+            state.headers.remove("content-length")
+            state.headers.remove("content-encoding")
             ByteArray(0)
         }
         // The RAW body (pre-injection) is what gets cached / persisted, so a
         // tightened firewall applies at serve time (see MAIN_FRAME cache serve).
-        val rawBodyBytes = bodyBytes
+        state.rawBody = state.body
+    }
 
+    /** RAW main-frame disk persist stage of [fetchAndProcessResponse]. */
+    private fun persistRawMainFrame(
+        response: Response,
+        urlString: String,
+        isAppOrigin: Boolean,
+        isMainFrame: Boolean,
+        state: ProcessedResponse
+    ) {
         // Persist the RAW main-frame HTML (before injection) for stale-while-
         // revalidate on a later cold start. Injection is applied at serve time
         // with the current firewall config, so only app-shell routes qualify.
@@ -837,62 +875,68 @@ class VWebviewClient(
         // is stale-served to GET navigations. A real HEAD body is empty anyway
         // (isNotEmpty skips it); the gate exists for the 307-preserved POST
         // whose HTML would otherwise seed the store.
-        if (isAppOrigin && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty() &&
+        if (isAppOrigin && isMainFrame && state.statusCode in 200..299 && state.body.isNotEmpty() &&
             response.request.method == "GET"
         ) {
-            // declaredCt, not modifiedHeaders: the serving type is pinned to
+            // declaredCt, not the header map: the serving type is pinned to
             // text/html above, so that read can never fail here.
-            val ctLower = declaredCt.orEmpty()
+            val ctLower = state.declaredCt.orEmpty()
             if (ctLower.contains("text/html")) {
-                // bodyBytes is still raw here; injection happens below. Persist
+                // body is still raw here; injection happens below. Persist
                 // off the network thread with the sanitized headers so a stale
                 // serve matches the in-memory cache (incl. security headers).
-                val rawBytes = bodyBytes
-                val sanitizedHeaders = HashMap(modifiedHeaders)
+                val rawBytes = state.body
+                val sanitizedHeaders = HashMap(state.headers)
+                val phrase = state.reasonPhrase
                 diskCacheExecutor.execute {
-                    MainFrameDiskCache.writeMainFrame(urlString, rawBytes, sanitizedHeaders, reasonPhrase)
+                    MainFrameDiskCache.writeMainFrame(urlString, rawBytes, sanitizedHeaders, phrase)
                 }
             }
         }
+    }
 
+    /** Firewall injection + injection-claim recording stage of [fetchAndProcessResponse]. */
+    private fun injectAndRecordClaims(
+        urlString: String,
+        host: String,
+        isAppOrigin: Boolean,
+        isMainFrame: Boolean,
+        state: ProcessedResponse
+    ) {
         // Inject the JS network firewall into every Discord HTML response. This
         // runs before any page scripts and wraps fetch/XHR/WebSocket for hosts
         // that slip past shouldInterceptRequest. The runtimes are embedded
         // alongside when both are in memory, so the renderer parses them at
         // document time instead of blocking the UI thread on a ~1 MB
         // evaluateJavascript round-trip.
-        if (isAppOrigin && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty()) {
-            val ctLower = (modifiedHeaders.getOrDefault("content-type", "")).lowercase()
+        if (isAppOrigin && isMainFrame && state.statusCode in 200..299 && state.body.isNotEmpty()) {
+            val ctLower = (state.headers.getOrDefault("content-type", "")).lowercase()
             if (ctLower.contains("text/html")) {
                 try {
-                    val text = bodyBytes.toString(Charsets.UTF_8)
+                    val text = state.body.toString(Charsets.UTF_8)
                     val result = ResponseHtmlInjector.injectFirewallAndCss(text, urlString, isDiscordMainFrame = isAppOrigin)
                     val patched = result.html
                     if (patched != null && patched !== text) {
-                        bodyBytes = patched.toByteArray(Charsets.UTF_8)
-                        modifiedHeaders["content-length"] = bodyBytes.size.toString()
-                        modifiedHeaders.remove("content-encoding")
+                        state.body = patched.toByteArray(Charsets.UTF_8)
+                        state.headers["content-length"] = state.body.size.toString()
+                        state.headers.remove("content-encoding")
                         // Record the embedded URL so onPageStarted can skip
                         // re-injection. On overflow, clear so a new navigation
                         // is still tracked (a dropped entry only costs one
                         // idempotent re-injection).
-                        if (firewallEmbeddedUrls.size >= MAX_FIREWALL_TRACKED) firewallEmbeddedUrls.clear()
-                        firewallEmbeddedUrls.add(urlString)
+                        updateInjectionClaims(urlString, firewallEmbedded = true, runtimeEmbedded = result.runtimeEmbedded)
                         VDELog.i("WV", "Embedded firewall JS: $host (${FirewallConfig.jsAllowedHosts().size} hosts)")
                         if (result.runtimeEmbedded) {
-                            if (runtimeEmbeddedUrls.size >= MAX_RUNTIME_TRACKED) runtimeEmbeddedUrls.clear()
-                            runtimeEmbeddedUrls.add(urlString)
                             VDELog.i("WV", "Embedded Vencord runtime into main frame")
-                        } else {
-                            runtimeEmbeddedUrls.remove(urlString)
                         }
                     } else {
                         // No `</head>`: raw body. Drop any stranded claim
                         // (see serveStaleMainFrame).
-                        firewallEmbeddedUrls.remove(urlString)
-                        runtimeEmbeddedUrls.remove(urlString)
+                        EmbeddedUrlClaims.clearAll(urlString)
                     }
-                } catch (_: Exception) {}
+                } catch (_: Exception) {
+                    // Best-effort: a decode/inject failure serves the raw body.
+                }
             }
         } else if (isMainFrame) {
             // The gate above skipped the embed. Drop any claim stranded by an
@@ -900,28 +944,37 @@ class VWebviewClient(
             // back to evaluateJavascript instead of skipping on a stale
             // claim. Main frames only: claims are never held for
             // subresource URLs.
-            firewallEmbeddedUrls.remove(urlString)
-            runtimeEmbeddedUrls.remove(urlString)
+            EmbeddedUrlClaims.clearAll(urlString)
         }
+    }
 
+    /** LRU cache-write stage of [fetchAndProcessResponse]. */
+    private fun cacheResult(
+        response: Response,
+        urlString: String,
+        cacheKey: String,
+        cacheTarget: CacheTarget?,
+        isAppOrigin: Boolean,
+        state: ProcessedResponse
+    ) {
         // MAIN_FRAME caches the RAW (pre-injection) body; the firewall and
         // runtimes are injected at serve time so a config change applies on
         // the next serve. THEME_CSS has no injected content, so it caches
         // the final bytes.
-        val bytesToCache = if (cacheTarget == CacheTarget.MAIN_FRAME) rawBodyBytes else bodyBytes
+        val bytesToCache = if (cacheTarget == CacheTarget.MAIN_FRAME) state.rawBody else state.body
         // An empty body is never a valid entry. A failed or over-cap read
         // would otherwise be cached as a blank 200 and served for the full
         // TTL, since fresh LRU hits never revalidate.
-        if (statusCode in 200..299 && cacheTarget != null && bytesToCache.isNotEmpty()) {
-            // Set-Cookie never enters modifiedHeaders (diverted to setCookies),
+        if (state.statusCode in 200..299 && cacheTarget != null && bytesToCache.isNotEmpty()) {
+            // Set-Cookie never enters the header map (diverted to setCookies),
             // so cached headers are cookie-free by construction. A cached
             // replay cannot resurrect an old token (zombie session) or cross
             // accounts on a shared device.
-            val headersToCache = HashMap(modifiedHeaders).apply {
+            val headersToCache = HashMap(state.headers).apply {
                 remove("content-length")
                 remove("content-encoding")
             }
-            val entry = CachedResponse(statusCode, reasonPhrase, headersToCache, bytesToCache)
+            val entry = CachedResponse(state.statusCode, state.reasonPhrase, headersToCache, bytesToCache)
             when (cacheTarget) {
                 CacheTarget.THEME_CSS -> themeCssCache.put(cacheKey, entry)
                 CacheTarget.MAIN_FRAME -> if (response.request.method == "GET" &&
@@ -933,7 +986,7 @@ class VWebviewClient(
                     // write.
                     isAppOrigin &&
                     // HTML only, judged on the declared type (see declaredCt).
-                    declaredCt != null && declaredCt.contains("text/html")
+                    state.declaredCt?.contains("text/html") == true
                 ) {
                     // GET-only: the LRU key carries the ORIGINAL request's
                     // method, but resolveRedirects may have converted the wire
@@ -945,9 +998,9 @@ class VWebviewClient(
                     // path doesn't fall back to a stale startup-time copy.
                     // isAppOrigin restated: this writes process-lifetime
                     // state and must not rely on the enclosing gate.
-                    if (urlString == "https://discord.com/app" && isAppOrigin) {
+                    if (urlString == Constants.APP_SHELL_URL && isAppOrigin) {
                         val refreshed = MainFrameDiskCache.CachedMainFrame(
-                            rawBodyBytes, reasonPhrase, headersToCache, System.currentTimeMillis()
+                            state.rawBody, state.reasonPhrase, headersToCache, System.currentTimeMillis()
                         )
                         val shells = HashMap(StaleMainFrame.preloadedShells)
                         shells[urlString] = refreshed
@@ -956,8 +1009,15 @@ class VWebviewClient(
                 }
             }
         }
+    }
 
-        if (setCookies.isNotEmpty()) {
+    /**
+     * Set-Cookie delivery + final response construction stage of
+     * [fetchAndProcessResponse]. The multivalue channel returns early on
+     * success; any glue failure falls through to the CookieManager replay.
+     */
+    private fun deliverCookiesAndBuild(response: Response, state: ProcessedResponse): WebResourceResponse {
+        if (state.setCookies.isNotEmpty()) {
             val responseUrl = response.request.url.toString()
             if (isMultiCookieChannelSupported()) {
                 // Chromium M138+ splits the androidx wrapper's NUL-joined value
@@ -965,10 +1025,10 @@ class VWebviewClient(
                 // full attribute fidelity (HttpOnly, SameSite, Expires).
                 try {
                     val compat = WebResourceResponseCompat(
-                        effectiveContentType, "utf-8", statusCode, reasonPhrase,
-                        modifiedHeaders, ByteArrayInputStream(bodyBytes)
+                        state.contentType, "utf-8", state.statusCode, state.reasonPhrase,
+                        state.headers, ByteArrayInputStream(state.body)
                     )
-                    compat.setCookies(setCookies)
+                    compat.setCookies(state.setCookies)
                     return compat.toWebResourceResponse()
                 } catch (_: Exception) {
                     // Glue failure; fall through to the CookieManager path.
@@ -979,13 +1039,13 @@ class VWebviewClient(
             // each into the cookie store, scoped to the final response URL.
             // setCookie is void, so a store that refuses a cookie logs nothing
             // here; the delivery log below still shows what was attempted.
-            for (cookie in setCookies) {
+            for (cookie in state.setCookies) {
                 CookieManager.getInstance().setCookie(responseUrl, cookie)
             }
-            VDELog.d("WV", "Delivered ${setCookies.size} Set-Cookie header(s) for ${UrlNormalizer.redactForLog(responseUrl)}")
+            VDELog.d("WV", "Delivered ${state.setCookies.size} Set-Cookie header(s) for ${UrlNormalizer.redactForLog(responseUrl)}")
         }
 
-        return WebResourceResponse(effectiveContentType, "utf-8", statusCode, reasonPhrase, modifiedHeaders, ByteArrayInputStream(bodyBytes))
+        return WebResourceResponse(state.contentType, "utf-8", state.statusCode, state.reasonPhrase, state.headers, ByteArrayInputStream(state.body))
     }
 
     /**
@@ -1017,6 +1077,22 @@ class VWebviewClient(
         private val STRIPPED_CONDITIONAL_HEADERS = setOf(
             "if-none-match", "if-modified-since", "if-unmodified-since", "if-match"
         )
+        // OkHttp throws IllegalArgumentException on these reserved (hop-by-hop /
+        // session) headers. They are managed by the HTTP client itself and
+        // normally not surfaced in getRequestHeaders(), but we drop them
+        // defensively.
+        private val OKHTTP_RESTRICTED_HEADERS = setOf(
+            "host", "content-length", "transfer-encoding", "connection", "keep-alive",
+            "proxy-authorization", "te", "trailer", "upgrade"
+        )
+
+        // Credential-bearing request headers that must never be forwarded across
+        // an origin change, so a cross-origin redirect cannot leak the origin's
+        // session/authorization to the target. (proxy-authorization is already in
+        // OKHTTP_RESTRICTED_HEADERS.)
+        private val CREDENTIAL_HEADERS = setOf(
+            "cookie", "authorization", "proxy-authorization", "authentication-info"
+        )
         // Headers that select a different response body, folded into the cache key.
         private val VARIANT_HEADERS = setOf(
             "if-none-match", "if-modified-since", "accept-encoding", "accept"
@@ -1045,17 +1121,18 @@ class VWebviewClient(
             "worker-src", "manifest-src", "child-src"
         )
 
-        // Forge hosts are only trusted to serve user-theme CSS. The instance
-        // method [isForgeHost] handles CSP-stripping; this companion copy lets the
-        // shared network gate (in the companion object) enforce the CSS-only rule.
-        private val COMPANION_FORGE_HOSTS_EXACT = hashSetOf(
+        // Forge hosts are only trusted to serve user-theme CSS. This predicate
+        // (the single copy) serves both the instance CSP-stripping interception
+        // (isVencordCssUrl / shouldInterceptForCspStripping) and the shared
+        // network gate here in the companion, which enforces the CSS-only rule.
+        private val FORGE_HOSTS_EXACT = hashSetOf(
             "github.com", "raw.githubusercontent.com", "codeberg.org",
             "githack.com", "raw.githack.com", "cdn.githack.com", "cbcdn.githack.com"
         )
-        private val companionForgeHostCache = ConcurrentHashMap<String, Boolean>()
-        private fun isForgeHostCompanion(host: String): Boolean =
-            companionForgeHostCache.computeIfAbsent(host) { h ->
-                h in COMPANION_FORGE_HOSTS_EXACT ||
+        private val forgeHostCache = ConcurrentHashMap<String, Boolean>()
+        private fun isForgeHost(host: String): Boolean =
+            forgeHostCache.computeIfAbsent(host) { h ->
+                h in FORGE_HOSTS_EXACT ||
                     h.endsWith(".github.io") ||
                     h.endsWith(".codeberg.page") ||
                     h.endsWith(".githack.com")
@@ -1075,20 +1152,6 @@ class VWebviewClient(
 
         private val themeCssCache = ThreadSafeLruCache(2 * 1024 * 1024)
         private val mainFrameCache = ThreadSafeLruCache(2 * 1024 * 1024)
-
-        // Track main-frame URLs that already have the network firewall JS
-        // embedded in the HTML (from shouldInterceptRequest / fetchAndProcessResponse).
-        // When onPageStarted fires for one of these, the combined
-        // firewall+animation evaluateJavascript can be skipped entirely,
-        // saving one IPC round-trip.  Capped at 16 entries to bound memory.
-        private val firewallEmbeddedUrls = ConcurrentHashMap.newKeySet<String>()
-        private const val MAX_FIREWALL_TRACKED = 16
-
-        // Track main-frame URLs that already have the Vencord runtimes embedded
-        // in the HTML. Mirrors firewallEmbeddedUrls so onPageStarted can skip
-        // the (up to ~1 MB) evaluateJavascript round-trip for those URLs.
-        private val runtimeEmbeddedUrls = ConcurrentHashMap.newKeySet<String>()
-        private const val MAX_RUNTIME_TRACKED = 16
 
         // Privacy filter: blocks Discord telemetry, Sentry, fingerprinting,
         // and (optionally) typing indicators at the path level. Shared by
@@ -1212,7 +1275,123 @@ class VWebviewClient(
          *  Chromium serve a cached copy; a 200 with mismatched MIME makes the
          *  resource a no-op (no script execution, no CSS application). */
         private fun blockedResponse(): WebResourceResponse =
-            WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
+            WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+
+        /**
+         * The operator-controlled stylesheets vencord_mobile.js fetches on
+         * every page load (browser.css / moreFixes.css). They live on forge
+         * hosts and end in .css, so the recovery user-theme gate must exempt
+         * them or it would break the mod's own fix CSS.
+         *
+         * Compared on scheme + host + path; the query string is ignored
+         * (cache-busting variants are the same stylesheet).
+         */
+        private val OPERATOR_CSS_URLS: List<Triple<String, String, String>> = listOf(
+            Constants.VENCORD_CSS_URL,
+            Constants.EQUICORD_CSS_URL,
+            VendroidApp.MORE_FIXES_CSS_URL
+        ).map { url ->
+            val uri = Uri.parse(url)
+            Triple(uri.scheme.orEmpty(), uri.host.orEmpty(), uri.path.orEmpty())
+        }
+
+        /**
+         * True when [uri] is one of [OPERATOR_CSS_URLS] (scheme + host +
+         * path, query ignored). Pure, so the exemption check is unit-testable.
+         */
+        internal fun isOperatorCssUrl(uri: Uri): Boolean {
+            val scheme = uri.scheme ?: return false
+            val host = uri.host ?: return false
+            val path = uri.path ?: return false
+            return OPERATOR_CSS_URLS.any { (opScheme, opHost, opPath) ->
+                scheme.equals(opScheme, ignoreCase = true) &&
+                    host.equals(opHost, ignoreCase = true) &&
+                    path == opPath
+            }
+        }
+
+        /**
+         * Layer 1 of the recovery session's user-theme gate: while
+         * [HttpClient.userCssDisabled] is raised, blocks forge-host
+         * stylesheets except the operator CSS. Returns a blocking response,
+         * or null to allow the request.
+         *
+         * Broader than [isVencordCssUrl]: that predicate is a
+         * cache-classification heuristic whose vencord|equicord|vendroid
+         * substring check would miss user themes such as
+         * `raw.githubusercontent.com/SomeUser/theme/main/theme.css`. Fails
+         * closed: all forge-host CSS is blocked except the exempt operator
+         * URLs, even a page's non-theme CSS.
+         *
+         * Uploaded themes are not visible here: they are imported as blob:
+         * URLs from IndexedDB, which never reach shouldInterceptRequest, and
+         * are covered by the runtime prelude's VencordNative setter trap
+         * (Layer 2).
+         */
+        internal fun userCssGateResponse(uri: Uri): WebResourceResponse? {
+            if (!HttpClient.userCssDisabled) return null
+            if (uri.path?.endsWith(".css") != true) return null
+            val host = uri.host?.lowercase() ?: return null
+            if (!isForgeHost(host)) return null
+            if (isOperatorCssUrl(uri)) return null
+            logUserCssBlock(host)
+            return themeBlockedResponse()
+        }
+
+        /**
+         * Blocking response for the user-theme gate: 403 with an empty body
+         * and no-cache, so Chromium neither applies nor stores a suppressed
+         * theme. Unlike [blockedResponse] (200) a 403 cannot be mistaken for
+         * a successful empty stylesheet by cache heuristics.
+         */
+        private fun themeBlockedResponse(): WebResourceResponse =
+            WebResourceResponse(
+                "text/css", "utf-8", 403, "Forbidden",
+                mapOf("Cache-Control" to "no-cache"),
+                ByteArrayInputStream(ByteArray(0))
+            )
+
+        /**
+         * Minimum gap between "theme CSS blocked" log lines. A failed @import
+         * can be retried on every navigation, which would flood the shareable
+         * log; the first block always logs (the initial stamp is 0).
+         */
+        private const val THEME_BLOCK_LOG_INTERVAL_MS = 10_000L
+
+        @Volatile
+        private var lastThemeBlockLogAtMs = 0L
+
+        private fun logUserCssBlock(host: String) {
+            val now = System.currentTimeMillis()
+            // Non-atomic check-and-set is fine: a lost update just logs the
+            // same host twice, which the rate limit absorbs.
+            if (now - lastThemeBlockLogAtMs < THEME_BLOCK_LOG_INTERVAL_MS) return
+            lastThemeBlockLogAtMs = now
+            VDELog.w("WV", "User themes disabled; blocked theme CSS: $host")
+        }
+
+        /**
+         * True if a `data:` URL payload is inert (cannot execute script) in
+         * both contexts that consult this predicate:
+         *
+         * - NAVIGATION (subframe document loads, via
+         *   VWebviewClient.shouldOverrideUrlLoading): this list alone applies.
+         *   `data:image/svg+xml` is NOT inert there (an SVG document runs
+         *   inline `onload` script) and `data:text/html` is raw HTML.
+         * - SUBRESOURCE (shouldBlockForRequest): adds `data:image/` (kept
+         *   broad, not restricted to png/jpeg/etc.): as a SUBRESOURCE (<img>),
+         *   data:image/svg+xml does NOT execute scripts, and Discord relies on
+         *   it for avatars/icons.
+         *
+         * Uses ignoreCase startsWith instead of lowercasing the whole URL:
+         * data: payloads can be hundreds of KB, and a full-string lowercase
+         * copies them.
+         */
+        private fun isInertDataPayload(url: String): Boolean =
+            url.startsWith("data:font/", ignoreCase = true) ||
+                url.startsWith("data:application/font", ignoreCase = true) ||
+                url.startsWith("data:text/css", ignoreCase = true) ||
+                url.startsWith("data:application/octet-stream", ignoreCase = true) // some fonts use this
 
         /**
          * Shared scheme + host + privacy interception gate used by both the
@@ -1225,8 +1404,8 @@ class VWebviewClient(
          * Returns a blocking response if the request must be denied, or null
          * to allow it through to the fetch/CSP path.
          */
-        @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.N)
-        fun shouldBlockForRequest(request: android.webkit.WebResourceRequest): WebResourceResponse? {
+        @RequiresApi(Build.VERSION_CODES.N)
+        fun shouldBlockForRequest(request: WebResourceRequest): WebResourceResponse? {
             val scheme = request.url.scheme
             // data:/blob: have a null host and would bypass the domain
             // allowlist. Allow only inert media/font/CSS data: payloads; block
@@ -1240,15 +1419,8 @@ class VWebviewClient(
             // SVG-script-execution risk applies only in navigation/subframe
             // contexts, handled by shouldOverrideUrlLoading.
             if (scheme == "data") {
-                // Allocation-free prefix checks: data: payloads (avatars, inline
-                // media, fonts) can be hundreds of KB, and this runs per request
-                // on the Chromium network thread, so avoid lowercasing a copy.
                 val url = request.url.toString()
-                val isInert = url.startsWith("data:image/", ignoreCase = true) ||
-                    url.startsWith("data:font/", ignoreCase = true) ||
-                    url.startsWith("data:application/font", ignoreCase = true) ||
-                    url.startsWith("data:text/css", ignoreCase = true) ||
-                    url.startsWith("data:application/octet-stream", ignoreCase = true) // some fonts use this
+                val isInert = url.startsWith("data:image/", ignoreCase = true) || isInertDataPayload(url)
                 if (!isInert) {
                     return blockedResponse()
                 }
@@ -1261,6 +1433,13 @@ class VWebviewClient(
             if (shouldBlockUri(scheme, host, request.url.path, lowerHost)) {
                 return blockedResponse()
             }
+            // Recovery session ("Disable themes"): suppress user theme CSS
+            // from forge hosts before it can be fetched or served from the
+            // theme CSS cache. Runs before the theme-cache lookup and the
+            // CSP-strip fetch in shouldInterceptRequest, and inside this
+            // shared gate so the Service Worker path cannot drift from the
+            // WebView path.
+            userCssGateResponse(request.url)?.let { return it }
             // Privacy: block Discord telemetry, Sentry, and fingerprinting before
             // the CSP-stripping/fetch path so they never reach the network.
             return shouldBlockForPrivacy(host, request.url.path, lowerHost)
@@ -1297,7 +1476,7 @@ class VWebviewClient(
             // Note: the CSS itself isn't inert. Attribute-selector + url()
             // exfiltration to a .css endpoint on an allowlisted forge host is
             // possible. Accepted as a trust trade-off of remote-theme support.
-            if (lowerHost != null && isForgeHostCompanion(lowerHost)) {
+            if (lowerHost != null && isForgeHost(lowerHost)) {
                 val isCss = path?.endsWith(".css") == true
                 if (!isCss) return true
             }
@@ -1306,15 +1485,15 @@ class VWebviewClient(
 
         // Bounded executor for SWR background refetches; per-URL dedup avoids
         // redundant refreshes during rapid navigation.
-        private val revalidateExecutor: java.util.concurrent.Executor =
-            java.util.concurrent.Executors.newSingleThreadExecutor()
+        private val revalidateExecutor: Executor =
+            Executors.newSingleThreadExecutor()
         private val revalidatingUrls = ConcurrentHashMap.newKeySet<String>()
 
         // Dedicated single-thread executor for persisting raw main-frame HTML to
         // the disk cache off the network thread, avoiding a fresh Thread per write
         // and never competing with the SWR executor.
-        private val diskCacheExecutor: java.util.concurrent.Executor =
-            java.util.concurrent.Executors.newSingleThreadExecutor()
+        private val diskCacheExecutor: Executor =
+            Executors.newSingleThreadExecutor()
 
         // Delegates: the preloaded-shell store moved to StaleMainFrame;
         // VendroidApp and MainFrameDiskCache call through VWebviewClient.

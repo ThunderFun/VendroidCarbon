@@ -41,6 +41,14 @@ class BridgeKeyAllowlistTest {
     }
 
     @Test
+    fun `recovery-only flags stay unreachable from page JS`() {
+        // The recovery screen is the only writer; page JS must be able to
+        // neither read nor flip safe mode or the themes recovery flag.
+        assertFalse(VencordNative.isBridgeKeyAllowed("safeMode"))
+        assertFalse(VencordNative.isBridgeKeyAllowed("disableThemes"))
+    }
+
+    @Test
     fun `pruned dead keys stay blocked`() {
         for (key in setOf("splashScreen", "discordBranch", "allowRemoteDebugging"))
             assertFalse("bridge must keep blocking $key", VencordNative.isBridgeKeyAllowed(key))

@@ -5,7 +5,6 @@ import android.content.SharedPreferences
 import android.webkit.ValueCallback
 import android.webkit.WebView
 import androidx.test.core.app.ApplicationProvider
-import androidx.webkit.WebViewFeature
 import com.nin0dev.vendroid.webview.HttpClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -19,7 +18,6 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.android.controller.ActivityController
 import org.robolectric.annotation.Config
-import org.robolectric.shadows.ShadowWebView
 import java.lang.ref.WeakReference
 
 /**

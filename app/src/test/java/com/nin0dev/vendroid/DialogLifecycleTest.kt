@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Looper
 import android.webkit.WebView
 import androidx.test.core.app.ApplicationProvider
+import com.nin0dev.vendroid.webview.HttpClient
 import com.nin0dev.vendroid.webview.LinkHandler
 import com.nin0dev.vendroid.webview.SecureWebViewDialog
 import org.junit.Assert.assertFalse
@@ -56,6 +57,15 @@ class DialogLifecycleTest {
             .putBoolean("riskWarningAccepted", true)
             .putBoolean("vendroid_rememberLastChannel", false)
             .commit()
+
+        // Same convention as MainActivityVencordRuntimeLoadTest. Both runtimes
+        // must be published before buildActivity so loadVencordRuntimes never
+        // enqueues a real fetchVencord; a runtime-null boot takes the
+        // immediate bundle-check path (bundleCheckDelayMs returns 0) and would
+        // do real network I/O in a unit test.
+        HttpClient.vencordDisabled = false
+        HttpClient.setVencordRuntime("1;")
+        HttpClient.setVencordMobileRuntime("2;")
 
         controller = Robolectric.buildActivity(MainActivity::class.java)
         activity = controller.setup().get()

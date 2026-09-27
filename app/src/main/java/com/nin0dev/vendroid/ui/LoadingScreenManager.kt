@@ -7,8 +7,10 @@ import android.os.Looper
 import android.view.View
 import android.view.View.GONE
 import android.view.ViewGroup
+import android.view.ViewPropertyAnimator
 import androidx.appcompat.app.AppCompatActivity
 import com.nin0dev.vendroid.R
+import java.util.Random
 
 /**
  * Manages the loading screen: dot pulse, aurora glow backdrop, timeout, and
@@ -45,7 +47,7 @@ class LoadingScreenManager(
     private var animRunnable: Runnable? = null
     private var timeoutRunnable: Runnable? = null
     private var dismissRunnable: Runnable? = null
-    private var dismissAnimator: android.view.ViewPropertyAnimator? = null
+    private var dismissAnimator: ViewPropertyAnimator? = null
     private var animStartTime: Long = 0
     private var pausedAt: Long = 0
     private var ampX: Float = 0f
@@ -89,7 +91,7 @@ class LoadingScreenManager(
         ).toFloat()
         ampX = minDim * 0.16f
         ampY = minDim * 0.20f
-        val rng = java.util.Random()
+        val rng = Random()
         blobSpecs.forEachIndexed { i, spec ->
             baseX[i] = spec.baseXFrac * minDim
             baseY[i] = spec.baseYFrac * minDim

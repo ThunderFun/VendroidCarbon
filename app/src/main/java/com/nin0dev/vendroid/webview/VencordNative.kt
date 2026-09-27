@@ -1,26 +1,38 @@
 package com.nin0dev.vendroid.webview
 
+import android.app.Dialog
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.core.content.edit
+import com.nin0dev.vendroid.BuildConfig
 import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.R
+import com.nin0dev.vendroid.RecoveryActivity
 import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.ShareHelper
+import com.nin0dev.vendroid.utils.SettingKeys
 import com.nin0dev.vendroid.utils.VDELog
+import com.nin0dev.vendroid.utils.vdeGson
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.lang.ref.WeakReference
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebView) {
@@ -37,8 +49,6 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         internal val STRING_SETTING_KEYS get() = BridgeSettings.STRING_SETTING_KEYS
         internal fun isTypeSafeBridgeWrite(op: String, key: String) = BridgeSettings.isTypeSafeBridgeWrite(op, key)
         internal fun isBridgeKeyAllowed(id: String) = BridgeSettings.isBridgeKeyAllowed(id)
-
-        private val gson = com.google.gson.Gson()
 
         // Capability token, injected only into the top-level Discord document
         // (see bridgeBootstrapJs). addJavascriptInterface exposes the bridge to
@@ -63,6 +73,8 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // to "{}"), and the Vencord web shim (main WebView) and window.qcssSet
         // (editor WebView) live in separate JS contexts, so both flows park
         // their settled result in a page global and let Kotlin poll it.
+        // The QUICKCSS_GET_*/poll constants below feed fetchQuickCssViaPage;
+        // quickCssSaveJs is the save path.
         private const val QUICKCSS_POLL_INTERVAL_MS = 250L
         private const val QUICKCSS_POLL_ATTEMPTS = 8
 
@@ -145,7 +157,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             cachedBootstrapJs?.let { return it }
             val t = ensureToken()
             // JSON-encode so the token is safely embedded in a JS string literal.
-            val tokenLiteral = gson.toJson(t)
+            val tokenLiteral = vdeGson.toJson(t)
             return ("(function(){" +
                 "'use strict';" +
                 // Capture uncaught errors so bundle boot crashes are visible
@@ -203,14 +215,14 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     // disk, taking 50-100ms on eMMC; doing it on the bridge thread would stall
     // all @JavascriptInterface methods.
     private val settingsPrefs: SharedPreferences? = activity.get()
-        ?.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        ?.getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
 
     // Dedicated SharedPreferences for CSS cache entries. Isolating CSS from
     // the main "settings" prefs avoids rewriting the entire settings XML on
     // every CSS write and keeps the settings file small (faster cold-start
     // parse, no contention between CSS churn and settings).
     private val cssCachePrefs: SharedPreferences? = activity.get()
-        ?.getSharedPreferences("css_cache", Context.MODE_PRIVATE)
+        ?.getSharedPreferences(SettingKeys.CSS_CACHE_PREFS_NAME, Context.MODE_PRIVATE)
 
     private val executor = Executors.newSingleThreadExecutor()
 
@@ -276,16 +288,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     // Settings-row toggles get tapped in quick succession. The default 500 ms
     // window would swallow the second tap and the row's read-back would snap
     // the switch back, which looks like a broken toggle. 50 ms still caps
-    // scripted writes at 20/s per key.
-    private val TOGGLE_SETTING_KEYS = setOf(
-        "vendroid_confirmExternalLinks",
-        "vendroid_blockTypingIndicator",
-        "vendroid_gestures",
-        "vendroid_support_warnings"
-    )
-
+    // scripted writes at 20/s per key. The key set lives in
+    // BridgeSettings.RAPID_TOGGLE_KEYS.
     private fun minWriteIntervalNanos(id: String): Long =
-        if (id in TOGGLE_SETTING_KEYS) 50_000_000L else 500_000_000L
+        if (id in BridgeSettings.RAPID_TOGGLE_KEYS) 50_000_000L else 500_000_000L
 
     private fun rateLimitWrite(id: String): Boolean = rateLimitWrite(id, minWriteIntervalNanos(id))
 
@@ -407,7 +413,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // getUrl() must run on the UI thread; bridge methods run on a Chromium
         // thread, so bound the read to avoid stalling the shared bridge thread.
         var verified = false
-        val latch = java.util.concurrent.CountDownLatch(1)
+        val latch = CountDownLatch(1)
         wvActivity.runOnUiThread {
             try {
                 val url = wv.url
@@ -421,13 +427,15 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     wvActivity.navigationInProgress = false
                     verified = true
                 }
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                // WebView torn down mid-verify; leave unverified so the timeout path fails closed.
+            }
             latch.countDown()
         }
         try {
             // Fail closed on timeout rather than trusting a possibly-stale
             // cached host across a navigation.
-            if (!latch.await(50, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            if (!latch.await(50, TimeUnit.MILLISECONDS)) {
                 return false
             }
         } catch (_: InterruptedException) {
@@ -459,7 +467,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         if (isShutdown) return
         try {
             executor.execute(block)
-        } catch (_: java.util.concurrent.RejectedExecutionException) {
+        } catch (_: RejectedExecutionException) {
             // Shut down between the check and the submit; nothing useful to do.
         }
     }
@@ -500,18 +508,20 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     // Native-gated actions for the app-owned UI buttons rendered in
-    // vencord_mobile.js ("View logs" / "Open firewall editor"). openQuickCss,
-    // the other privileged method, is called directly by the QuickCSS editor
-    // bridge and must stay JS-callable, so it is not collapsed into this
-    // channel. updateVencord/updateVendroid were retired with the
-    // upstream-bundle flip: their only callers lived in the vendored
-    // vendroidEnhancements plugin, which the vanilla bundle does not carry.
-    private val ALLOWED_NATIVE_ACTIONS = setOf("openLogs", "openFirewallEditor")
+    // vencord_mobile.js ("View logs" / "Open firewall editor" / the client
+    // mod switcher's "Restart now"). openQuickCss, the other privileged
+    // method, is called directly by the QuickCSS editor bridge and must stay
+    // JS-callable, so it is not collapsed into this channel.
+    // updateVencord/updateVendroid were retired with the upstream-bundle
+    // flip: their only callers lived in the vendored vendroidEnhancements
+    // plugin, which the vanilla bundle does not carry.
+    private val ALLOWED_NATIVE_ACTIONS =
+        setOf("openLogs", "openFirewallEditor", "restartApp")
 
     @JavascriptInterface
     fun requestNative(token: String?, action: String?) {
         // Token is required as defense-in-depth, but the real boundary is that
-        // page JS cannot reach these two app-owned actions except through this
+        // page JS cannot reach these app-owned actions except through this
         // single gated channel.
         if (!isBridgeAuthorized(token)) return
         val safeAction = action ?: return
@@ -519,6 +529,28 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         when (safeAction) {
             "openLogs" -> openLogs()
             "openFirewallEditor" -> openFirewallEditor()
+            "restartApp" -> restartApp()
+        }
+    }
+
+    // "Restart now" for the client-mod switcher. The switch itself already
+    // invalidated the cached bundle and nulled the runtime; the new bundle
+    // loads on the next cold start, which only a process restart provides.
+    //
+    // This bridge runs in :web, so the restart hands off to RecoveryActivity
+    // (default process) instead of killing itself: self-kill races
+    // startActivity against process death, and singleTask can deliver
+    // onNewIntent to the dying instance instead of cold-starting.
+    private fun restartApp() {
+        // Same domain gate as openLogs: the action leaks no data, but a
+        // non-Discord page still must not bounce the app.
+        if (!isOnDiscordDomain()) return
+        val act = activity.get() ?: return
+        act.runOnUiThread {
+            act.startActivity(
+                Intent(act, RecoveryActivity::class.java)
+                    .putExtra(RecoveryActivity.EXTRA_RELAUNCH_MAIN, true)
+            )
         }
     }
 
@@ -573,23 +605,47 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 VDELog.w("VN", "Rejected JS write to read-only CSS cache key: $safeId")
                 return@guardedPrefs
             }
-            if (safeId == "clientMod") {
+            if (safeId == SettingKeys.KEY_CLIENT_MOD) {
                 // Only the two known mods are valid; reject anything else.
                 if (safeValue != "vencord" && safeValue != "equicord") {
                     VDELog.w("VN", "Rejected invalid clientMod value: $safeValue")
                     return@guardedPrefs
                 }
+                // A same-value write must stay a true no-op. The switcher UI
+                // guards against it, raw bridge calls do not, and repeating
+                // the invalidation deletes a good bundle, strips the runtime
+                // from future navigations, and forces a full re-download each
+                // time, at the page-JS write rate limit (~2.5 MB per 500 ms).
+                // An absent key counts as the default; a poisoned key counts
+                // as changed, so the invalidation below still runs.
+                val previous = try {
+                    prefs.getString(safeId, null) ?: "vencord"
+                } catch (_: ClassCastException) {
+                    null
+                }
+                if (previous == safeValue) return@guardedPrefs
                 // Invalidate the stale bundle so the next launch downloads
                 // the new mod cleanly, rather than injecting both the old
-                // (from preload) and new (from fetchVencord) runtimes.
+                // (from preload) and new (from fetchVencord) runtimes. One
+                // batch, so no reader can observe a gap between the stamp,
+                // identity, and key writes. The delete and runtime nulling
+                // are not prefs writes, so they stay out of the edit lambda.
                 prefs.edit {
                     // Zero the version stamp so the next launch redownloads
                     // unconditionally.
                     putInt(HttpClient.PREF_LAST_BUNDLE_UPDATE, 0)
                     clearBundleIdentityKeys()
-                    activity.get()?.filesDir?.let { File(it, "vencord.js").delete() }
-                    HttpClient.setVencordRuntime(null)
+                    putString(safeId, safeValue)
                 }
+                activity.get()?.filesDir?.let { File(it, "vencord.js").delete() }
+                HttpClient.setVencordRuntime(null)
+                // The batch above already wrote the key; skip the shared
+                // tail write.
+                //
+                // Start the prefetch now, while the old session is still
+                // alive; see prefetchBundleAfterModSwitch.
+                activity.get()?.let { HttpClient.prefetchBundleAfterModSwitch(it) }
+                return@guardedPrefs
             }
             prefs.edit {
                 putString(safeId, safeValue)
@@ -627,17 +683,17 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             // Live-update the link-confirm flag so the toggle takes effect
             // without an app restart. Inside the guarded block so rejected or
             // rate-limited writes can't desync the flag from persisted state.
-            if (safeId == "vendroid_confirmExternalLinks") {
-                com.nin0dev.vendroid.webview.LinkHandler.updateConfirmExternalLinks(value)
+            if (safeId == SettingKeys.KEY_VENDROID_CONFIRM_EXTERNAL_LINKS) {
+                LinkHandler.updateConfirmExternalLinks(value)
             }
             // Live-update the typing indicator filter so the toggle takes
             // effect without an app restart.
-            if (safeId == "vendroid_blockTypingIndicator") {
-                com.nin0dev.vendroid.webview.VWebviewClient.updateTypingBlock(value)
+            if (safeId == SettingKeys.KEY_VENDROID_BLOCK_TYPING_INDICATOR) {
+                VWebviewClient.updateTypingBlock(value)
             }
             // Opt-out wipes any persisted position.
-            if (safeId == "vendroid_rememberLastChannel" && !value) {
-                prefs.edit { remove("lastUrl") }
+            if (safeId == SettingKeys.KEY_VENDROID_REMEMBER_LAST_CHANNEL && !value) {
+                prefs.edit { remove(SettingKeys.KEY_LAST_URL) }
             }
             Unit
         }
@@ -648,103 +704,15 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // Single auth check; nothing between here and the guarded work can
         // change the verdict.
         if (!isBridgeAuthorized(token)) return
-        val rawId = id?.trim()
-        val safeId = rawId?.let { r -> IconAliasManager.ICON_NAMES.find { it.equals(r, ignoreCase = true) } }
-        if (rawId == null || safeId == null) {
-            val a = activity.get()
-            // rawId is page-controlled and unbounded, and lands in a Toast
-            // (which gets parcellized), so bound it.
-            val why = if (rawId == null) "null id" else "unknown id '${rawId.take(64)}'"
-            a?.runOnUiThread { Toast.makeText(a, "Icon change: $why", Toast.LENGTH_SHORT).show() }
-            return
-        }
         if (!isOnDiscordDomainStrict()) {
             val a = activity.get()
             a?.runOnUiThread { Toast.makeText(a, "Icon change: not on Discord domain", Toast.LENGTH_SHORT).show() }
             return
         }
         val act = activity.get() ?: return
-        try {
-            synchronized(IconAliasManager.iconLock) {
-                // Verify the cache against PM before trusting it, so the guard
-                // and oldIcon below are truthful. Runs even on the
-                // already-active path so re-selecting the same icon cleans up
-                // leftover aliases.
-                try {
-                    IconAliasManager.reconcileIconState(act)
-                } catch (t: Throwable) {
-                    // Reads inside are exception-safe; this is only a safety
-                    // net so a bridge method can never crash the process.
-                    VDELog.e("VN", "changeAppIcon: icon state reconcile failed", t)
-                }
-                if (safeId == IconAliasManager.currentIcon) {
-                    act.runOnUiThread {
-                        Toast.makeText(act, "Icon '$safeId' is already active", Toast.LENGTH_SHORT).show()
-                    }
-                    return
-                }
-                val oldIcon = IconAliasManager.currentIcon
-                if (oldIcon == null) {
-                    // Reconcile failed to establish a baseline (it logs the
-                    // reason). Guessing "Main" could disable the alias about
-                    // to be enabled and leave the launcher with no entry. No
-                    // PM writes have happened yet, so abort; the next attempt
-                    // reconciles again.
-                    VDELog.e("VN", "changeAppIcon: no resolved icon baseline; aborting")
-                    act.runOnUiThread {
-                        Toast.makeText(act, "Icon change failed: icon state unavailable", Toast.LENGTH_LONG).show()
-                    }
-                    return
-                }
-                val pm = act.packageManager
-                val pkg = act.applicationContext
-                // Enable first: while both aliases are briefly enabled the
-                // launcher still has an entry; disabling first could leave none.
-                pm.setComponentEnabledSetting(
-                    IconAliasManager.iconComponent(pkg, safeId),
-                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                    PackageManager.DONT_KILL_APP
-                )
-                // The new alias is live in the launcher from here on, so the
-                // cache must claim it now, even if the cleanup below fails.
-                IconAliasManager.currentIcon = safeId
-                fun disableOld(): Boolean = try {
-                    pm.setComponentEnabledSetting(
-                        IconAliasManager.iconComponent(pkg, oldIcon),
-                        PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                        PackageManager.DONT_KILL_APP
-                    )
-                    true
-                } catch (t: Throwable) {
-                    VDELog.e("VN", "changeAppIcon: disabling old icon '$oldIcon' failed", t)
-                    false
-                }
-                // One retry covers transient binder failures. If it still
-                // fails, reconcileIconState heals the leftover alias on the
-                // next icon change or app start.
-                val cleanupFailed = !disableOld() && !disableOld()
-                act.runOnUiThread {
-                    Toast.makeText(
-                        act,
-                        if (cleanupFailed)
-                            "Icon switched to $safeId, but the old icon could not be removed. Opening the icon switcher again (even on the same icon) repairs it."
-                        else
-                            "Icon changed to $safeId. Restart launcher if it doesn't update.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-        } catch (t: Throwable) {
-            // Safety net: an exception escaping a @JavascriptInterface method
-            // kills the process. On exit the cache is either unchanged (the
-            // enable threw before any commit) or already claims the live
-            // alias.
-            VDELog.e("VN", "changeAppIcon failed for id=$safeId", t)
-            val a = activity.get()
-            a?.runOnUiThread {
-                Toast.makeText(a, "Icon change failed: ${t.message ?: t.javaClass.simpleName}", Toast.LENGTH_LONG).show()
-            }
-        }
+        // applyIconChange takes iconLock itself; do not wrap this call in
+        // another synchronized.
+        IconAliasManager.applyIconChange(act, id)
     }
 
     /**
@@ -784,7 +752,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             onPageFinished = { view ->
                 if (safeQuickCss.isNotEmpty()) {
                     view.evaluateJavascript(
-                        "window.qcssSet?.(${gson.toJson(safeQuickCss)})", null
+                        "window.qcssSet?.(${vdeGson.toJson(safeQuickCss)})", null
                     )
                 } else {
                     // Fallback when the bundle didn't supply the CSS. Vencord
@@ -792,24 +760,8 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     // loaded bundle; if Vencord isn't ready the editor opens
                     // empty. In practice the bundle always passes the CSS, so
                     // this branch is rarely hit. (Mechanism: QUICKCSS_GET_*_JS.)
-                    val mainWv = wvRef.get() ?: return@openAssetEditor
-                    val currentAct = activity.get()
-                    if (currentAct == null || currentAct.isFinishing || currentAct.isDestroyed) return@openAssetEditor
-                    try {
-                        mainWv.evaluateJavascript(QUICKCSS_GET_START_JS, null)
-                    } catch (_: IllegalStateException) {
-                        // Main WebView destroyed before the read could start.
-                        return@openAssetEditor
-                    }
-                    val handler = Handler(Looper.getMainLooper())
-                    var pending = true
-                    fun deliver(json: String?) {
-                        pending = false
-                        // Async callback: the editor may have been dismissed
-                        // or the activity finished by now. Guard first.
-                        if (!quickCssDialogActive) return
-                        if (currentAct.isFinishing || currentAct.isDestroyed) return
-                        if (json == null) return // nothing to load; editor stays empty
+                    fetchQuickCssViaPage { json ->
+                        if (json == null) return@fetchQuickCssViaPage // nothing to load; editor stays empty
                         try {
                             view.evaluateJavascript(
                                 "window.qcssSet?.($json)", null
@@ -818,42 +770,90 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                             // Editor WebView was destroyed before delivery.
                         }
                     }
-                    fun poll(attempt: Int) {
-                        if (!pending || !quickCssDialogActive) return
-                        if (currentAct.isFinishing || currentAct.isDestroyed) return
-                        try {
-                            mainWv.evaluateJavascript(QUICKCSS_GET_POLL_JS) { result ->
-                                val value = result?.trim()
-                                when (value) {
-                                    // Script failed, Vencord missing, or
-                                    // get() rejected: nothing to load.
-                                    null, "null" -> deliver(null)
-                                    // 0 = still pending; retry, bounded.
-                                    "0" ->
-                                        if (attempt + 1 >= QUICKCSS_POLL_ATTEMPTS) {
-                                            VDELog.w("VN", "quickCss fallback: get() never settled; editor opened empty")
-                                            deliver(null)
-                                        } else {
-                                            handler.postDelayed({ poll(attempt + 1) }, QUICKCSS_POLL_INTERVAL_MS)
-                                        }
-                                    else -> deliver(value) // WebView's own JSON encoding
-                                }
-                            }
-                        } catch (_: IllegalStateException) {
-                            // Main WebView destroyed mid-poll: give up quietly.
-                            pending = false
-                        }
-                    }
-                    handler.postDelayed({ poll(0) }, QUICKCSS_POLL_INTERVAL_MS)
                 }
             }
         )
+    }
+
+    /**
+     * Reads QuickCSS from the loaded Vencord bundle in the main WebView.
+     * Kicks off quickCss.get(), polls a bounded number of times for the
+     * settled value, and hands the result to [onResult]: the WebView's own
+     * JSON encoding of the CSS text, or null when there is nothing to load
+     * or the read never settles. Enforces the liveness guards itself (dialog
+     * dismissed, activity finishing or destroyed, main WebView destroyed),
+     * so [onResult] runs only while the editor dialog is still active, on
+     * the main thread.
+     */
+    private fun fetchQuickCssViaPage(onResult: (String?) -> Unit) {
+        val mainWv = wvRef.get() ?: return
+        val currentAct = activity.get() ?: return
+        if (currentAct.isFinishing || currentAct.isDestroyed) return
+        try {
+            mainWv.evaluateJavascript(QUICKCSS_GET_START_JS, null)
+        } catch (_: IllegalStateException) {
+            // Main WebView destroyed before the read could start.
+            return
+        }
+        val handler = Handler(Looper.getMainLooper())
+        var pending = true
+        fun deliver(json: String?) {
+            pending = false
+            // Async callback: the editor may have been dismissed
+            // or the activity finished by now. Guard first.
+            if (!quickCssDialogActive) return
+            if (currentAct.isFinishing || currentAct.isDestroyed) return
+            onResult(json)
+        }
+        fun poll(attempt: Int) {
+            if (!pending || !quickCssDialogActive) return
+            if (currentAct.isFinishing || currentAct.isDestroyed) return
+            try {
+                mainWv.evaluateJavascript(QUICKCSS_GET_POLL_JS) { result ->
+                    val value = result?.trim()
+                    when (value) {
+                        // Script failed, Vencord missing, or
+                        // get() rejected: nothing to load.
+                        null, "null" -> deliver(null)
+                        // 0 = still pending; retry, bounded.
+                        "0" ->
+                            if (attempt + 1 >= QUICKCSS_POLL_ATTEMPTS) {
+                                VDELog.w("VN", "quickCss fallback: get() never settled; editor opened empty")
+                                deliver(null)
+                            } else {
+                                handler.postDelayed({ poll(attempt + 1) }, QUICKCSS_POLL_INTERVAL_MS)
+                            }
+                        else -> deliver(value) // WebView's own JSON encoding
+                    }
+                }
+            } catch (_: IllegalStateException) {
+                // Main WebView destroyed mid-poll: give up quietly.
+                pending = false
+            }
+        }
+        handler.postDelayed({ poll(0) }, QUICKCSS_POLL_INTERVAL_MS)
     }
 
     /** Interface implemented by the per-editor bridges so the shared
      *  [openAssetEditor] helper can mark the page origin as committed. */
     private interface EditorOrigin {
         var originCommitted: Boolean
+    }
+
+    /** Shared shell for the per-editor bridges (QuickCSS, log viewer,
+     *  firewall editor): the hosting activity + dialog pair and the origin
+     *  gate. Concrete bridges keep only their own @JavascriptInterface
+     *  methods (their close paths differ and stay per-bridge). */
+    private abstract class AssetEditorBridge(
+        protected val activity: MainActivity,
+        protected val dialog: Dialog
+    ) : EditorOrigin {
+        // Set from onPageFinished (UI thread). WebView.getUrl() must be called
+        // on the UI thread, but @JavascriptInterface methods run on a Chromium
+        // internal thread, so checking getUrl() directly is unreliable.
+        @Volatile override var originCommitted = false
+
+        protected fun isExpectedOrigin(): Boolean = originCommitted
     }
 
     /**
@@ -866,7 +866,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
      */    private fun openAssetEditor(
         act: MainActivity,
         assetUrl: String,
-        createBridge: (android.app.Dialog) -> EditorOrigin,
+        createBridge: (Dialog) -> EditorOrigin,
         onShown: () -> Unit,
         onDialogDismiss: () -> Unit,
         onPageFinished: (WebView) -> Unit
@@ -874,7 +874,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         act.runOnUiThread {
             // Nullable so the catch path can clean up a failure at any point.
             var wv: WebView? = null
-            var dialog: android.app.Dialog? = null
+            var dialog: Dialog? = null
             try {
                 if (act.isFinishing || act.isDestroyed) return@runOnUiThread
                 val editor = WebView(act)
@@ -886,7 +886,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 val bridge = createBridge(dialog)
                 editor.addJavascriptInterface(bridge, "VencordMobileNative")
 
-                editor.webViewClient = object : android.webkit.WebViewClient() {
+                editor.webViewClient = object : WebViewClient() {
                     // Fail closed: only ever load the expected bundled asset.
                     // Any navigation away from it (a link tap, meta refresh, or
                     // a future asset change) is blocked so the
@@ -894,7 +894,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     // remote/attacker document.
                     override fun shouldOverrideUrlLoading(
                         view: WebView?,
-                        request: android.webkit.WebResourceRequest
+                        request: WebResourceRequest
                     ): Boolean {
                         return request.url.toString() != assetUrl
                     }
@@ -905,11 +905,11 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     // editor WebView.
                     override fun shouldInterceptRequest(
                         view: WebView?,
-                        request: android.webkit.WebResourceRequest
-                    ): android.webkit.WebResourceResponse? {
+                        request: WebResourceRequest
+                    ): WebResourceResponse? {
                         return if (request.url.toString() == assetUrl) null
-                        else android.webkit.WebResourceResponse(
-                            "text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0))
+                        else WebResourceResponse(
+                            "text/plain", "utf-8", ByteArrayInputStream(ByteArray(0))
                         )
                     }
 
@@ -945,17 +945,11 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     private class QuickCssBridge(
-        private val activity: MainActivity,
-        private val dialog: android.app.Dialog
-    ) : EditorOrigin {
-        // Set from onPageFinished (UI thread). WebView.getUrl() must be called
-        // on the UI thread, but @JavascriptInterface methods run on a Chromium
-        // internal thread, so checking getUrl() directly is unreliable.
-        @Volatile override var originCommitted = false
+        activity: MainActivity,
+        dialog: Dialog
+    ) : AssetEditorBridge(activity, dialog) {
 
-        private fun isExpectedOrigin(): Boolean = originCommitted
-
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun quickCssSet(css: String?) {
             if (!isExpectedOrigin()) return
             val safe = css ?: ""
@@ -973,7 +967,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     return@runOnUiThread
                 }
                 try {
-                    mainWv.evaluateJavascript(quickCssSaveJs(gson.toJson(safe))) { result ->
+                    mainWv.evaluateJavascript(quickCssSaveJs(vdeGson.toJson(safe))) { result ->
                         // Async callback: the editor may have been dismissed
                         // by now; the isShowing guards below cover that.
                         if (activity.isFinishing || activity.isDestroyed) return@evaluateJavascript
@@ -1004,7 +998,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             }
         }
 
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun quickCssClose() {
             if (!isExpectedOrigin()) return
             activity.runOnUiThread {
@@ -1040,7 +1034,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun isDebugBuild(token: String?): Boolean {
         if (!isBridgeAuthorized(token)) return false
         if (!isOnDiscordDomain()) return false
-        return com.nin0dev.vendroid.BuildConfig.DEBUG
+        return BuildConfig.DEBUG
     }
 
     private fun openLogs() {
@@ -1060,39 +1054,36 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             onPageFinished = { view ->
                 val logs = VDELog.getRecentLogs(500)
                 view.evaluateJavascript(
-                    "window.vdeSetLogs?.(${gson.toJson(logs)})", null
+                    "window.vdeSetLogs?.(${vdeGson.toJson(logs)})", null
                 )
             }
         )
     }
 
     private class LogViewerBridge(
-        private val activity: MainActivity,
-        private val dialog: android.app.Dialog
-    ) : EditorOrigin {
-        @Volatile override var originCommitted = false
+        activity: MainActivity,
+        dialog: Dialog
+    ) : AssetEditorBridge(activity, dialog) {
 
-        private fun isExpectedOrigin(): Boolean = originCommitted
-
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun close() {
             if (!isExpectedOrigin()) return
             if (dialog.isShowing) dialog.dismiss()
         }
 
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun clearLogs() {
             if (!isExpectedOrigin()) return
             VDELog.clearLogs()
         }
 
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun refreshLogs(): String {
             if (!isExpectedOrigin()) return ""
             return VDELog.getRecentLogs(500)
         }
 
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun shareLogs() {
             if (!isExpectedOrigin()) return
             val text = VDELog.getLogFileContents()
@@ -1115,7 +1106,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             onShown = { firewallDialogActive = true },
             onDialogDismiss = { firewallDialogActive = false },
             onPageFinished = { view ->
-                val json = gson.toJson(FirewallConfig.toJson())
+                val json = vdeGson.toJson(FirewallConfig.toJson())
                 view.evaluateJavascript(
                     "window.vdeFirewallInit?.($json)", null
                 )
@@ -1124,15 +1115,12 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     private class FirewallEditorBridge(
-        private val activity: MainActivity,
-        private val dialog: android.app.Dialog
-    ) : EditorOrigin {
-        @Volatile override var originCommitted = false
+        activity: MainActivity,
+        dialog: Dialog
+    ) : AssetEditorBridge(activity, dialog) {
         @Volatile private var lastError: String? = null
 
-        private fun isExpectedOrigin(): Boolean = originCommitted
-
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun close() {
             try {
                 if (!isExpectedOrigin()) return
@@ -1142,7 +1130,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             }
         }
 
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun getFirewallConfig(): String {
             try {
                 if (!isExpectedOrigin()) return "{\"error\":\"origin\"}"
@@ -1161,15 +1149,15 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 .replace("\n", " ").replace("\r", " ").replace("\t", " ")
         }
 
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun saveFirewallConfig(json: String): Boolean {
             try {
                 if (!isExpectedOrigin()) return false
                 val ok = FirewallConfig.fromJsonAndSave(json)
                 if (ok) {
                     activity.runOnUiThread {
-                        android.widget.Toast.makeText(
-                            activity, "Firewall saved", android.widget.Toast.LENGTH_SHORT
+                        Toast.makeText(
+                            activity, "Firewall saved", Toast.LENGTH_SHORT
                         ).show()
                     }
                 }
@@ -1180,14 +1168,14 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             }
         }
 
-        @android.webkit.JavascriptInterface
+        @JavascriptInterface
         fun resetFirewallConfig() {
             try {
                 if (!isExpectedOrigin()) return
                 FirewallConfig.resetToDefaults()
                 activity.runOnUiThread {
-                    android.widget.Toast.makeText(
-                        activity, "Firewall reset to defaults", android.widget.Toast.LENGTH_SHORT
+                    Toast.makeText(
+                        activity, "Firewall reset to defaults", Toast.LENGTH_SHORT
                     ).show()
                 }
             } catch (t: Throwable) {

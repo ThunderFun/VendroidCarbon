@@ -1,6 +1,7 @@
 package com.nin0dev.vendroid.webview
 
 import com.nin0dev.vendroid.utils.JsPatches
+import java.util.concurrent.atomic.AtomicReference
 
 internal object ResponseHtmlInjector {
     private val disableHighlightCss = "html{-webkit-tap-highlight-color:transparent}a,button,[role=\"button\"],input,textarea,select,[tabindex]:not([tabindex=\"-1\"]){outline:none}"
@@ -12,7 +13,7 @@ internal object ResponseHtmlInjector {
      *
      * [runtimeEmbedded] reflects the same snapshot that performed the embed,
      * so it always matches the served HTML. Callers must claim
-     * runtimeEmbeddedUrls from this flag, never from a fresh re-read of the
+     * EmbeddedUrlClaims.recordRuntime from this flag, never from a fresh re-read of the
      * HttpClient statics: a preload publishing between the embed snapshot and
      * a re-read would claim runtimes the HTML lacks, and onPageStarted would
      * then skip its typeof probe and missedInjection recovery.
@@ -77,10 +78,11 @@ internal object ResponseHtmlInjector {
             sb.append("<script>")
                 .append(escapeScriptTagContent(VencordNative.bridgeBootstrapJs()))
                 .append("</script>")
-                // Env shim must precede the bundle (see VENCORD_PRELUDE_JS).
-                .append("<script>").append(JsPatches.VENCORD_PRELUDE_JS).append(';')
-                .append(escapedRuntimeOf(runtime!!)).append(';')
-                .append(escapedMobileRuntimeOf(mobileRuntime!!)).append(";</script>")
+                // Gate flag then env shim must precede the bundle
+                // (see JsPatches.vencordPreludeJs).
+                .append("<script>").append(JsPatches.vencordPreludeJs(HttpClient.userCssDisabled)).append(';')
+                .append(escapedOf(escapedRuntimeRef, runtime!!)).append(';')
+                .append(escapedOf(escapedMobileRuntimeRef, mobileRuntime!!)).append(";</script>")
         }
         sb.append(text, headIdx, text.length)
         return InjectionResult(sb.toString(), runtimeReady)
@@ -92,25 +94,20 @@ internal object ResponseHtmlInjector {
      * reference identity avoids re-scanning/re-copying them on every cached
      * main-frame serve. A replaced runtime (clientMod switch, update) gets a
      * new String instance, which misses the cache exactly once.
-     */    private class EscapedJs(val raw: String, val escaped: String)
+     */
+    private class EscapedJs(val raw: String, val escaped: String)
 
-    @Volatile
-    private var escapedRuntime: EscapedJs? = null
+    // One cache slot per runtime string, both served by [escapedOf].
+    // AtomicReference.get/set have volatile semantics, which matters because
+    // injectFirewallAndCss runs on concurrent WebView threads.
+    private val escapedRuntimeRef = AtomicReference<EscapedJs?>()
+    private val escapedMobileRuntimeRef = AtomicReference<EscapedJs?>()
 
-    @Volatile
-    private var escapedMobileRuntime: EscapedJs? = null
-
-    private fun escapedRuntimeOf(raw: String): String {
-        escapedRuntime?.let { if (it.raw === raw) return it.escaped }
+    private fun escapedOf(holder: AtomicReference<EscapedJs?>, raw: String): String {
+        val cached = holder.get()
+        if (cached != null && cached.raw === raw) return cached.escaped
         val e = EscapedJs(raw, escapeScriptTagContent(raw))
-        escapedRuntime = e
-        return e.escaped
-    }
-
-    private fun escapedMobileRuntimeOf(raw: String): String {
-        escapedMobileRuntime?.let { if (it.raw === raw) return it.escaped }
-        val e = EscapedJs(raw, escapeScriptTagContent(raw))
-        escapedMobileRuntime = e
+        holder.set(e)
         return e.escaped
     }
 

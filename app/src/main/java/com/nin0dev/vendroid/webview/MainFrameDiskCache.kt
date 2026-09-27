@@ -5,6 +5,7 @@ import android.net.Uri
 import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.VDELog
 import java.io.File
+import java.security.MessageDigest
 import java.util.Base64
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -195,6 +196,7 @@ import kotlin.concurrent.withLock
                         // the FIFO cycles it out.
                         lines.removeAt(0)
                     }
+                    // Index write is best-effort; losing it only skips a cold-start preload hint.
                     try { idx.writeText(lines.joinToString("\n") + "\n") } catch (_: Exception) {}
                 }
                 // Reclaim aged-out entries (evicted URLs, crash debris).
@@ -261,6 +263,7 @@ import kotlin.concurrent.withLock
                 if (tab <= 0) continue
                 val k = line.substring(0, tab)
                 val vEnc = line.substring(tab + 1)
+                // Undecodable header line: skip it; the content-type default below covers an empty map.
                 try {
                     headers[k] = String(dec.decode(vEnc), Charsets.UTF_8)
                 } catch (_: Exception) {}
@@ -310,7 +313,9 @@ import kotlin.concurrent.withLock
                 if (nowMs - fetchedAt <= MAX_AGE_MS) continue
                 files.forEach { it.delete() }
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            // Sweep is best-effort; anything left behind is retried on the next sweep.
+        }
     }
 
     /** The cacheable URLs recorded during writes, for cold-start preload. */
@@ -334,7 +339,9 @@ import kotlin.concurrent.withLock
         val dir = cacheDir ?: return
         try {
             dir.listFiles()?.forEach { it.delete() }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            // Leftover files are inert; the sweep reclaims them once they age out.
+        }
     }
 
     private fun entryBaseName(urlString: String): String {
@@ -343,7 +350,7 @@ import kotlin.concurrent.withLock
         // one page would be served the other's stale HTML. Truncating to 32
         // hex chars keeps collisions astronomically unlikely while staying
         // compact.
-        val md = java.security.MessageDigest.getInstance("SHA-256")
+        val md = MessageDigest.getInstance("SHA-256")
         val sb = StringBuilder(ENTRY_BASE_LEN)
         for (b in md.digest(urlString.toByteArray(Charsets.UTF_8))) {
             sb.append(((b.toInt() and 0xFF) + 0x100).toString(16).substring(1))

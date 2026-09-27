@@ -1,5 +1,7 @@
 package com.nin0dev.vendroid.utils
 
+import android.util.Log
+import com.nin0dev.vendroid.BuildConfig
 import java.util.concurrent.ConcurrentHashMap
 
 object Constants {
@@ -24,6 +26,12 @@ object Constants {
         "https://github.com/Vendicated/Vencord/releases/latest/download/browser.css"
     const val EQUICORD_CSS_URL =
         "https://github.com/Equicord/Equicord/releases/latest/download/browser.css"
+
+    /** The Discord web-app shell: what MainActivity loads when no deep link or
+     *  resumable session applies, and the anchor host the bridge fields are
+     *  set to while it loads. */
+    const val APP_SHELL_URL = "https://discord.com/app"
+    const val APP_SHELL_HOST = "discord.com"
 
     // The bundle is arbitrary code executed in the Discord origin; it may
     // only be fetched from GitHub's release infrastructure. Both hosts are
@@ -117,8 +125,8 @@ object Constants {
         // after FirewallConfig.init() has run. Enforce the boot-order contract
         // in debug so a new call path that skips init fails loudly instead of
         // silently blocking every host (fail-closed).
-        if (com.nin0dev.vendroid.BuildConfig.DEBUG && !FirewallConfig.isInitialized()) {
-            android.util.Log.e("Vendroid", "isAllowedDomain() called before FirewallConfig.init(); returning false")
+        if (BuildConfig.DEBUG && !FirewallConfig.isInitialized()) {
+            Log.e("Vendroid", "isAllowedDomain() called before FirewallConfig.init(); returning false")
         }
         return isAllowedDomainLower(host.lowercase())
     }

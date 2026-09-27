@@ -1,6 +1,5 @@
 package com.nin0dev.vendroid.webview
 
-import android.content.ActivityNotFoundException
 import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Log
@@ -17,8 +16,11 @@ import androidx.core.view.WindowInsetsControllerCompat
 import com.nin0dev.vendroid.BuildConfig
 import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.R
+import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.VDELog
 import java.lang.ref.WeakReference
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 class VChromeClient(activity: MainActivity) : WebChromeClient() {
     private val activityRef: WeakReference<MainActivity> = WeakReference(activity)
@@ -26,9 +28,9 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
     companion object {
         // Per-page cap for unprefixed ERROR console capture from Discord
         // app origins. Reset by VWebviewClient.onPageStarted.
-        private val consoleErrorQuota = java.util.concurrent.atomic.AtomicInteger(30)
+        private val consoleErrorQuota = AtomicInteger(30)
         private val seenConsoleErrors: MutableSet<String> =
-            java.util.concurrent.ConcurrentHashMap.newKeySet()
+            ConcurrentHashMap.newKeySet()
 
         @JvmStatic
         fun resetPageErrorQuota() {
@@ -75,7 +77,7 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         // into the shareable log.
         if (message.startsWith("[Vendroid]") || message.startsWith("[VDE]")) {
             val host = activityRef.get()?.currentHostForBridge
-            if (host == null || !com.nin0dev.vendroid.utils.Constants.isDiscordAppOrigin(host)) {
+            if (host == null || !Constants.isDiscordAppOrigin(host)) {
                 // Drop without persisting: emitted by a non-app-origin page.
                 return true
             }
@@ -95,7 +97,7 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         // deduped) since they signal bundle boot failures.
         if (msg.messageLevel() == MessageLevel.ERROR) {
             val host = activityRef.get()?.currentHostForBridge
-            if (host != null && com.nin0dev.vendroid.utils.Constants.isDiscordAppOrigin(host)) {
+            if (host != null && Constants.isDiscordAppOrigin(host)) {
                 val source = msg.sourceId() ?: ""
                 val titled = "$message @ ${UrlNormalizer.redactForLog(source)}:${msg.lineNumber()}"
                 val dedupeKey = titled.take(80)
