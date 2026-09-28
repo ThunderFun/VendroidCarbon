@@ -27,12 +27,12 @@ if (keystorePropertiesFile.exists()) {
 }
 
 android {
-    namespace = 'com.nin0dev.vendroid'
+    namespace = 'io.github.thunderfun.vendroid'
     compileSdk 37
     compileSdkMinor = 1
 
     defaultConfig {
-        applicationId "com.nin0dev.vendroid"
+        applicationId "io.github.thunderfun.vendroid"
         minSdk 26
         targetSdk 35
         versionCode 17

@@ -181,9 +181,15 @@ div[class^="prompt_"] {
     }
 
     // Ported gesture navigation (vendroidEnhancements.start()): swipe
-    // between chat, member list and sidebar. Gated by the native
-    // vendroid_gestures pref (default on), read live in the swipe handler so
-    // the settings toggle applies without a restart.
+    // between the sidebar, chat and the member list. The vendroid_gestures
+    // pref (default on) is read live per swipe, so the settings toggle
+    // applies without a restart; the listeners stay attached for the page
+    // lifetime either way.
+    //
+    // State is re-derived on every swipe from the same source back press
+    // uses: the MOBILE_WEB_SIDEBAR_* subscriptions in 31-do-init.js feed
+    // isSidebarOpen. The members panel has no Flux event and is read from
+    // its DOM at swipe time.
     var _vendroidGesturesSetupDone = false;
     function gesturesEnabled() {
         try {
@@ -198,18 +204,116 @@ div[class^="prompt_"] {
         _vendroidGesturesSetupDone = true;
         if (legacyVendroidPluginPresent()) return;
 
-        var isMembersVisible = false;
-        var isSidebarVisible = true;
+        // Single-finger tracking. A gesture counts only when exactly one
+        // finger was down for its whole life: a second finger, a lift with
+        // fingers still down, or a touchcancel drops it. Both ends are read
+        // in clientX/clientY, one coordinate space.
+        var tracking = false;
+        var startX = 0;
+        var startY = 0;
+        var startT = 0;
+        var startTarget = null;
 
-        function updatePanelsStatus() {
-            isSidebarVisible = !!document.querySelector("div[class^='sidebar_']");
-            isMembersVisible = !!document.querySelector("div[class^='members_']");
+        var sidebarDriftLogged = false;
+        var layerDriftLogged = false;
+
+        // The DOM read never overrides isSidebarOpen; back press reads the
+        // same flag and a second truth would drift. A mismatch is logged
+        // once so selector rot or a lost Flux event shows up in VDELog.
+        function sidebarDriftCanary() {
+            if (sidebarDriftLogged) return;
+            try {
+                var domOpen = !!document.querySelector("div[class^='sidebar_']");
+                if (domOpen === isSidebarOpen) return;
+                sidebarDriftLogged = true;
+                console.error("[Vendroid] Swipe: sidebar state drift, flux=" + isSidebarOpen +
+                    " dom=" + domOpen + " (selector rot or missing Flux event)");
+            } catch (e) {}
         }
 
-        setInterval(function() {
-            try { if (!document.hidden) updatePanelsStatus(); } catch (e) {}
-        }, 1000);
-        try { updatePanelsStatus(); } catch (e) {}
+        // Layer gate. Reuses the back-press helper but exempts the
+        // sidebar's own layer container while the sidebar is open, so
+        // left-swipe can still close it. discordLayerOpen() fails open when
+        // the layer markup is missing; for swipes that would silently kill
+        // the feature, so that case logs once.
+        function layerBlocksSwipe(sidebarOpen) {
+            var open;
+            try { open = discordLayerOpen(); } catch (e) { return true; }
+            if (!open) return false;
+            try {
+                var containers = document.querySelectorAll('[class*="layerContainer"]');
+                if (containers.length === 0) {
+                    if (!layerDriftLogged) {
+                        layerDriftLogged = true;
+                        console.error("[Vendroid] Swipe: layer containers absent, drift?");
+                    }
+                    return true;
+                }
+                if (!sidebarOpen) return true;
+                for (var i = 0; i < containers.length; i++) {
+                    var c = containers[i];
+                    if (c.childElementCount === 0) continue;
+                    if (c.querySelector("div[class^='sidebar_']")) continue;
+                    return true;
+                }
+                return false;
+            } catch (e) {
+                return true;
+            }
+        }
+
+        // Typing and scrubbing targets are input, not navigation: text
+        // fields, sliders (input[type=range] is covered by the input rule),
+        // inline players, the search card. The :not() exempts an explicit
+        // contenteditable="false". Evaluated on the touchstart target,
+        // which can differ from where the touch ends.
+        function swipeTargetExcluded(el) {
+            try {
+                if (!el || !el.closest) return false;
+                if (el.closest("input, textarea, [contenteditable]:not([contenteditable='false'])")) return true;
+                if (el.closest("video, audio")) return true;
+                if (el.closest('[data-vde-search-overlay]')) return true;
+            } catch (e) {}
+            return false;
+        }
+
+        // Horizontally scrollable surfaces (attachment carousels, the Nitro
+        // shop) own horizontal drags. Runs after the threshold checks; the
+        // getComputedStyle walk is too expensive for every tap.
+        function swipeTargetScrollable(el) {
+            try {
+                for (var n = el; n && n !== document.body; n = n.parentElement) {
+                    if (n.scrollWidth - n.clientWidth > 8) {
+                        var ox = getComputedStyle(n).overflowX;
+                        if (ox === "auto" || ox === "scroll") return true;
+                    }
+                }
+            } catch (e) {}
+            return false;
+        }
+
+        // Drag-to-select. Best effort: some Android flows materialise the
+        // selection around the lift, so this can miss.
+        function selectionActive() {
+            try {
+                var sel = window.getSelection();
+                return !!(sel && sel.rangeCount > 0 && !sel.isCollapsed);
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // The search card is not a modal (pointer-events pass through below
+        // it), so nothing else hides its touches. Same visibility test as
+        // onBackPress; a hidden session leaves the results dock interactive.
+        function searchOverlayVisible() {
+            try {
+                var o = _vendroidSearchOverlay;
+                return !!(o && o.el && o.el.style.display !== 'none');
+            } catch (e) {
+                return false;
+            }
+        }
 
         // Lazy module lookups; the anchors are the same ones the plugin
         // used via @webpack/common. Accessed on swipe, long after boot.
@@ -229,69 +333,176 @@ div[class^="prompt_"] {
             try { return Vencord.Webpack.findByProps("toggleMembersSection"); } catch (e) { return null; }
         }
 
-        var startX = 0;
-        var startY = 0;
-        document.addEventListener("touchstart", function(event) {
+        function currentGuildId() {
             try {
-                startX = event.changedTouches[0].clientX;
-                startY = event.changedTouches[0].clientY;
+                var store = selectedGuildStore();
+                if (store && typeof store.getGuildId === "function") return store.getGuildId();
             } catch (e) {}
-        });
-        document.addEventListener("touchend", function(event) {
+            return null;
+        }
+
+        // The member list only exists in a guild channel. SelectedGuildStore
+        // can still report the last guild while a DM is open, so @me routes
+        // are excluded by path too.
+        function guildContext() {
             try {
-                if (!startX || !startY) return;
-                var endX = event.changedTouches[0].screenX;
-                var endY = event.changedTouches[0].screenY;
+                if (window.location.pathname.indexOf("/channels/@me") === 0) return false;
+            } catch (e) { return false; }
+            return !!currentGuildId();
+        }
 
-                var isSwipeVertical = Math.abs(endY - startY) > 60;
-                if (isSwipeVertical) return;
-                if (Math.abs(endX - startX) <= 60) return;
+        // Same dispatch back press opens with. The hamburger click (hashed
+        // class) is only the no-dispatcher fallback; history.back() is not
+        // used because there may be nothing to pop.
+        function openSidebar() {
+            var fd = findFluxDispatcher();
+            if (fd) {
+                try {
+                    fd.dispatch({ type: "MOBILE_WEB_SIDEBAR_OPEN" });
+                    return true;
+                } catch (e) {
+                    console.error("[Vendroid] Swipe: sidebar OPEN dispatch failed: " + e.message);
+                }
+            }
+            try {
+                var hamburger = document.querySelector("button[class^='btnHamburger__']");
+                if (hamburger) { hamburger.click(); return true; }
+                console.warn("[Vendroid] Swipe: no dispatcher and no hamburger, sidebar not opened");
+            } catch (e) {}
+            return false;
+        }
 
-                // Live pref read; taps and vertical swipes never reach this.
-                if (!gesturesEnabled()) return;
+        function dispatchSidebarClose() {
+            var fd = findFluxDispatcher();
+            if (!fd) return false;
+            try {
+                fd.dispatch({ type: "MOBILE_WEB_SIDEBAR_CLOSE" });
+                return true;
+            } catch (e) {
+                console.error("[Vendroid] Swipe: sidebar CLOSE dispatch failed: " + e.message);
+                return false;
+            }
+        }
 
-                if (endX < startX) {
-                    // Left swipe (right to left)
-                    if (isSidebarVisible) {
-                        var router = navRouter();
-                        var store = selectedGuildStore();
-                        if (router && store && typeof router.transitionToGuild === "function" && typeof store.getGuildId === "function") {
-                            router.transitionToGuild(store.getGuildId());
-                        }
-                        isMembersVisible = false;
-                        isSidebarVisible = false;
-                    } else if (!isMembersVisible) {
-                        var actionsL = channelSidebarActions();
-                        if (actionsL && typeof actionsL.toggleMembersSection === "function") {
-                            actionsL.toggleMembersSection();
-                            isMembersVisible = true;
-                            isSidebarVisible = false;
-                        }
-                    }
-                } else {
-                    // Right swipe (left to right)
-                    if (!isSidebarVisible) {
-                        if (!isMembersVisible) {
-                            var hamburger = document.querySelector("button[class^='btnHamburger__']");
-                            if (hamburger) hamburger.click();
-                            isMembersVisible = false;
-                            isSidebarVisible = true;
-                        }
-                    }
-                    if (isMembersVisible) {
-                        var actionsR = channelSidebarActions();
-                        if (actionsR && typeof actionsR.toggleMembersSection === "function") {
-                            actionsR.toggleMembersSection();
-                            isMembersVisible = false;
-                            isSidebarVisible = false;
+        // Close shape varies by route. Chat route: CLOSE alone, since
+        // transitionToGuild would jump to the guild's last-active channel.
+        // Guild list route: navigate into the guild, there is no chat to
+        // reveal. DM list: transitionToGuild(null) lands on Friends, so
+        // CLOSE plus history.back() instead.
+        function closeSidebar() {
+            var path = "";
+            try { path = window.location.pathname; } catch (e) {}
+            var chatRoute = /^\/channels\/[^\/]+\/[^\/]+$/.test(path);
+            var dmHome = path.indexOf("/channels/@me") === 0;
+
+            if (chatRoute) {
+                if (dispatchSidebarClose()) return true;
+            } else if (!dmHome) {
+                var gid = currentGuildId();
+                if (gid) {
+                    var router = navRouter();
+                    if (router && typeof router.transitionToGuild === "function") {
+                        try { router.transitionToGuild(gid); return true; } catch (e) {
+                            console.error("[Vendroid] Swipe: transitionToGuild failed: " + e.message);
                         }
                     }
                 }
+                if (dispatchSidebarClose()) return true;
+            } else {
+                dispatchSidebarClose();
+            }
+            try {
+                if (window.history.length > 1) { window.history.back(); return true; }
+            } catch (e) {}
+            return false;
+        }
+
+        function toggleMembers() {
+            var actions = channelSidebarActions();
+            if (actions && typeof actions.toggleMembersSection === "function") {
+                try { actions.toggleMembersSection(); return true; } catch (e) {
+                    console.error("[Vendroid] Swipe: toggleMembersSection failed: " + e.message);
+                }
+            }
+            return false;
+        }
+
+        document.addEventListener("touchstart", function(event) {
+            if (event.touches.length !== 1) { tracking = false; return; }
+            tracking = true;
+            startX = event.changedTouches[0].clientX;
+            startY = event.changedTouches[0].clientY;
+            startT = Date.now();
+            startTarget = event.target;
+        }, { passive: true });
+
+        document.addEventListener("touchcancel", function() {
+            tracking = false;
+        }, { passive: true });
+
+        document.addEventListener("touchend", function(event) {
+            if (!tracking) return;
+            tracking = false;                                // one-shot
+            if (event.touches.length !== 0) return;          // fingers still down
+
+            try {
+                var endX = event.changedTouches[0].clientX;
+                var endY = event.changedTouches[0].clientY;
+                var dx = endX - startX;
+                var dy = endY - startY;
+
+                // Gates cheapest first: a rejected swipe must not cost a
+                // DOM query.
+                if (!isInApp()) return;
+                if (!gesturesEnabled()) return;
+                if (desktopModeEnabled() || !isAndroidWebDevicePreOverride()) return;
+                if (swipeTargetExcluded(startTarget)) return;
+                if (selectionActive()) return;
+
+                // Dominant-horizontal only: the 60 px floor plus the 1.5x
+                // margin rejects diagonals and scroll drift while accepting a
+                // long horizontal drag with vertical drift.
+                if (Math.abs(dx) < 60 || Math.abs(dx) < 1.5 * Math.abs(dy)) return;
+                if (Date.now() - startT > 600) return;       // drag, not swipe
+                if (swipeTargetScrollable(startTarget)) return;
+
+                if (searchOverlayVisible()) return;
+
+                // Fresh state per swipe; each branch performs at most one
+                // action.
+                var sidebarOpen = isSidebarOpen;
+                sidebarDriftCanary();
+                if (layerBlocksSwipe(sidebarOpen)) return;
+
+                var membersOpen = false;
+                try { membersOpen = !!document.querySelector("div[class^='members_']"); } catch (e) {}
+
+                if (dx < 0) {
+                    // Left swipe (right to left).
+                    if (sidebarOpen) {
+                        closeSidebar();
+                    } else if (!membersOpen && guildContext()) {
+                        toggleMembers();
+                    }
+                    return;
+                }
+
+                // Right swipe (left to right).
+                if (membersOpen && !sidebarOpen) {
+                    toggleMembers();
+                    return;
+                }
+                if (!sidebarOpen) openSidebar();
             } catch (e) {
                 console.error("[Vendroid] gesture handler error: " + e.message);
             }
-        });
-        console.warn("[Vendroid] Gesture navigation enabled");
+        }, { passive: true });
+
+        if (gesturesEnabled()) {
+            console.warn("[Vendroid] Gesture navigation enabled");
+        } else {
+            console.warn("[Vendroid] Gesture handler attached (enabled=false)");
+        }
     }
 
     // Ported support-server warnings (vendroidEnhancements). Alerts on

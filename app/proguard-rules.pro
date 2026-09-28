@@ -9,20 +9,20 @@
 # but aggressive R8 settings (-repackageclasses, -allowaccessmodification)
 # can still break the bridge if the class itself is obfuscated or merged.
 -keep @interface android.webkit.JavascriptInterface
--keepclassmembers class com.nin0dev.vendroid.webview.VencordNative {
+-keepclassmembers class io.github.thunderfun.vendroid.webview.VencordNative {
     @android.webkit.JavascriptInterface <methods>;
 }
 # Also keep the class from being renamed/merged so the runtime type
 # matches what addJavascriptInterface() registered.
--keep class com.nin0dev.vendroid.webview.VencordNative { *; }
+-keep class io.github.thunderfun.vendroid.webview.VencordNative { *; }
 
 # Inner bridge classes registered via addJavascriptInterface() from
 # openLogs()/openQuickCss()/openFirewallEditor(). R8's aggressive passes
 # can merge or rename these even though @JavascriptInterface keeps their
 # method names, so keep the classes explicitly.
--keep class com.nin0dev.vendroid.webview.VencordNative$LogViewerBridge { *; }
--keep class com.nin0dev.vendroid.webview.VencordNative$QuickCssBridge { *; }
--keep class com.nin0dev.vendroid.webview.VencordNative$FirewallEditorBridge { *; }
+-keep class io.github.thunderfun.vendroid.webview.VencordNative$LogViewerBridge { *; }
+-keep class io.github.thunderfun.vendroid.webview.VencordNative$QuickCssBridge { *; }
+-keep class io.github.thunderfun.vendroid.webview.VencordNative$FirewallEditorBridge { *; }
 
 # Gson: keep only the core Gson class + TypeToken (for reflection).
 # Let R8 shrink all unused Gson adapters/internals. Only serialized
@@ -51,16 +51,16 @@
 # aggressive passes (-optimizationpasses 5, -allowaccessmodification,
 # -repackageclasses) can inline or merge it away if it looks unused.
 # The HandlerThread and Handler fields must survive for file I/O.
--keep class com.nin0dev.vendroid.utils.VDELog { *; }
--keep class com.nin0dev.vendroid.utils.VDELog$Level { *; }
--keep class com.nin0dev.vendroid.utils.VDELog$LogEntry { *; }
+-keep class io.github.thunderfun.vendroid.utils.VDELog { *; }
+-keep class io.github.thunderfun.vendroid.utils.VDELog$Level { *; }
+-keep class io.github.thunderfun.vendroid.utils.VDELog$LogEntry { *; }
 
 # FirewallConfig: runtime-editable domain allowlist. Aggressive R8 passes can
 # inline or merge a singleton that looks unused from static analysis; keep it
 # and its Category enum explicitly.
--keep class com.nin0dev.vendroid.utils.FirewallConfig { *; }
--keep class com.nin0dev.vendroid.utils.FirewallConfig$Category { *; }
--keep class com.nin0dev.vendroid.utils.FirewallConfig$Category$Companion { *; }
+-keep class io.github.thunderfun.vendroid.utils.FirewallConfig { *; }
+-keep class io.github.thunderfun.vendroid.utils.FirewallConfig$Category { *; }
+-keep class io.github.thunderfun.vendroid.utils.FirewallConfig$Category$Companion { *; }
 
 # Remove ALL logging in release (including Log.w and Log.e which
 # still allocate strings for their arguments even if not visible).

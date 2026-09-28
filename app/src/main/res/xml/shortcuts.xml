@@ -7,7 +7,7 @@
         android:shortcutLongLabel="@string/recovery_shortcut_name">
         <intent
             android:action="android.intent.action.VIEW"
-            android:targetPackage="com.nin0dev.vendroid"
-            android:targetClass="com.nin0dev.vendroid.RecoveryActivity" />
+            android:targetPackage="io.github.thunderfun.vendroid"
+            android:targetClass="io.github.thunderfun.vendroid.RecoveryActivity" />
     </shortcut>
 </shortcuts>

@@ -424,7 +424,86 @@
     } catch(e) {}
     let initialized = false;
 
+    // Desktop-oriented plugins upstream ships with enabledByDefault:true
+    // that are dead weight or dead code inside the Android WebView:
+    //   WebPWA              - PWA manifest + navigator.setAppBadge; the app
+    //                         itself is the PWA
+    //   WebScreenShare      - replaces getDisplayMedia with a quality-picker
+    //                         modal; the WebView has no usable screen-capture
+    //                         path, so the override only shadows future
+    //                         native screenshare plumbing
+    //   WebScreenShareFixes - desktop Chromium SDP bitrate munging (2500kbps
+    //                         cap removal); no effect path here today
+    // Disabled at two layers. Download-time bundle patches flip
+    // enabledByDefault:!0 to !1 (BundlePatcher.kt, the source of truth for
+    // both the settings default and recoverPlugins' force-enable pass
+    // below). This sweep is the second layer, migrating settings persisted
+    // by older builds; their materialized enabled:true would otherwise
+    // outlive the bundle change (Vencord persists its settings tree to
+    // localStorage under "VencordSettings", so old defaults are already on
+    // disk).
+    //
+    // The enabledByDefault neutralization runs every boot, before the flag
+    // early-return, so recoverPlugins can never resurrect the plugins even
+    // when the bundle patch missed (anchor rot). The sweep itself is
+    // one-shot via a dual flag: native prefs (survive WebView storage loss
+    // and the in-memory localStorage shim) plus a localStorage mirror
+    // (covers a silently rejected native write; bridge writes can be
+    // dropped by the per-key rate limiter or the 256 distinct-key cap, and
+    // rejections are silent). Skip if either flag is set. Bump the flag
+    // suffix when extending the plugin list.
+    var VDE_DEFAULT_OFF_PLUGINS = ["WebPWA", "WebScreenShare", "WebScreenShareFixes"];
+    var VDE_DEFAULT_OFF_FLAG = "vendroid_plugin_defaults_v1";
+
+    function applyPluginDefaultOff() {
+        try {
+            VDE_DEFAULT_OFF_PLUGINS.forEach(function(n) {
+                var p = Vencord.Plugins && Vencord.Plugins.plugins && Vencord.Plugins.plugins[n];
+                if (p && p.enabledByDefault) p.enabledByDefault = false;
+            });
+
+            var sweptNative = false, sweptLs = false;
+            try { sweptNative = VencordMobileNative.getBool(VDE_DEFAULT_OFF_FLAG, false); } catch(e) {}
+            try {
+                sweptLs = typeof window.localStorage === "object" && window.localStorage !== null &&
+                    window.localStorage.getItem(VDE_DEFAULT_OFF_FLAG) === "1";
+            } catch(e) {}
+            if (sweptNative || sweptLs) return;
+
+            VDE_DEFAULT_OFF_PLUGINS.forEach(function(n) {
+                // The read materializes plugins[n] from the (patched) bundle
+                // default; that materialized state is what we inspect and
+                // correct. Don't optimize the access away.
+                var s = Vencord.Settings && Vencord.Settings.plugins && Vencord.Settings.plugins[n];
+                if (s && s.enabled) {
+                    s.enabled = false;
+                    var p = Vencord.Plugins.plugins[n];
+                    if (p && p.started) {
+                        // Expected on the first migration boot: the bundle
+                        // starts WebpackReady-stage plugins as soon as
+                        // _initWebpack resolves, which can beat this sweep.
+                        // stopPlugin un-applies patches and restores
+                        // replaced globals (getDisplayMedia).
+                        try { Vencord.Plugins.stopPlugin(p); } catch(e) {}
+                    }
+                    console.warn("[Vendroid] Default-off sweep disabled plugin: " + n);
+                }
+            });
+
+            try {
+                VencordMobileNative.setBool(VDE_DEFAULT_OFF_FLAG, true);
+                var persisted = false;
+                try { persisted = VencordMobileNative.getBool(VDE_DEFAULT_OFF_FLAG, false); } catch(e) {}
+                if (!persisted) console.warn("[Vendroid] Default-off flag write rejected; localStorage mirror carries the flag");
+            } catch(e) {}
+            try { window.localStorage.setItem(VDE_DEFAULT_OFF_FLAG, "1"); } catch(e) {}
+        } catch(e) {
+            console.error("[Vendroid] applyPluginDefaultOff error: " + e.message);
+        }
+    }
+
     function recoverPlugins() {
+        applyPluginDefaultOff();
         try {
             const plugins = Vencord.Plugins.plugins;
             const total = Object.keys(plugins).length;

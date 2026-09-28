@@ -89,6 +89,22 @@
             </intent-filter>
         </activity-alias>
         <activity-alias
+            android:name=".BasicMainActivity"
+            android:exported="true"
+            android:roundIcon="@mipmap/ic_launcher_v_round"
+            android:label="@string/app_name"
+            android:icon="@mipmap/ic_launcher_v"
+            android:enabled="false"
+            android:targetActivity=".MainActivity">
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
             android:name=".JollyMainActivity"
             android:exported="true"
             android:roundIcon="@mipmap/ic_launcher_jolly_round"
@@ -142,6 +158,54 @@
             android:roundIcon="@mipmap/ic_launcher_ts12_round"
             android:label="@string/app_name"
             android:icon="@mipmap/ic_launcher_ts12"
+            android:enabled="false"
+            android:targetActivity=".MainActivity">
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".GlassMainActivity"
+            android:exported="true"
+            android:roundIcon="@mipmap/ic_launcher_glass_round"
+            android:label="@string/app_name"
+            android:icon="@mipmap/ic_launcher_glass"
+            android:enabled="false"
+            android:targetActivity=".MainActivity">
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".CharcoalMainActivity"
+            android:exported="true"
+            android:roundIcon="@mipmap/ic_launcher_charcoal_round"
+            android:label="@string/app_name"
+            android:icon="@mipmap/ic_launcher_charcoal"
+            android:enabled="false"
+            android:targetActivity=".MainActivity">
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".OLEDMainActivity"
+            android:exported="true"
+            android:roundIcon="@mipmap/ic_launcher_oled_round"
+            android:label="@string/app_name"
+            android:icon="@mipmap/ic_launcher_oled"
             android:enabled="false"
             android:targetActivity=".MainActivity">
             <meta-data
