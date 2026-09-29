@@ -18,6 +18,7 @@ import io.github.thunderfun.vendroid.BuildConfig
 import io.github.thunderfun.vendroid.MainActivity
 import io.github.thunderfun.vendroid.VendroidApp
 import io.github.thunderfun.vendroid.utils.Constants
+import io.github.thunderfun.vendroid.utils.DiscordBranch
 import io.github.thunderfun.vendroid.utils.FirewallConfig
 import io.github.thunderfun.vendroid.utils.JsPatches
 import io.github.thunderfun.vendroid.utils.VDELog
@@ -998,7 +999,12 @@ class VWebviewClient(
                     // path doesn't fall back to a stale startup-time copy.
                     // isAppOrigin restated: this writes process-lifetime
                     // state and must not rely on the enclosing gate.
-                    if (urlString == Constants.APP_SHELL_URL && isAppOrigin) {
+                    // The active branch's shell, same URL the cold start
+                    // anchors on. A hardcoded stable URL would leave PTB and
+                    // canary sessions refreshing the wrong preloaded entry.
+                    val activeShellUrl = mainActivity?.appShell?.appShellUrl
+                        ?: DiscordBranch.DEFAULT.appShellUrl
+                    if (urlString == activeShellUrl && isAppOrigin) {
                         val refreshed = MainFrameDiskCache.CachedMainFrame(
                             state.rawBody, state.reasonPhrase, headersToCache, System.currentTimeMillis()
                         )

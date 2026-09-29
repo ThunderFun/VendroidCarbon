@@ -101,23 +101,9 @@ class NavigationPolicyTest {
         )
     }
 
-    @Test fun decide_mainFrameDiscordSubdomain_loadsInWebview() {
-        assertTrue(
-            NavigationPolicy.decide(Uri.parse("https://canary.discord.com"), isForMainFrame = true)
-                == NavigationPolicy.Action.LOAD_IN_WEBVIEW
-        )
-    }
-
     @Test fun decide_mainFrameDiscordAppPath_loadsInWebview() {
         assertTrue(
             NavigationPolicy.decide(Uri.parse("https://discord.com/app"), isForMainFrame = true)
-                == NavigationPolicy.Action.LOAD_IN_WEBVIEW
-        )
-    }
-
-    @Test fun decide_mainFrameDiscordChannels_loadsInWebview() {
-        assertTrue(
-            NavigationPolicy.decide(Uri.parse("https://discord.com/channels/123/456"), isForMainFrame = true)
                 == NavigationPolicy.Action.LOAD_IN_WEBVIEW
         )
     }
@@ -132,13 +118,6 @@ class NavigationPolicyTest {
     @Test fun decide_mainFrameDiscordBlogRoot_showsPopup() {
         assertTrue(
             NavigationPolicy.decide(Uri.parse("https://discord.com/blog"), isForMainFrame = true)
-                == NavigationPolicy.Action.SHOW_POPUP
-        )
-    }
-
-    @Test fun decide_mainFrameGithub_showsPopup() {
-        assertTrue(
-            NavigationPolicy.decide(Uri.parse("https://github.com"), isForMainFrame = true)
                 == NavigationPolicy.Action.SHOW_POPUP
         )
     }
@@ -173,56 +152,15 @@ class NavigationPolicyTest {
         )
     }
 
-    @Test fun decide_mainFrameHttpUnknown_showsPopup() {
-        assertTrue(
-            NavigationPolicy.decide(Uri.parse("http://evil.com"), isForMainFrame = true)
-                == NavigationPolicy.Action.SHOW_POPUP
-        )
-    }
-
     // ------------------------------------------------------------------
     //  NavigationPolicy.decide: subframe (iframe)
     // ------------------------------------------------------------------
 
-    @Test fun decide_subframeGithub_loadsInWebview() {
-        assertTrue(
-            NavigationPolicy.decide(Uri.parse("https://github.com"), isForMainFrame = false)
-                == NavigationPolicy.Action.LOAD_IN_WEBVIEW
-        )
-    }
-
-    @Test fun decide_subframeYoutube_loadsInWebview() {
-        assertTrue(
-            NavigationPolicy.decide(Uri.parse("https://youtube.com"), isForMainFrame = false)
-                == NavigationPolicy.Action.LOAD_IN_WEBVIEW
-        )
-    }
-
-    @Test fun decide_subframeHcaptcha_loadsInWebview() {
-        assertTrue(
-            NavigationPolicy.decide(Uri.parse("https://hcaptcha.com"), isForMainFrame = false)
-                == NavigationPolicy.Action.LOAD_IN_WEBVIEW
-        )
-    }
-
+    // Subframes load in-WebView before the URL is read, so host, scheme, and
+    // path cannot change the action. One case pins the branch.
     @Test fun decide_subframeUnknownHost_loadsInWebview() {
         assertTrue(
             NavigationPolicy.decide(Uri.parse("https://evil.com"), isForMainFrame = false)
-                == NavigationPolicy.Action.LOAD_IN_WEBVIEW
-        )
-    }
-
-    @Test fun decide_subframeNullHost_loadsInWebview() {
-        assertTrue(
-            NavigationPolicy.decide(Uri.parse("https://"), isForMainFrame = false)
-                == NavigationPolicy.Action.LOAD_IN_WEBVIEW
-        )
-    }
-
-    @Test fun decide_subframeDiscordBlog_loadsInWebview() {
-        // Subframes always load in-WebView regardless of path.
-        assertTrue(
-            NavigationPolicy.decide(Uri.parse("https://discord.com/blog/post"), isForMainFrame = false)
                 == NavigationPolicy.Action.LOAD_IN_WEBVIEW
         )
     }

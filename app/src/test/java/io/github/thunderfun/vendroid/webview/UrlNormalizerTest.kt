@@ -304,18 +304,13 @@ class UrlNormalizerTest {
         assertFalse(n.displayString.endsWith("…"))
     }
 
-    @Test fun normalize_aboutSchemeNotMalformed() {
-        // about:blank is passed through shouldOverrideUrlLoading before
-        // normalize; but if it reaches here it should not be flagged malformed.
+    // about:blank normally bypasses normalize via shouldOverrideUrlLoading,
+    // but must not be flagged malformed if it arrives, and hostless schemes
+    // must not gain "//" or drop content.
+    @Test fun normalize_aboutBlank_passesThroughIntact() {
         val n = UrlNormalizer.normalize(Uri.parse("about:blank"))
         assertFalse(n.malformed)
         assertEquals("about", n.scheme)
-    }
-
-    // Regression: hostless schemes must not gain "//" or drop content.
-    @Test fun normalize_aboutBlankDisplayIsNotMalformed() {
-        val n = UrlNormalizer.normalize(Uri.parse("about:blank"))
-        assertFalse(n.malformed)
         assertEquals("about:blank", n.displayString)
     }
 

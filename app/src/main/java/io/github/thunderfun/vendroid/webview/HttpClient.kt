@@ -486,6 +486,17 @@ object HttpClient {
             "unknown"
         }
 
+    /** File name of the cached Vencord bundle inside the caller's filesDir. */
+    const val VENDROID_BUNDLE_FILE = "vencord.js"
+
+    /**
+     * The on-disk Vencord bundle under [dir]. Fetch, preload, the safety
+     * net, heals, and deletes all construct it here, so a rename cannot
+     * drift across callers.
+     */
+    @JvmStatic
+    fun vendroidFile(dir: File): File = File(dir, VENDROID_BUNDLE_FILE)
+
     /** Logs the on-disk bundle's identity once per process. */
     @Volatile
     private var bundleIdentityLogged = false
@@ -582,7 +593,7 @@ object HttpClient {
                 "Vencord location rejected: $problem (${UrlNormalizer.redactForLog(vencordLocation)})"
             )
         }
-        val vendroidFile = File(activity.filesDir, "vencord.js")
+        val vendroidFile = HttpClient.vendroidFile(activity.filesDir)
         // Reclaim temp debris from downloads killed mid-write; the common
         // case is a process restart during the clientMod switch prefetch.
         sweepStaleBundleTemps(vendroidFile, System.currentTimeMillis())
@@ -645,9 +656,9 @@ object HttpClient {
             }
             bundleCheckedThisSession = true
             // Must survive the early return: on a cold boot this can fire
-            // before any inject pass, after the preload won runSafetyNetLoad's
-            // CAS and the safety net returned without injecting, leaving
-            // missedInjection set. This call is then the only recovery trigger
+            // before any inject pass, after the preload won
+            // VencordRuntimeLoader's CAS and the safety net returned without
+            // injecting, leaving missedInjection set. This call is then the only recovery trigger
             // until the next navigation; it is idempotent.
             activity.runOnUiThread {
                 (activity as? MainActivity)?.injectVencordIfReady()

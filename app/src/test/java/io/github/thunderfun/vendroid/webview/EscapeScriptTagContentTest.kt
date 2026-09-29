@@ -66,15 +66,22 @@ class EscapeScriptTagContentTest {
     }
 
     @Test
-    fun `vendored eqjs snapshot embeds with no raw hazard tokens`() {
-        val snapshot = File("../eq.js")
-        if (!snapshot.exists()) return // snapshot not vendored in this checkout
-        val escaped = escapeScriptTagContent(snapshot.readText())
-        assertFalse("raw </script survived escaping", escaped.contains("</script", ignoreCase = true))
-        assertFalse("raw <!-- survived escaping", escaped.contains("<!--"))
-        // Upstream's own pre-escaped QuickCSS closers and the neutralized SVG
-        // comment openers must survive intact.
-        assertTrue("upstream <\\/script closers were corrupted", escaped.contains("<\\/script"))
-        assertTrue("comment openers were not neutralized", escaped.contains("<\\!--"))
+    fun `vendored snapshots embed with no raw hazard tokens`() {
+        // Real bundle content: an upstream bundle with a latent-comment trip
+        // shape must still come out inert.
+        for (name in listOf("vencord_snapshot.js", "equicord_snapshot.js")) {
+            val snapshot = File("../$name")
+            if (!snapshot.exists()) continue // snapshot not vendored in this checkout
+            val raw = snapshot.readText()
+            val escaped = escapeScriptTagContent(raw)
+            assertFalse("$name: raw </script survived escaping", escaped.contains("</script", ignoreCase = true))
+            assertFalse("$name: raw <!-- survived escaping", escaped.contains("<!--"))
+            // Upstream's own pre-escaped QuickCSS closers must survive intact.
+            assertTrue("$name: upstream <\\/script closers were corrupted", escaped.contains("<\\/script"))
+            if (raw.contains("<!--")) {
+                // The neutralized SVG comment openers must be present.
+                assertTrue("$name: comment openers were not neutralized", escaped.contains("<\\!--"))
+            }
+        }
     }
 }

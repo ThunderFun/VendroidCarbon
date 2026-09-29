@@ -15,14 +15,15 @@ import org.junit.Test
  *    mirror is pinned in BridgeSettingTypeContractTest.
  *  - checkVDEUpdates, clientMod: allowed. checkVDEUpdates is read by the
  *    updater tab; clientMod is value-validated in setString.
+ *  - discordBranch: allowed. Consumed natively at startup (DiscordBranch)
+ *    and value-validated in setString.
  *  - checkAnnouncements: allowed but currently unread. Kept for upstream,
  *    and type-guarded meanwhile.
  *  - vencordLocation: rejected. It selects the code the app downloads and
  *    executes, so page JS must never write it.
- *  - splashScreen, discordBranch, allowRemoteDebugging: blocked. Nothing
- *    native consumes them, so HttpClient prunes them from the tree at
- *    download time. The gate keeps blocking them so a re-addition cannot
- *    quietly become another dead toggle.
+ *  - splashScreen, allowRemoteDebugging: blocked. Nothing native consumes
+ *    them, so HttpClient prunes them from the tree at download time. The
+ *    gate keeps blocking them so a re-addition cannot become a dead toggle.
  *  - orbColor, splashBgColor: allowed. Splash-only colors written by their
  *    dedicated bridge methods (setOrbColor/setSplashBgColor) and
  *    value-validated on the setString route; read only at startup.
@@ -34,7 +35,7 @@ class BridgeKeyAllowlistTest {
 
     @Test
     fun `natively consumed app settings are allowed`() {
-        for (key in setOf("desktopMode", "checkVDEUpdates", "checkAnnouncements", "clientMod"))
+        for (key in setOf("desktopMode", "checkVDEUpdates", "checkAnnouncements", "clientMod", "discordBranch"))
             assertTrue("bridge must allow $key", VencordNative.isBridgeKeyAllowed(key))
     }
 
@@ -53,7 +54,7 @@ class BridgeKeyAllowlistTest {
 
     @Test
     fun `pruned dead keys stay blocked`() {
-        for (key in setOf("splashScreen", "discordBranch", "allowRemoteDebugging"))
+        for (key in setOf("splashScreen", "allowRemoteDebugging"))
             assertFalse("bridge must keep blocking $key", VencordNative.isBridgeKeyAllowed(key))
     }
 

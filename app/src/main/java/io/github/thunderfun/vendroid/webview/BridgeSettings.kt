@@ -37,6 +37,9 @@ internal object BridgeSettings {
     // here only to pin the contract if that gate changes.
     internal val STRING_SETTING_KEYS = setOf(
         SettingKeys.KEY_CLIENT_MOD,
+        // Discord branch token, read natively at cold start to build the app
+        // shell URL. Value-validated in VencordNative.setString.
+        SettingKeys.KEY_DISCORD_BRANCH,
         SettingKeys.KEY_VENCORD_LOCATION,
         // Custom bar tint, written by the setBarColor bridge method. Pinned
         // here because setBool is prefix-admitted: without this entry page JS
@@ -65,7 +68,8 @@ internal object BridgeSettings {
         SettingKeys.KEY_VENDROID_CONFIRM_EXTERNAL_LINKS,
         SettingKeys.KEY_VENDROID_BLOCK_TYPING_INDICATOR,
         SettingKeys.KEY_VENDROID_GESTURES,
-        SettingKeys.KEY_VENDROID_SUPPORT_WARNINGS
+        SettingKeys.KEY_VENDROID_SUPPORT_WARNINGS,
+        SettingKeys.KEY_DESKTOP_MODE
     )
 
     // Single type-contract gate for both bridge write paths: returns
@@ -82,6 +86,10 @@ internal object BridgeSettings {
     private val EXTRA_ALLOWED_KEYS = setOf(
         SettingKeys.KEY_CHECK_VDE_UPDATES,
         SettingKeys.KEY_CHECK_ANNOUNCEMENTS,
+        // Discord branch switcher from the Vendroid settings tree, consumed
+        // by the native startup path. Unprefixed; without this entry both
+        // its reads and writes would be dropped.
+        SettingKeys.KEY_DISCORD_BRANCH,
         // Desktop mode toggle from the eq.js settings tree, consumed by
         // installWebView at startup. Unprefixed; without this entry both
         // its reads and writes were dropped, so the toggle never applied.

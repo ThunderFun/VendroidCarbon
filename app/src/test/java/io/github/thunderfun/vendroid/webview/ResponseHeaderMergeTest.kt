@@ -70,14 +70,6 @@ class ResponseHeaderMergeTest {
         assertEquals("Accept-Encoding, Origin", headers["vary"])
     }
 
-    @Test fun duplicateListHeader_keepsWireOrder() {
-        val (headers, _) = merge(
-            "link" to "<a>; rel=preload",
-            "link" to "<b>; rel=preload"
-        )
-        assertEquals("<a>; rel=preload, <b>; rel=preload", headers["link"])
-    }
-
     @Test fun duplicateSingleton_lastWins() {
         val (headers, _) = merge(
             "report-to" to """{"group":"a"}""",
@@ -95,29 +87,21 @@ class ResponseHeaderMergeTest {
     }
 
     @Test fun mixedCaseNames_foldedIntoLowercaseSingleEntry() {
-        val (headers, _) = merge(
+        val (singleton, _) = merge(
             "Content-Type" to "text/html; charset=utf-8",
             "content-type" to "application/json"
         )
-        // One entry, not two lines Chromium would have to disambiguate.
-        assertEquals(1, headers.size)
-        assertEquals("application/json", headers["content-type"])
-    }
+        // One entry, not two lines Chromium would have to disambiguate; the
+        // replacement also stays under the lowercase key.
+        assertEquals(1, singleton.size)
+        assertEquals("application/json", singleton["content-type"])
 
-    @Test fun mixedCaseListHeader_joinedAcrossCasing() {
-        val (headers, _) = merge(
+        // List headers fold across casing too, comma-joined in wire order.
+        val (list, _) = merge(
             "Vary" to "Accept-Encoding",
             "vary" to "Origin"
         )
-        assertEquals("Accept-Encoding, Origin", headers["vary"])
-    }
-
-    @Test fun singletonReplacedInPlace_keepsLowercaseKey() {
-        val headers = HashMap<String, String>()
-        ResponseHeaderMerge.merge(headers, ArrayList(), "content-type", "text/plain")
-        ResponseHeaderMerge.merge(headers, ArrayList(), "Content-Type", "text/html")
-        assertEquals("text/html", headers["content-type"])
-        assertEquals(1, headers.size)
+        assertEquals("Accept-Encoding, Origin", list["vary"])
     }
 
     @Test fun uniqueHeaders_passThroughLowercased() {
@@ -143,14 +127,11 @@ class ResponseHeaderMergeTest {
         assertNull(ResponseHeaderMerge.valueFor(mapOf("a" to "b"), "c"))
     }
 
-    @Test fun bareMediaType_stripsParameters() {
-        assertEquals("text/html", ResponseHeaderMerge.bareMediaType("text/html; charset=utf-8"))
-        assertEquals("application/json", ResponseHeaderMerge.bareMediaType("application/json; charset=utf-8"))
-    }
-
     @Test fun bareMediaType_bareValuePassesThrough() {
         assertEquals("text/html", ResponseHeaderMerge.bareMediaType("text/html"))
         assertEquals("application/json", ResponseHeaderMerge.bareMediaType("application/json"))
+        assertEquals("text/html", ResponseHeaderMerge.bareMediaType("text/html; charset=utf-8"))
+        assertEquals("application/json", ResponseHeaderMerge.bareMediaType("application/json; charset=utf-8"))
     }
 
     @Test fun bareMediaType_trimsWhitespace() {

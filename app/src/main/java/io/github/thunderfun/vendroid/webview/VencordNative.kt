@@ -19,6 +19,7 @@ import io.github.thunderfun.vendroid.MainActivity
 import io.github.thunderfun.vendroid.R
 import io.github.thunderfun.vendroid.RecoveryActivity
 import io.github.thunderfun.vendroid.utils.Constants
+import io.github.thunderfun.vendroid.utils.DiscordBranch
 import io.github.thunderfun.vendroid.utils.FirewallConfig
 import io.github.thunderfun.vendroid.utils.ShareHelper
 import io.github.thunderfun.vendroid.utils.SettingKeys
@@ -26,7 +27,6 @@ import io.github.thunderfun.vendroid.utils.VDELog
 import io.github.thunderfun.vendroid.utils.getStringSafe
 import io.github.thunderfun.vendroid.utils.vdeGson
 import java.io.ByteArrayInputStream
-import java.io.File
 import java.lang.ref.WeakReference
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
@@ -733,6 +733,39 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 // write.
                 return@guardedPrefs
             }
+            if (safeId == SettingKeys.KEY_DISCORD_BRANCH) {
+                // Only the three known branch tokens are valid. The startup
+                // reader normalizes unknown values, but the write path must
+                // not. This value selects the origin that receives the
+                // capability token and the injected runtimes, so a typo
+                // fails the write instead of silently persisting the
+                // default.
+                if (DiscordBranch.ofPrefValue(safeValue) == null) {
+                    VDELog.w("VN", "Rejected invalid discordBranch value: $safeValue")
+                    return@guardedPrefs
+                }
+                // A same-value write must stay a true no-op, matching
+                // clientMod. An absent key counts as the default; a poisoned
+                // key counts as changed, so the cleanup below still runs.
+                val previous = try {
+                    prefs.getString(safeId, null) ?: DiscordBranch.DEFAULT.prefValue
+                } catch (_: ClassCastException) {
+                    null
+                }
+                if (previous == safeValue) return@guardedPrefs
+                // The saved route belongs to the old branch. Drop it in the
+                // same batch as the switch so no reader can observe the new
+                // branch with the old route. The resume gates also check the
+                // host; this upholds the same invariant in the persisted
+                // state.
+                prefs.edit {
+                    putString(safeId, safeValue)
+                    remove(SettingKeys.KEY_LAST_URL)
+                }
+                // The batch above already wrote the key; skip the shared tail
+                // write.
+                return@guardedPrefs
+            }
             if (safeId == SettingKeys.KEY_CLIENT_MOD) {
                 // Only the two known mods are valid; reject anything else.
                 if (safeValue != "vencord" && safeValue != "equicord") {
@@ -765,7 +798,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     clearBundleIdentityKeys()
                     putString(safeId, safeValue)
                 }
-                activity.get()?.filesDir?.let { File(it, "vencord.js").delete() }
+                activity.get()?.filesDir?.let { HttpClient.vendroidFile(it).delete() }
                 HttpClient.setVencordRuntime(null)
                 // The batch above already wrote the key; skip the shared
                 // tail write.
@@ -920,8 +953,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun getDefaultBarColor(token: String?): String {
         // No domain gate, like getAppIcons: the payload is this app's own
         // theme color, which leaks nothing.
-        if (!isBridgeAuthorized(token)) return "#121214"
-        val act = activity.get() ?: return "#121214"
+        // No Context on these paths to resolve the resource; the constant
+        // mirrors @color/status_bar_color.
+        if (!isBridgeAuthorized(token)) return Constants.DEFAULT_BAR_COLOR_HEX
+        val act = activity.get() ?: return Constants.DEFAULT_BAR_COLOR_HEX
         // Theme-resolved (values-night + future attr re-pointing correct);
         // "#%06x" masks alpha and normalizes to lowercase.
         return String.format(

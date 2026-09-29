@@ -47,7 +47,18 @@ internal object SettingKeys {
     /** Which client mod runtime to load ("vencord" / "equicord"); also bridged as a string. */
     const val KEY_CLIENT_MOD = "clientMod"
 
-    /** Desktop UA switch, read natively at startup and writable via the bridge. */
+    /**
+     * Which Discord web-app origin the client opens ("stable" / "ptb" /
+     * "canary"). Bridged as a string, validated against [DiscordBranch], and
+     * applied only at the next cold start. The key name matches the old plugin
+     * tree's setting, so a value written before this feature existed keeps
+     * working.
+     */
+    const val KEY_DISCORD_BRANCH = "discordBranch"
+
+    /** Desktop UA switch, read natively at startup and writable via the
+     *  bridge. The UA's Chrome version mirrors the installed WebView engine
+     *  (MainActivity.desktopUserAgentFrom). */
     const val KEY_DESKTOP_MODE = "desktopMode"
 
     /** Saved channel URL for the remember-last-channel feature. */

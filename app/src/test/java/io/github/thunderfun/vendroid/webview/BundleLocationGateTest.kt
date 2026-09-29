@@ -43,12 +43,8 @@ class BundleLocationGateTest {
     // --- bundleLocationFetchProblem: accepted locations ---
 
     @Test
-    fun officialVencordUrl_passes() {
+    fun officialUrls_pass() {
         assertNull(HttpClient.bundleLocationFetchProblem(Constants.JS_BUNDLE_URL))
-    }
-
-    @Test
-    fun officialEquicordUrl_passes() {
         assertNull(HttpClient.bundleLocationFetchProblem(Constants.EQUICORD_BUNDLE_URL))
     }
 
@@ -156,15 +152,17 @@ class BundleLocationGateTest {
     }
 
     @Test
-    fun emptyVencordLocation_fallsBackToDefault() {
-        sPrefs.edit().putString("vencordLocation", "").commit()
-        assertEquals(Constants.JS_BUNDLE_URL, HttpClient.resolveBundleLocation(sPrefs))
-    }
-
-    @Test
-    fun whitespaceVencordLocation_fallsBackToDefault() {
-        sPrefs.edit().putString("vencordLocation", "   ").commit()
-        assertEquals(Constants.JS_BUNDLE_URL, HttpClient.resolveBundleLocation(sPrefs))
+    fun blankVencordLocation_fallsBackToDefault() {
+        // Empty and whitespace resolve through the same takeIf; the message
+        // names the failing case.
+        for (blank in listOf("", "   ")) {
+            sPrefs.edit().putString("vencordLocation", blank).commit()
+            assertEquals(
+                "blank value '$blank' must fall back to the official default",
+                Constants.JS_BUNDLE_URL,
+                HttpClient.resolveBundleLocation(sPrefs)
+            )
+        }
     }
 
     @Test

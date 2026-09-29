@@ -27,11 +27,7 @@ object Constants {
     const val EQUICORD_CSS_URL =
         "https://github.com/Equicord/Equicord/releases/latest/download/browser.css"
 
-    /** The Discord web-app shell: what MainActivity loads when no deep link or
-     *  resumable session applies, and the anchor host the bridge fields are
-     *  set to while it loads. */
-    const val APP_SHELL_URL = "https://discord.com/app"
-    const val APP_SHELL_HOST = "discord.com"
+    // The app shell URL and host come from [DiscordBranch].
 
     // The bundle is arbitrary code executed in the Discord origin; it may
     // only be fetched from GitHub's release infrastructure. Both hosts are
@@ -186,4 +182,17 @@ object Constants {
         navigationDomainCache.clear()
         JsPatches.invalidateCache()
     }
+
+    // --- UI ---
+
+    /**
+     * Theme-default bar color as a lowercase six-digit hex string. Must match
+     * the "#%06x" format VencordNative.getDefaultBarColor emits and the
+     * @color/status_bar_color resource (values/ and values-night/), which is
+     * the source of truth; this constant is the fallback for bridge paths
+     * with no Context to resolve it. JS consumers pass the value on
+     * verbatim, so casing and width must be preserved. Edit together with
+     * the resource when rebranding.
+     */
+    const val DEFAULT_BAR_COLOR_HEX = "#121214"
 }

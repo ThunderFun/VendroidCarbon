@@ -13,13 +13,13 @@
         android:id="@+id/webview"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="#121214" />
+        android:background="@color/status_bar_color" />
 
     <FrameLayout
         android:id="@+id/loading_screen"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="#121214">
+        android:background="@color/status_bar_color">
 
         <!-- Glow backdrop blobs: radial gradients hardware-layered by
              LoadingScreenManager. The root MUST stay a FrameLayout; the

@@ -703,9 +703,54 @@
     // backgrounded.
     var _vendroidSettingsPoll = null;
 
+    // The desktopMode value the running WebView was built with, captured
+    // once per session. The UA is fixed at WebView install, so a persisted
+    // value that differs from this one means a restart is pending.
+    // Re-reading at injection time would pick up a post-toggle value after
+    // a settings-tab remount and hide that pending restart. undefined means
+    // not captured yet; false is a valid captured value.
+    var _vdeDesktopModeAtBoot;
+    function captureDesktopModeAtBootIfNeeded() {
+        if (typeof _vdeDesktopModeAtBoot !== 'undefined') return;
+        // The bridge and its token wrapper are installed before this script
+        // runs. If either is missing, retry on the next poller tick.
+        if (typeof VencordMobileNative === 'undefined') return;
+        try {
+            _vdeDesktopModeAtBoot = !!VencordMobileNative.getBool('desktopMode', false);
+        } catch(e) {
+            console.error('[Vendroid] desktopMode boot capture failed: ' + e.message);
+        }
+    }
+
+    // The discordBranch value the running session opened with, captured once
+    // per session. The branch is fixed at WebView install, so a persisted
+    // value that differs means a restart is pending. Same capture contract
+    // as _vdeDesktopModeAtBoot: undefined means not captured yet, retry per
+    // poller tick.
+    var _vdeDiscordBranchAtBoot;
+    // Anything but the two non-default tokens reads as stable, matching the
+    // native DiscordBranch.fromPrefValue fallback.
+    function normalizeDiscordBranch(value) {
+        return (value === 'ptb' || value === 'canary') ? value : 'stable';
+    }
+    function captureDiscordBranchAtBootIfNeeded() {
+        if (typeof _vdeDiscordBranchAtBoot !== 'undefined') return;
+        // The bridge and its token wrapper are installed before this script
+        // runs. If either is missing, retry on the next poller tick.
+        if (typeof VencordMobileNative === 'undefined') return;
+        try {
+            _vdeDiscordBranchAtBoot = normalizeDiscordBranch(
+                VencordMobileNative.getString('discordBranch', 'stable'));
+        } catch(e) {
+            console.error('[Vendroid] discordBranch boot capture failed: ' + e.message);
+        }
+    }
+
     function setupSettingsRows() {
         if (_vendroidSettingsPoll) return;
         try {
+            captureDesktopModeAtBootIfNeeded();
+            captureDiscordBranchAtBootIfNeeded();
             _vendroidSettingsPoll = setInterval(injectSettingsRowsIfMissing, 750);
             injectSettingsRowsIfMissing(); // immediate try in case tab is open
         } catch(e) {

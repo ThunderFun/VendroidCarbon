@@ -9,7 +9,6 @@ import io.github.thunderfun.vendroid.webview.HttpClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -21,15 +20,13 @@ import org.robolectric.annotation.Config
 import java.lang.ref.WeakReference
 
 /**
- * Pins the contract of MainActivity's Vencord runtime safety net
- * ([MainActivity.runSafetyNetLoad]):
+ * Pins the wrapper-specific contract of MainActivity's Vencord runtime
+ * safety net ([MainActivity.runSafetyNetLoad]). The loader owns publish and
+ * kill-switch behavior, pinned in [VencordRuntimeLoaderTest]:
  *
- *  1. Publishes a missing runtime; never clobbers one published by the
- *     preload thread or a test stub.
- *  2. Does nothing once the safe-mode kill switch is raised.
- *  3. Publishes after activity destroy (process-wide state) without touching
+ *  1. Publishes after activity destroy (process-wide state) without touching
  *     the destroyed WebView.
- *  4. A late publish retries injection, healing a page that loaded before the
+ *  2. A late publish retries injection, healing a page that loaded before the
  *     runtimes were ready via the missedInjection reload.
  *
  * Tests call [MainActivity.runSafetyNetLoad] directly; it is companion-scoped
@@ -85,55 +82,6 @@ class MainActivityVencordRuntimeLoadTest {
         // injectVencordIfReady only injects on Discord app origins.
         activity.currentUrlForBridge = "https://discord.com/app"
         activity.currentHostForBridge = "discord.com"
-    }
-
-    @Test
-    fun missingMobileRuntime_isPublished() {
-        buildActivity()
-        HttpClient.setVencordMobileRuntime(null)
-        val expected = ApplicationProvider.getApplicationContext<Context>()
-            .resources.openRawResource(R.raw.vencord_mobile).use {
-                HttpClient.readAsText(it)
-            }
-
-        MainActivity.runSafetyNetLoad(
-            sPrefs, activity.resources, activity.filesDir, WeakReference(activity)
-        )
-
-        assertEquals(expected, HttpClient.VencordMobileRuntime)
-        // The bundle branch is inert in tests: needsBundleRedownload() is
-        // always true under testDebugUnitTest (BuildConfig.DEBUG), so the
-        // on-disk file is never read and the stub survives.
-        assertEquals("1;", HttpClient.VencordRuntime)
-    }
-
-    @Test
-    fun existingMobileRuntime_isNeverClobbered() {
-        buildActivity()
-        // Preload thread won the race / a test stub is installed: the task
-        // must leave an already-published runtime untouched.
-        HttpClient.setVencordMobileRuntime("2;")
-
-        MainActivity.runSafetyNetLoad(
-            sPrefs, activity.resources, activity.filesDir, WeakReference(activity)
-        )
-
-        assertEquals("2;", HttpClient.VencordMobileRuntime)
-    }
-
-    @Test
-    fun safeModeRaised_nothingIsReadOrPublished() {
-        buildActivity()
-        HttpClient.vencordDisabled = true
-        HttpClient.setVencordRuntime(null)
-        HttpClient.setVencordMobileRuntime(null)
-
-        MainActivity.runSafetyNetLoad(
-            sPrefs, activity.resources, activity.filesDir, WeakReference(activity)
-        )
-
-        assertNull(HttpClient.VencordMobileRuntime)
-        assertNull(HttpClient.VencordRuntime)
     }
 
     @Test

@@ -17,9 +17,9 @@ package io.github.thunderfun.vendroid.ui
  *
  * Every entry point returns null for a null source; callers skip the
  * corresponding mutation and the XML drawables keep the stock look. That
- * is the right default, since the theme default bar color is #121214 in
- * values/ and values-night/ alike: "no tint" and "theme default" are the
- * same visual case.
+ * is the right default, since the theme default bar color is
+ * @color/status_bar_color (identical in values/ and values-night/):
+ * "no tint" and "theme default" are the same visual case.
  *
  * All math is hand-rolled (RGB↔HSV, sRGB relative luminance) so this stays
  * testable on the plain JVM: android.graphics.Color's conversions are native

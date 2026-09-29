@@ -28,10 +28,10 @@ import java.io.File
 class HttpClientBundlePatchTest {
 
     private fun snapshot(name: String): File {
-        val f = File("../$name")
-        // Snapshots may not be vendored in every checkout; skip rather than
-        // fail the suite (the mechanics tests below still run).
-        return f
+        // Callers check exists() and skip when a snapshot is not vendored in
+        // this checkout. The path resolves from the app module's test working
+        // directory.
+        return File("../$name")
     }
 
     // --- mechanics ---

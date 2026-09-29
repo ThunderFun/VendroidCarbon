@@ -62,6 +62,8 @@
     <color name="md_theme_dark_surfaceTint">#BEC2FF</color>
     <color name="md_theme_dark_outlineVariant">#46464F</color>
     <color name="md_theme_dark_scrim">#000000</color>
+    <!-- Must match Constants.DEFAULT_BAR_COLOR_HEX (utils/Constants.kt), the
+         no-Context fallback VencordNative's JS bridge returns; edit together. -->
     <color name="status_bar_color">#121214</color>
     <color name="text">#000000</color>
 </resources>

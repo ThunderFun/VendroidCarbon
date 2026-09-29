@@ -4,8 +4,6 @@ import io.github.thunderfun.vendroid.utils.Constants
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -21,9 +19,9 @@ import org.robolectric.annotation.Config
  * every redirect hop must clear the same gate (the shared client never
  * auto-follows redirects, so a single missed hop fails the whole fetch).
  *
- * Also pins the retired operator hosts staying rejected: a persisted
- * vencordLocation pointing at vde-builds.nin0.dev must keep failing the
- * gate so the boot-time heal removes it.
+ * Also pins the retired operator host rejection: a persisted vencordLocation
+ * pointing at vde-builds.nin0.dev keeps failing the host gate, so the
+ * boot-time heal removes it (see VencordLocationHealTest).
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -56,25 +54,6 @@ class VencordHostAllowlistTest {
         assertFalse(Constants.isAllowedVencordHost("release-assets.githubusercontent.com.evil.io"))
         assertFalse(Constants.isAllowedVencordHost("notgithub.com"))
         assertFalse(Constants.isAllowedVencordHost("raw.githubusercontent.com"))
-    }
-
-    // --- official URLs clear the fetch gate ---
-
-    @Test
-    fun officialBundleUrls_passTheFetchGate() {
-        assertNull(HttpClient.bundleLocationFetchProblem(Constants.JS_BUNDLE_URL))
-        assertNull(HttpClient.bundleLocationFetchProblem(Constants.EQUICORD_BUNDLE_URL))
-    }
-
-    @Test
-    fun retiredHostUrls_failTheFetchGate() {
-        // A legacy persisted vencordLocation must keep failing so
-        // VendroidApp.healUnusableVencordLocation removes it on upgrade.
-        val problem = HttpClient.bundleLocationFetchProblem(
-            "https://vde-builds.nin0.dev/vencord/browser.js"
-        )
-        assertNotNull(problem)
-        assertTrue(problem!!.contains("not in the allowed list"))
     }
 
     // --- redirect hop re-validation (executeVencordGetResolvingRedirect) ---

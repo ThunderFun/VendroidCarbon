@@ -156,6 +156,9 @@ class MainActivityWebViewLifecycleTest {
     @Test
     fun probeCallbackAfterDestroy_nullResult_doesNotReloadOrCrash() {
         activity.injectVencordIfReady()
+        // Same missed-injection state as the stale-result test: without the
+        // liveness guard, null falls through to reload() on the dead WebView.
+        activity.missedInjection = true
         val callback = probeCallback
         controller.destroy()
 

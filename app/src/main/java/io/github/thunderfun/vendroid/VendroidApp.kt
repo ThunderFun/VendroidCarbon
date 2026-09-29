@@ -4,14 +4,16 @@ import android.app.ActivityManager
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
-import android.graphics.Color
 import android.os.Build
 import android.os.Process
 import android.webkit.CookieManager
 import android.webkit.WebView
+import androidx.core.content.ContextCompat
+import io.github.thunderfun.vendroid.R
 import io.github.thunderfun.vendroid.webview.HttpClient
 import io.github.thunderfun.vendroid.webview.MainFrameDiskCache
 import io.github.thunderfun.vendroid.webview.VWebviewClient
+import io.github.thunderfun.vendroid.webview.VencordRuntimeLoader
 import io.github.thunderfun.vendroid.webview.clearBundleIdentityKeys
 import io.github.thunderfun.vendroid.utils.Constants
 import io.github.thunderfun.vendroid.utils.FirewallConfig
@@ -20,6 +22,10 @@ import io.github.thunderfun.vendroid.utils.VDELog
 import io.github.thunderfun.vendroid.utils.getBooleanSafe
 import io.github.thunderfun.vendroid.utils.getStringSafe
 import java.io.File
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 class VendroidApp : Application() {
     override fun onCreate() {
@@ -47,7 +53,7 @@ class VendroidApp : Application() {
         // reader, so no preload or fetch observes the stale value.
         healUnusableVencordLocation(
             bootPrefs,
-            File(filesDir, "vencord.js")
+            HttpClient.vendroidFile(filesDir)
         )
 
         // 3. Log app + WebView versions for incident reports.
@@ -89,6 +95,39 @@ class VendroidApp : Application() {
 
             // 12. Preload the persisted main-frame shell off the UI thread.
             preloadMainFrameDiskCache()
+        }
+    }
+
+    /**
+     * App-scope executor for the :web cold-start steps in onCreate. The cap
+     * of 4 bounds parallel cold-start IO while still letting the queued
+     * cookie-DB and disk-cache warmups start during boot. Idle core threads
+     * exit after 30s, so the pool holds no threads outside startup. The
+     * :main process never submits, so it never spawns pool threads.
+     *
+     * core must equal max here. With core=0 and an unbounded queue the pool
+     * never grows past one worker, serializing every task.
+     */
+    private val startupExecutor = ThreadPoolExecutor(
+        4, 4, 30L, TimeUnit.SECONDS,
+        LinkedBlockingQueue(),
+        ThreadFactory { r -> Thread(r, "vde-startup") }
+    ).apply { allowCoreThreadTimeOut(true) }
+
+    /**
+     * Runs [body] on [startupExecutor] and renames the worker for the task's
+     * duration, so thread dumps and ANR traces name the task actually
+     * running. The finally reset accounts for pool-thread reuse. Tasks keep
+     * their own try/catch; this wrapper swallows nothing.
+     */
+    private fun launchStartupTask(task: String, body: () -> Unit) {
+        startupExecutor.execute {
+            Thread.currentThread().name = "vde-startup-$task"
+            try {
+                body()
+            } finally {
+                Thread.currentThread().name = "vde-startup"
+            }
         }
     }
 
@@ -172,7 +211,13 @@ class VendroidApp : Application() {
         if (riskAccepted) {
             try {
                 prewarmedWebView = WebView(this).apply {
-                    setBackgroundColor(Color.parseColor("#121214"))
+                    // Resource read, not a literal, so a rebrand edits
+                    // resources, not code. The color is transient:
+                    // MainActivity re-tints on install, before the WebView
+                    // first draws.
+                    setBackgroundColor(
+                        ContextCompat.getColor(this@VendroidApp, R.color.status_bar_color)
+                    )
                 }
             } catch (e: Exception) {
                 VDELog.e("VDE", "Failed to create prewarmed WebView", e)
@@ -187,10 +232,10 @@ class VendroidApp : Application() {
      * file stays small (faster cold-start parse).
      */
     private fun startCssCacheMigration() {
-        Thread {
+        launchStartupTask("css-migration") {
             try {
                 val settingsPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
-                if (settingsPrefs.getBoolean(SettingKeys.KEY_CSS_CACHE_MIGRATED, false)) return@Thread
+                if (settingsPrefs.getBoolean(SettingKeys.KEY_CSS_CACHE_MIGRATED, false)) return@launchStartupTask
                 val cssPrefs = getSharedPreferences(SettingKeys.CSS_CACHE_PREFS_NAME, Context.MODE_PRIVATE)
                 val editor = cssPrefs.edit()
                 val settingsEditor = settingsPrefs.edit()
@@ -213,7 +258,7 @@ class VendroidApp : Application() {
             } catch (ex: Exception) {
                 VDELog.e("VDE", "CSS cache migration failed", ex)
             }
-        }.start()
+        }
     }
 
     /**
@@ -273,57 +318,35 @@ class VendroidApp : Application() {
 
     /**
      * Pre-load the Vencord runtimes on a background thread so they are
-     * in memory by the time MainActivity.onCreate() runs.
+     * in memory by the time MainActivity.onCreate() runs. The load-and-publish
+     * sequence lives in [VencordRuntimeLoader]; this wrapper supplies
+     * threading, logging, and Application-scope resources/filesDir, which
+     * stay valid for the process lifetime.
      */
     private fun preloadVencordRuntimes() {
-        Thread {
-            // Publish-site guard; see HttpClient.vencordDisabled.
-            if (HttpClient.vencordDisabled) return@Thread
+        launchStartupTask("runtime-preload") {
+            val sPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
             try {
-                // 1. VencordMobile runtime (65 KB raw resource, memory-mapped)
-                if (HttpClient.VencordMobileRuntime == null) {
-                    resources.openRawResource(R.raw.vencord_mobile).use { inputStream ->
-                        HttpClient.setVencordMobileRuntimeIfNull(HttpClient.readAsText(inputStream))
-                    }
+                val outcome = VencordRuntimeLoader.loadIfMissing(sPrefs, resources, filesDir)
+                if (outcome.mobilePublished) {
+                    VDELog.i("VDE", "VencordMobile runtime preloaded")
                 }
-                VDELog.i("VDE", "VencordMobile runtime preloaded")
-                // 2. Vencord runtime (potentially ~1 MB from disk)
-                val vendroidFile = File(filesDir, "vencord.js")
-                val sPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
-                // Skip the preload while a redownload is pending so the
-                // stale bundle is never published. The file is kept on disk
-                // as fetchVencord's offline fallback; deleting it here would
-                // brick Vencord on an offline launch.
-                val needsRedownload = HttpClient.needsBundleRedownload(sPrefs)
-                if (!needsRedownload && vendroidFile.exists() && HttpClient.VencordRuntime == null) {
-                    try {
-                        // The file was written with applyPatches already
-                        // applied during a previous download. Skip the
-                        // redundant ~1MB regex scan by trusting the
-                        // persisted patched flag + patch-set key.
-                        //
-                        // stillValid re-checks the guards at publish time;
-                        // the read can stall for seconds on slow storage
-                        // while a clientMod switch deletes the file and
-                        // forces a redownload.
-                        val published = HttpClient.setVencordRuntimeIfNull(
-                            HttpClient.readBundleFromDisk(sPrefs, vendroidFile)
-                        ) {
-                            !HttpClient.needsBundleRedownload(sPrefs) && vendroidFile.exists()
-                        }
-                        if (published) {
-                            VDELog.i("VDE", "Vencord runtime preloaded (${vendroidFile.length()} bytes)")
-                        } else {
-                            VDELog.i("VDE", "Vencord runtime preload skipped (published or invalidated elsewhere)")
-                        }
-                    } catch (ex: Exception) {
-                        VDELog.e("VDE", "Failed to apply Vencord patches: ${ex.message}", ex)
-                    }
+                if (outcome.bundlePublished) {
+                    VDELog.i(
+                        "VDE",
+                        "Vencord runtime preloaded (${HttpClient.vendroidFile(filesDir).length()} bytes)"
+                    )
+                }
+                if (!outcome.publishedSomething) {
+                    VDELog.i(
+                        "VDE",
+                        "Vencord runtime preload published nothing (safe mode or runtimes already present)"
+                    )
                 }
             } catch (ex: Exception) {
                 VDELog.e("VDE", "Vencord preload failed: ${ex.message}", ex)
             }
-        }.start()
+        }
     }
 
     /**
@@ -332,13 +355,13 @@ class VendroidApp : Application() {
      * dedicated css_cache prefs lets JS skip the network fetch without
      * churning the main settings XML. Gated on first-run consent so no
      * network activity phones home before the user accepts the risk
-     * warning. (Other startup threads are local-only: runtime preload,
+     * warning. (Other startup tasks are local-only: runtime preload,
      * cookie-DB warmup, and disk-cache preload touch no network.)
      * Safe mode skips this too: only vencord_mobile.js applies the
      * CSS, and it never loads, so the prefetch buys nothing.
      */
     private fun prefetchVencordCss() {
-        Thread {
+        launchStartupTask("css-prefetch") {
             try {
                 val sPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
                 val cssPrefs = getSharedPreferences(SettingKeys.CSS_CACHE_PREFS_NAME, Context.MODE_PRIVATE)
@@ -356,9 +379,9 @@ class VendroidApp : Application() {
                 }
                 editor.apply()
             } catch (ex: Exception) {
-                VDELog.e("VDE", "CSS prefetch thread failed", ex)
+                VDELog.e("VDE", "CSS prefetch task failed", ex)
             }
-        }.start()
+        }
     }
 
     /**
@@ -436,7 +459,7 @@ class VendroidApp : Application() {
      * local-only prefs work, no network.
      */
     private fun sweepStaleCssCacheEntries(bootPrefs: SharedPreferences) {
-        Thread {
+        launchStartupTask("css-sweep") {
             try {
                 val cssPrefs = getSharedPreferences(SettingKeys.CSS_CACHE_PREFS_NAME, Context.MODE_PRIVATE)
                 val isEquicord = bootPrefs.getStringSafe(SettingKeys.KEY_CLIENT_MOD, "vencord") == "equicord"
@@ -459,7 +482,7 @@ class VendroidApp : Application() {
             } catch (ex: Exception) {
                 VDELog.e("VDE", "CSS cache sweep failed", ex)
             }
-        }.start()
+        }
     }
 
     /**
@@ -467,13 +490,13 @@ class VendroidApp : Application() {
      * the cost on its first CookieManager.getInstance() call.
      */
     private fun warmUpCookieManager() {
-        Thread {
+        launchStartupTask("cookie-warmup") {
             try {
                 CookieManager.getInstance()
             } catch (ex: Exception) {
                 VDELog.e("VDE", "CookieManager warmup failed", ex)
             }
-        }.start()
+        }
     }
 
     /**
@@ -481,7 +504,7 @@ class VendroidApp : Application() {
      * the first shouldInterceptRequest doesn't read from disk.
      */
     private fun preloadMainFrameDiskCache() {
-        Thread {
+        launchStartupTask("disk-cache-preload") {
             try {
                 MainFrameDiskCache.init(applicationContext)
                 VWebviewClient.preloadMainFrameCache()
@@ -489,7 +512,7 @@ class VendroidApp : Application() {
             } catch (ex: Exception) {
                 VDELog.e("VDE", "Main-frame disk cache preload failed", ex)
             }
-        }.start()
+        }
     }
 
     companion object {

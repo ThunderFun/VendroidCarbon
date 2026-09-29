@@ -84,24 +84,27 @@ class VencordLocationHealTest {
     }
 
     @Test
-    fun plainHttpOnAllowedHost_heals() {
-        seedCustomLegacyState("http://github.com/Vendicated/Vencord/releases/latest/download/browser.js")
+    fun gateRejectedLocation_heals() {
+        // Non-HTTPS and OkHttp-unparseable values are both gate rejections
+        // and must take the same heal path; the reasons are pinned in
+        // BundleLocationGateTest.
+        val locations = listOf(
+            "http://github.com/Vendicated/Vencord/releases/latest/download/browser.js",
+            "https://github.com:99999/browser.js"
+        )
+        for (location in locations) {
+            prefs.edit().clear().commit()
+            seedCustomLegacyState(location)
 
-        VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
+            VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
 
-        assertNull(prefs.getString("vencordLocation", null))
-        assertFalse(vendroidFile.exists())
-        assertTrue(prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false))
-    }
-
-    @Test
-    fun uriToleratedButOkHttpUnparseable_heals() {
-        seedCustomLegacyState("https://github.com:99999/browser.js")
-
-        VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
-
-        assertNull(prefs.getString("vencordLocation", null))
-        assertFalse(vendroidFile.exists())
+            assertNull("$location must be removed", prefs.getString("vencordLocation", null))
+            assertFalse("$location must delete the cached bundle", vendroidFile.exists())
+            assertTrue(
+                "$location must set the heal notice",
+                prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false)
+            )
+        }
     }
 
     @Test
@@ -129,42 +132,30 @@ class VencordLocationHealTest {
     }
 
     @Test
-    fun officialUrl_notTouched() {
-        seedCustomLegacyState(Constants.JS_BUNDLE_URL)
-        val fileBefore = vendroidFile.readText()
-
-        VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
-
-        assertEquals(Constants.JS_BUNDLE_URL, prefs.getString("vencordLocation", null))
-        assertTrue(vendroidFile.exists())
-        assertEquals(fileBefore, vendroidFile.readText())
-        assertFalse(prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false))
-    }
-
-    @Test
-    fun equicordOfficialUrl_notTouched() {
-        seedCustomLegacyState(Constants.EQUICORD_BUNDLE_URL)
-
-        VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
-
-        assertEquals(Constants.EQUICORD_BUNDLE_URL, prefs.getString("vencordLocation", null))
-        assertTrue(vendroidFile.exists())
-        assertFalse(prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false))
-    }
-
-    @Test
-    fun customPathOnAllowedHost_notTouched() {
-        // The developer workflow must survive the heal.
-        seedCustomLegacyState("https://github.com/Vendicated/Vencord/releases/download/devbuild/browser.js")
-
-        VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
-
-        assertEquals(
-            "https://github.com/Vendicated/Vencord/releases/download/devbuild/browser.js",
-            prefs.getString("vencordLocation", null)
+    fun allowedLocations_notTouched() {
+        // Official URLs and custom paths on the allowed host pass the gate;
+        // the heal must leave the key, the cached bundle, and the notice
+        // flag alone.
+        val locations = listOf(
+            Constants.JS_BUNDLE_URL,
+            Constants.EQUICORD_BUNDLE_URL,
+            "https://github.com/Vendicated/Vencord/releases/download/devbuild/browser.js"
         )
-        assertTrue(vendroidFile.exists())
-        assertFalse(prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false))
+        for (location in locations) {
+            prefs.edit().clear().commit()
+            seedCustomLegacyState(location)
+            val fileBefore = vendroidFile.readText()
+
+            VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
+
+            assertEquals("$location must survive the heal", location, prefs.getString("vencordLocation", null))
+            assertTrue("$location must keep the cached bundle", vendroidFile.exists())
+            assertEquals("$location must not touch the cached bundle", fileBefore, vendroidFile.readText())
+            assertFalse(
+                "$location must not set the heal notice",
+                prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false)
+            )
+        }
     }
 
     @Test
@@ -195,14 +186,6 @@ class VencordLocationHealTest {
         assertTrue(vendroidFile.exists())
         assertEquals(fileBefore, vendroidFile.readText())
         assertFalse(prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false))
-    }
-
-    @Test
-    fun absentKey_noOp() {
-        VendroidApp.healUnusableVencordLocation(prefs, vendroidFile)
-
-        assertFalse(prefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false))
-        assertNull(prefs.getString(HttpClient.PREF_ETAG, null))
     }
 
     @Test

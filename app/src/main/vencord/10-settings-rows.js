@@ -1,6 +1,10 @@
     function injectSettingsRowsIfMissing() {
         try {
             if (document.hidden) return;
+            // Retry the session-start captures before the injectors so the
+            // restart-required rows never mount against an uncaptured value.
+            captureDesktopModeAtBootIfNeeded();
+            captureDiscordBranchAtBootIfNeeded();
             // .vde-rows-section exists only while the Vendroid Settings tab
             // is mounted; append into the last instance found.
             var sections = document.querySelectorAll('.vde-rows-section');
@@ -26,7 +30,9 @@
             if (!sections || sections.length === 0) return;
             var section = sections[sections.length - 1];
 
-            // Injector order is render order; the switcher stays first.
+            // Injector order is render order; the branch switcher stays
+            // first, the client mod switcher second, desktop mode last.
+            injectDiscordBranchSwitcherIfMissing(section);
             injectClientModSwitcherIfMissing(section);
             injectAppIconPickerIfMissing(section);
             injectBarColorRowIfMissing(section);
@@ -39,6 +45,7 @@
             injectRememberChannelToggleIfMissing(section);
             injectGesturesToggleIfMissing(section);
             injectSupportWarningsToggleIfMissing(section);
+            injectDesktopModeToggleIfMissing(section);
         } catch(e) {
             console.error('[Vendroid] injectSettingsRowsIfMissing error: ' + e.message);
         }
@@ -57,6 +64,166 @@
             (section.firstChild ? 'margin-top:40px;' : '');
         header.textContent = title;
         section.appendChild(header);
+    }
+
+    // "Discord branch" switcher (Stable / PTB / Canary). The row only reads
+    // and writes the discordBranch pref; setString can silently early-return
+    // (rate limiter, token check), so the dots reconcile to the persisted
+    // value after each write. The branch decides the origin loaded at the
+    // next cold start, hence the "Restart now" affordance. The restart note
+    // is derived from the session-start capture in 00-boot.js so it survives
+    // settings-tab remounts, the same fix desktop mode uses.
+    var VDE_DISCORD_BRANCHES = [
+        { value: 'stable', label: 'Stable', host: 'discord.com' },
+        { value: 'ptb', label: 'PTB', host: 'ptb.discord.com' },
+        { value: 'canary', label: 'Canary', host: 'canary.discord.com' }
+    ];
+
+    function discordBranchLabel(value) {
+        var norm = normalizeDiscordBranch(value);
+        for (var i = 0; i < VDE_DISCORD_BRANCHES.length; i++) {
+            if (VDE_DISCORD_BRANCHES[i].value === norm) return VDE_DISCORD_BRANCHES[i].label;
+        }
+        return 'Stable';
+    }
+
+    function injectDiscordBranchSwitcherIfMissing(section) {
+        try {
+            if (section.querySelector('[data-vde-discord-branch-switcher]')) return;
+            ensureSectionHeader(section, 'discord-branch', 'Discord branch');
+
+            var wrap = document.createElement('div');
+            wrap.setAttribute('data-vde-discord-branch-switcher', '1');
+            wrap.style.cssText = 'width:100%;';
+
+            var desc = document.createElement('div');
+            desc.className = 'vde-component-setting-description';
+            desc.style.cssText = 'color:var(--text-muted);margin-bottom:10px;';
+            desc.textContent = 'Choose which Discord build the app opens. Vencord settings, themes, and QuickCSS are stored per build and do not carry over; you may need to sign in again on a build you have not used before. Takes effect after a restart.';
+            wrap.appendChild(desc);
+
+            // Restart prompt; hidden while the persisted branch matches the
+            // one this session started on.
+            var restartNote = document.createElement('div');
+            restartNote.style.cssText = 'display:none;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;';
+            var restartText = document.createElement('span');
+            restartText.style.cssText = 'color:var(--header-primary);font-size:13px;flex:1 1 auto;';
+            var restartBtn = document.createElement('button');
+            restartBtn.type = 'button';
+            restartBtn.textContent = 'Restart now';
+            restartBtn.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;padding:6px 14px;background:var(--brand-primary,#5865f2);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;flex:none;-webkit-tap-highlight-color:transparent;';
+            restartBtn.addEventListener('click', function() {
+                try { VencordMobileNative.requestNative('restartApp'); } catch(e) {
+                    console.error('[Vendroid] restartApp failed: ' + e.message);
+                }
+            });
+            restartNote.appendChild(restartText);
+            restartNote.appendChild(restartBtn);
+            wrap.appendChild(restartNote);
+
+            var list = document.createElement('div');
+            list.style.cssText = 'display:flex;flex-direction:column;width:100%;';
+            wrap.appendChild(list);
+
+            var rows = [];
+            function setDotState(dot, selected) {
+                dot.style.border = selected ? '6px solid var(--brand-primary,#5865f2)' : '2px solid var(--interactive-muted,#72767d)';
+                dot.style.background = selected ? '#fff' : 'transparent';
+            }
+
+            function renderSelection(active) {
+                rows.forEach(function (entry) {
+                    setDotState(entry.dot, entry.value === active);
+                });
+            }
+
+            function currentBranch() {
+                try {
+                    return normalizeDiscordBranch(
+                        VencordMobileNative.getString('discordBranch', 'stable'));
+                } catch (e) {
+                    return 'stable';
+                }
+            }
+
+            // If the boot capture never landed because the bridge was
+            // unavailable, fall back to this mount's value so the note tracks
+            // in-mount changes only. A local fallback, not a write to the
+            // shared var, so the capture can still land later.
+            var mountValue = currentBranch();
+            var sessionStart = (typeof _vdeDiscordBranchAtBoot !== 'undefined')
+                ? _vdeDiscordBranchAtBoot
+                : mountValue;
+
+            function syncRestartNote(persisted) {
+                if (persisted === sessionStart) {
+                    restartNote.style.display = 'none';
+                    return;
+                }
+                restartText.textContent = 'Restart the app to open '
+                    + discordBranchLabel(persisted) + '.';
+                restartNote.style.display = 'flex';
+            }
+            syncRestartNote(mountValue);
+
+            VDE_DISCORD_BRANCHES.forEach(function (entry) {
+                var row = document.createElement('div');
+                row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;cursor:pointer;-webkit-tap-highlight-color:transparent;';
+
+                var labelWrap = document.createElement('div');
+                labelWrap.style.cssText = 'display:flex;flex-direction:column;';
+                var label = document.createElement('div');
+                label.style.cssText = 'color:var(--header-primary);font-size:14px;font-weight:500;';
+                label.textContent = entry.label;
+                var host = document.createElement('div');
+                host.style.cssText = 'color:var(--text-muted);font-size:12px;';
+                host.textContent = entry.host;
+                labelWrap.appendChild(label);
+                labelWrap.appendChild(host);
+                row.appendChild(labelWrap);
+
+                var dot = document.createElement('span');
+                dot.style.cssText = 'width:20px;height:20px;border-radius:50%;flex:none;box-sizing:border-box;';
+                row.appendChild(dot);
+
+                row.addEventListener('click', function () {
+                    // Debounce double-taps; the 700ms window outlasts the
+                    // bridge's 500ms write rate limit.
+                    if (list.getAttribute('data-busy') === '1') return;
+                    if (entry.value === currentBranch()) return;
+                    list.setAttribute('data-busy', '1');
+                    try {
+                        VencordMobileNative.setString('discordBranch', entry.value);
+                    } catch (e) {
+                        console.error('[Vendroid] setString discordBranch failed: ' + e.message);
+                    }
+                    // Re-read: a rejected write must not leave an unapplied
+                    // selection on screen.
+                    var persisted = currentBranch();
+                    renderSelection(persisted);
+                    syncRestartNote(persisted);
+                    if (persisted !== entry.value) {
+                        console.error('[Vendroid] setString discordBranch rejected; selection unchanged');
+                    }
+                    setTimeout(function () { list.removeAttribute('data-busy'); }, 700);
+                });
+
+                list.appendChild(row);
+                rows.push({ value: entry.value, dot: dot });
+            });
+
+            renderSelection(mountValue);
+
+            var divider = document.createElement('div');
+            divider.className = 'vde-divider-setting';
+            divider.style.cssText = 'width:100%;height:1px;border-top:thin solid var(--background-modifier-accent);margin-top:20px;margin-bottom:20px;';
+            wrap.appendChild(divider);
+
+            section.appendChild(wrap);
+            console.warn('[Vendroid] Discord branch switcher injected into Vendroid settings');
+        } catch (e) {
+            console.error('[Vendroid] injectDiscordBranchSwitcherIfMissing error: ' + e.message);
+        }
     }
 
     // "Client mod" switcher (Vencord ⇄ Equicord). The row only reads and
@@ -182,6 +349,77 @@
             console.warn('[Vendroid] Client mod switcher injected into Vendroid settings');
         } catch (e) {
             console.error('[Vendroid] injectClientModSwitcherIfMissing error: ' + e.message);
+        }
+    }
+
+    // Desktop mode swaps the WebView user agent to a desktop Chrome UA, so
+    // Discord serves its desktop web UI. The UA is fixed at WebView install
+    // in MainActivity.applyWebViewSettings, so the row only offers a restart
+    // and never applies live. Unlike the other rows, tapping the title or
+    // description also flips the switch (toggleOnLabelPress). It compares the
+    // persisted value against the session-start capture in 00-boot.js, which
+    // keeps the restart note correct across settings-tab remounts.
+    function injectDesktopModeToggleIfMissing(section) {
+        try {
+            if (section.querySelector('[data-vde-toggle="desktop-mode"]')) return;
+            ensureSectionHeader(section, 'layout', 'Layout');
+
+            // Restart note; hidden while persisted matches the session start.
+            var note = document.createElement('div');
+            note.style.cssText = 'display:none;align-items:center;justify-content:space-between;gap:12px;margin-top:12px;';
+            var noteText = document.createElement('span');
+            noteText.style.cssText = 'color:var(--header-primary);font-size:13px;flex:1 1 auto;';
+            var restartBtn = document.createElement('button');
+            restartBtn.type = 'button';
+            restartBtn.textContent = 'Restart now';
+            restartBtn.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;padding:6px 14px;background:var(--brand-primary,#5865f2);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;flex:none;-webkit-tap-highlight-color:transparent;';
+            restartBtn.addEventListener('click', function() {
+                try { VencordMobileNative.requestNative('restartApp'); } catch(e) {
+                    console.error('[Vendroid] restartApp failed: ' + e.message);
+                }
+            });
+            note.appendChild(noteText);
+            note.appendChild(restartBtn);
+
+            // Read once for the initial note state. If the session-start
+            // capture never landed because the bridge was unavailable, fall
+            // back to this mount's value so the note tracks in-mount
+            // changes only.
+            var mountValue = false;
+            try {
+                mountValue = !!VencordMobileNative.getBool('desktopMode', false);
+            } catch(e) {
+                console.error('[Vendroid] getBool for desktop-mode toggle failed: ' + e.message);
+            }
+            var sessionStart = (typeof _vdeDesktopModeAtBoot !== 'undefined')
+                ? _vdeDesktopModeAtBoot
+                : mountValue;
+
+            function syncRestartNote(persisted) {
+                if (persisted === sessionStart) {
+                    note.style.display = 'none';
+                    return;
+                }
+                noteText.textContent = persisted
+                    ? 'Restart to apply the desktop UI.'
+                    : 'Restart to return to the mobile UI.';
+                note.style.display = 'flex';
+            }
+            syncRestartNote(mountValue);
+
+            section.appendChild(buildVendroidToggleRow({
+                attr: 'desktop-mode',
+                prefKey: 'desktopMode',
+                defaultValue: false,
+                title: 'Desktop mode',
+                description: 'Load Discord with a desktop browser user agent so it renders its desktop web UI. Takes effect after a restart; gesture navigation is inactive in desktop mode.',
+                noteEl: note,
+                toggleOnLabelPress: true,
+                onChange: syncRestartNote
+            }));
+            console.warn('[Vendroid] Desktop mode toggle injected into Vendroid settings');
+        } catch(e) {
+            console.error('[Vendroid] injectDesktopModeToggleIfMissing error: ' + e.message);
         }
     }
 
@@ -967,11 +1205,14 @@
         }
     }
 
-    // Shared builder for the ported-feature toggle rows (gestures, support
-    // warnings). Same markup and reconcile-on-write behavior as the older
-    // hand-rolled toggles above: setBool can silently early-return (key
-    // allowlist, rate limiter), so the change handler re-reads the
-    // persisted value and reconciles the UI to the actual state.
+    // Shared builder for the toggle rows used by gestures, support warnings,
+    // and desktop mode. Same markup and reconcile-on-write behavior as the
+    // hand-rolled toggles above: setBool can silently early-return through
+    // the key allowlist or the rate limiter, so the change handler re-reads
+    // the persisted value and syncs the UI to it. opts.noteEl appends a node
+    // between the row and the divider, and opts.onChange fires with the
+    // reconciled value after each change, never on init. Desktop mode uses
+    // both for its restart note.
     function buildVendroidToggleRow(opts) {
         var wrap = document.createElement('div');
         wrap.setAttribute('data-vde-toggle', opts.attr);
@@ -1024,6 +1265,18 @@
         cb.checked = checked;
         render(checked);
 
+        // Fired with the reconciled persisted value after each change, never
+        // on init; callers set their initial state themselves. The inner
+        // catch keeps a throwing callback from breaking the toggle.
+        function emitChange(persisted) {
+            if (typeof opts.onChange !== 'function') return;
+            try {
+                opts.onChange(persisted);
+            } catch(e) {
+                console.error('[Vendroid] onChange for ' + opts.prefKey + ' failed: ' + e.message);
+            }
+        }
+
         cb.addEventListener('change', function() {
             try {
                 VencordMobileNative.setBool(opts.prefKey, cb.checked);
@@ -1032,6 +1285,7 @@
                     cb.checked = persisted;
                 }
                 render(cb.checked);
+                emitChange(cb.checked);
             } catch(e) {
                 console.error('[Vendroid] setBool for ' + opts.prefKey + ' failed: ' + e.message);
                 cb.checked = !cb.checked;
@@ -1039,7 +1293,20 @@
             }
         });
 
+        // Opt-in: label taps flip the checkbox through the same change
+        // handler as the switch. Used by desktop mode only.
+        if (opts.toggleOnLabelPress) {
+            labelCol.style.cursor = 'pointer';
+            labelCol.addEventListener('click', function() {
+                cb.click();
+            });
+        }
+
         wrap.appendChild(row);
+
+        if (opts.noteEl) {
+            wrap.appendChild(opts.noteEl);
+        }
 
         var divider = document.createElement('div');
         divider.className = 'vde-divider-setting';

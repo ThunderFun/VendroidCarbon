@@ -12,7 +12,6 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.res.Resources
-import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
@@ -34,6 +33,7 @@ import android.webkit.WebView
 import android.webkit.WebChromeClient
 import android.widget.Toast
 import io.github.thunderfun.vendroid.utils.Constants
+import io.github.thunderfun.vendroid.utils.DiscordBranch
 import io.github.thunderfun.vendroid.utils.FirewallConfig
 import io.github.thunderfun.vendroid.utils.SettingKeys
 import io.github.thunderfun.vendroid.utils.VDELog
@@ -43,11 +43,13 @@ import io.github.thunderfun.vendroid.utils.vdeGson
 import io.github.thunderfun.vendroid.ui.LoadingScreenManager
 import io.github.thunderfun.vendroid.ui.SplashPalette
 import io.github.thunderfun.vendroid.webview.BarColorManager
+import io.github.thunderfun.vendroid.webview.HttpCacheTuner
 import io.github.thunderfun.vendroid.webview.HttpClient
 import io.github.thunderfun.vendroid.webview.HttpClient.fetchVencord
 import io.github.thunderfun.vendroid.webview.LinkHandler
 import io.github.thunderfun.vendroid.webview.MainFrameDiskCache
 import io.github.thunderfun.vendroid.webview.NavigationPolicy
+import io.github.thunderfun.vendroid.webview.VencordRuntimeLoader
 import io.github.thunderfun.vendroid.webview.RuntimeInjector
 import io.github.thunderfun.vendroid.webview.UrlNormalizer
 import io.github.thunderfun.vendroid.webview.VChromeClient
@@ -88,6 +90,17 @@ class MainActivity : AppCompatActivity() {
     var currentUrlForBridge: String? = null
     @Volatile
     var currentHostForBridge: String? = null
+
+    /**
+     * The Discord branch this session opens. Snapshotted from the
+     * discordBranch pref before the first load; a change takes effect at the
+     * next cold start, the same restart-required contract as clientMod and
+     * desktopMode. @Volatile because VWebviewClient's cache refresh reads it
+     * from the network thread.
+     */
+    @Volatile
+    internal var appShell: DiscordBranch = DiscordBranch.DEFAULT
+        private set
     /** True between a main-frame commit and onPageFinished. Lets the bridge's
      *  strict domain check skip the UI-thread round trip in steady state. */
     @Volatile
@@ -138,6 +151,12 @@ class MainActivity : AppCompatActivity() {
      * Theme-resolved bar color: the picker's "default" and the reset target.
      * Resolves the attribute (not the color resource) so values-night and any
      * future re-point of the attr stay correct.
+     *
+     * The fallback reads @color/status_bar_color via ContextCompat, which
+     * resolves by device configuration rather than by theme. That matches
+     * the attribute today: every theme points the attr at this resource, and
+     * values and values-night agree. It is also the right "no tint" default
+     * if a future theme drops the attr.
      */
     // android.R.attr.statusBarColor is deprecated on API 36+ along with the
     // setter, but reading it is still the only way to get the theme's value,
@@ -159,7 +178,7 @@ class MainActivity : AppCompatActivity() {
                 VDELog.w("Main", "theme bar color resolve failed; using fallback: $t")
             }
         }
-        return Color.parseColor("#121214")
+        return ContextCompat.getColor(this, R.color.status_bar_color)
     }
 
     /** Startup path: read the persisted tint, publish it and tint the chrome. */
@@ -280,7 +299,11 @@ class MainActivity : AppCompatActivity() {
         managedDialogs.clear()
     }
 
-    private val fetchExecutor = Executors.newSingleThreadExecutor()
+    // Named for ANR/thread-dump triage. This single thread serializes the
+    // safety-net runtime load and every fetchVencord run (see
+    // VencordRuntimeLoader's concurrency note).
+    private val fetchExecutor =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "vde-fetch") }
 
     private fun migrateSettings() {
         val sPrefs = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
@@ -402,6 +425,15 @@ class MainActivity : AppCompatActivity() {
     private fun proceedWithStartup(sPrefs: SharedPreferences) {
         window.setFormat(PixelFormat.OPAQUE)
 
+        // Snapshot the Discord branch before anything loads. The shell URL and
+        // both resume gates read this field, and the pref is not re-read
+        // mid-session.
+        appShell = DiscordBranch.fromPrefValue(
+            sPrefs.getStringSafe(SettingKeys.KEY_DISCORD_BRANCH, DiscordBranch.DEFAULT.prefValue) {
+                VDELog.w("Main", "discordBranch type-poisoned; using default: $it")
+            }
+        )
+
         val editor = sPrefs.edit()
 
         // WebView debugging exposes the page (cookies, token, JS context) to
@@ -425,7 +457,7 @@ class MainActivity : AppCompatActivity() {
         )
         // Start the animation now so the splash does not freeze during WebView setup.
         loadingScreenManager.start()
-        loadingScreenManager.scheduleTimeout(30000)
+        loadingScreenManager.scheduleTimeout(LOADING_SCREEN_TIMEOUT_MS)
 
         installWebView(sPrefs)
         syncFeatureToggles(sPrefs)
@@ -523,6 +555,9 @@ class MainActivity : AppCompatActivity() {
 
         applyWebViewSettings(wv!!.settings, sPrefs)
         applyWebViewViewFlags(wv!!)
+        // Pin a large HTTP cache quota so Discord's hashed bundles survive
+        // between sessions (see HttpCacheTuner).
+        HttpCacheTuner.apply(wv!!)
 
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv!!, false)
     }
@@ -533,8 +568,14 @@ class MainActivity : AppCompatActivity() {
         // back to the default so stale or type-poisoned prefs cannot crash
         // cold start.
         if (sPrefs.getBooleanSafe(SettingKeys.KEY_DESKTOP_MODE, false)) {
-            s.userAgentString =
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            // Read before overriding. A fresh WebView reports the engine
+            // default; if a UA writer ever lands earlier, switch to
+            // WebSettings.getDefaultUserAgent(context).
+            val engineUa = s.userAgentString
+            if (chromeVersion(engineUa) == null) {
+                VDELog.w("Main", "WebView UA has no Chrome version; using fallback desktop UA")
+            }
+            s.userAgentString = desktopUserAgentFrom(engineUa)
         }
         // Sync the UA cache VWebviewClient uses for intercepted fetches.
         VWebviewClient.updateWebViewUserAgent(s.userAgentString)
@@ -722,13 +763,14 @@ class MainActivity : AppCompatActivity() {
         val delayMs = bundleCheckDelayMs(
             runtimeInMemory = HttpClient.VencordRuntime != null,
             needsRedownload = HttpClient.needsBundleRedownload(sPrefs),
-            bundleFileExists = File(filesDir, "vencord.js").exists()
+            bundleFileExists = HttpClient.vendroidFile(filesDir).exists()
         )
         Handler(Looper.getMainLooper()).postDelayed({
             val act = weakSelf.get()
             if (act == null || act.isFinishing || act.isDestroyed) return@postDelayed
-            // Mirrors runSafetyNetLoad's enqueue-race guard. fetchVencord now
-            // self-gates on the kill switch, so this only avoids enqueueing
+            // Mirrors the kill-switch guard in
+            // VencordRuntimeLoader.loadIfMissing. fetchVencord now
+            // self-gates on the same flag, so this only avoids enqueueing
             // the task in safe mode. No in-process path currently flips
             // vencordDisabled after scheduling (RecoveryActivity kills the
             // :web process before committing safeMode, and the pref is
@@ -772,9 +814,10 @@ class MainActivity : AppCompatActivity() {
      *  shell URL so callers can mirror it into currentUrlForBridge where the
      *  bridge must name the shell before the document commits. */
     private fun loadAppShell(): String {
-        wv!!.loadUrl(Constants.APP_SHELL_URL)
-        currentHostForBridge = Constants.APP_SHELL_HOST
-        return Constants.APP_SHELL_URL
+        val shellUrl = appShell.appShellUrl
+        wv!!.loadUrl(shellUrl)
+        currentHostForBridge = appShell.host
+        return shellUrl
     }
 
     /**
@@ -820,7 +863,7 @@ class MainActivity : AppCompatActivity() {
                 // Popup variant: this path also re-anchors currentUrlForBridge;
                 // set it before loadUrl (as before) so a bridge read before the
                 // commit names the shell, not a stale page.
-                currentUrlForBridge = Constants.APP_SHELL_URL
+                currentUrlForBridge = appShell.appShellUrl
                 return loadAppShell()
             }
             // Non-Discord deep link (or no data): load the default app shell.
@@ -844,8 +887,12 @@ class MainActivity : AppCompatActivity() {
             // The restore below calls loadUrl(), which bypasses
             // shouldOverrideUrlLoading and NavigationPolicy.decide, so
             // isResumableRoute (https + app origin + app-shell path, the
-            // cache predicate) is the only policy the resumed URL gets.
-            if (host != null && MainFrameDiskCache.isResumableRoute(lastUrl)) {
+            // cache predicate) is the only policy the resumed URL gets. The
+            // branch check is part of that policy. A route saved on another
+            // branch must not become this branch's home.
+            if (host != null && MainFrameDiskCache.isResumableRoute(lastUrl) &&
+                DiscordBranch.ofHost(host) == appShell
+            ) {
                 wv!!.loadUrl(lastUrl)
                 currentUrlForBridge = lastUrl
                 currentHostForBridge = host
@@ -1041,6 +1088,7 @@ class MainActivity : AppCompatActivity() {
             // getBooleanSafe: a String-typed key left by an older build would
             // crash onPause. Falling back to off skips the persist.
             if (host != null && MainFrameDiskCache.isResumableRoute(url) &&
+                DiscordBranch.ofHost(host) == appShell &&
                 prefs.getBooleanSafe(SettingKeys.KEY_VENDROID_REMEMBER_LAST_CHANNEL, false) {
                     VDELog.w("Main", "vendroid_rememberLastChannel type-poisoned; using default: $it")
                 }) {
@@ -1338,6 +1386,38 @@ class MainActivity : AppCompatActivity() {
          *  first session. */
         private const val BUNDLE_CHECK_DEFER_MS = 10_000L
 
+        /** Deadline passed to [LoadingScreenManager.scheduleTimeout]: if the
+         *  normal dismiss path, VWebviewClient's scheduleDismiss(500) on
+         *  first page paint, has not fired by then, the splash
+         *  force-dismisses. Tunable; must sit past the worst-case boot
+         *  window (bundle fetch + Vencord boot) plus that 500ms delay. */
+        private const val LOADING_SCREEN_TIMEOUT_MS = 30_000L
+
+        /**
+         * Last-resort desktop UA for [desktopUserAgentFrom]. Reached only when
+         * the engine UA has no Chrome token, which Android WebView does not
+         * produce, so the version here is cosmetic. Bump opportunistically.
+         */
+        internal const val DESKTOP_UA_FALLBACK =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+
+        private val CHROME_VERSION = Regex("""Chrome/([\d.]+)""")
+
+        /** Chrome version token from a WebView UA (`"153.0.0.0"`), or null when absent. */
+        internal fun chromeVersion(engineUa: String?): String? =
+            engineUa?.let { CHROME_VERSION.find(it)?.groupValues?.get(1) }
+
+        /**
+         * Desktop UA carrying [engineUa]'s Chrome version. Only the Windows
+         * platform tokens are fabricated; the version comes from the engine.
+         * The exact token is preserved, full or reduced. Falls back to
+         * [DESKTOP_UA_FALLBACK] when the UA has no Chrome token.
+         */
+        internal fun desktopUserAgentFrom(engineUa: String?): String {
+            val version = chromeVersion(engineUa) ?: return DESKTOP_UA_FALLBACK
+            return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$version Safari/537.36"
+        }
+
         /**
          * Delay for [scheduleDeferredBundleCheck]; see that KDoc for the
          * rationale. [deferMs] when this boot can paint with a runtime
@@ -1356,15 +1436,9 @@ class MainActivity : AppCompatActivity() {
         /**
          * Body of [loadVencordRuntimesFromDisk]. Companion-scoped and internal
          * so unit tests can drive it synchronously, and so the queued lambda
-         * captures no activity.
-         *
-         * Guards are re-evaluated at execution time: the queue wait can span
-         * a safe-mode re-entry or a bundle-cache invalidation. Publishes go
-         * through the compare-and-set helpers
-         * [HttpClient.setVencordMobileRuntimeIfNull] and
-         * [HttpClient.setVencordRuntimeIfNull] because the preload thread may
-         * publish the same content while this task waits; an unconditional set
-         * would clobber it, and make tests that stub the runtimes flaky.
+         * captures no activity. The load-and-publish sequence lives in
+         * [VencordRuntimeLoader]; this wrapper supplies the executor context
+         * and the injection tail.
          */
         internal fun runSafetyNetLoad(
             sPrefs: SharedPreferences,
@@ -1372,54 +1446,17 @@ class MainActivity : AppCompatActivity() {
             dir: File,
             weakSelf: WeakReference<MainActivity>
         ) {
-            // Safe mode may have been raised since enqueue; a session that can
-            // never publish should not pay for the reads.
-            if (HttpClient.vencordDisabled) return
-            var published = false
-            try {
-                // 1. Mobile runtime (65 KB raw resource).
-                if (HttpClient.VencordMobileRuntime == null) {
-                    val mobile = res.openRawResource(R.raw.vencord_mobile).use {
-                        HttpClient.readAsText(it)
-                    }
-                    if (HttpClient.setVencordMobileRuntimeIfNull(mobile)) {
-                        published = true
-                    }
-                }
-                // 2. Main runtime (~1 MB from disk).
-                if (!HttpClient.vencordDisabled && HttpClient.VencordRuntime == null) {
-                    val vendroidFile = File(dir, "vencord.js")
-                    // Skip the cached file while a redownload is pending so the
-                    // stale bundle is never published; fetchVencord installs a
-                    // fresh one or loads this file from its own offline
-                    // fallback. Freshness bookkeeping lives in HttpClient alone.
-                    if (!HttpClient.needsBundleRedownload(sPrefs) && vendroidFile.exists()) {
-                        try {
-                            // readBundleFromDisk patches when the persisted flag
-                            // is stale; the result is ready to publish.
-                            val fileContent = HttpClient.readBundleFromDisk(sPrefs, vendroidFile)
-                            // stillValid re-checks the guards at publish time;
-                            // the read can stall across a clientMod switch,
-                            // which deletes the file and forces a redownload.
-                            if (HttpClient.setVencordRuntimeIfNull(fileContent) {
-                                    !HttpClient.needsBundleRedownload(sPrefs) && vendroidFile.exists()
-                                }
-                            ) {
-                                published = true
-                            }
-                        } catch (e: Exception) {
-                            VDELog.e("Main", "Failed to read vendroidFile", e)
-                        }
-                    }
-                }
+            val outcome = try {
+                VencordRuntimeLoader.loadIfMissing(sPrefs, res, dir)
             } catch (e: Exception) {
                 // Shared executor: an uncaught throw here would kill the
                 // worker and the process with it, losing the rest of this
-                // task's reads; the CAS publishes tolerate a partial run, and
-                // the log keeps the gap diagnosable.
+                // task's reads; the loader's CAS publishes tolerate a partial
+                // run, and the log keeps the gap diagnosable.
                 VDELog.e("Main", "Vencord runtime safety-net load failed", e)
+                return
             }
-            if (!published) return
+            if (!outcome.publishedSomething) return
             // Reads are async now, so the first page can finish before this
             // publish lands: onPageStarted then flags missedInjection and
             // nothing re-checks until fetchVencord's network path completes.
