@@ -21,11 +21,11 @@ internal object ResponseHeaderMerge {
      * Headers whose values are not comma-separated lists. A duplicate of one
      * of these keeps the last value; joining would corrupt it ("report-to" /
      * "nel" are JSON objects that stop parsing when comma-joined,
-     * "content-length" is a single framing integer, CSP policies do not
-     * combine with commas).
+     * "content-length" is a single framing integer). CSP is excluded: its
+     * value is a comma-delimited policy list (CSP3 §2.2), so joining
+     * duplicates preserves policies a last-value-wins put would drop.
      */
     private val SINGLE_INSTANCE_HEADERS = setOf(
-        "content-security-policy", "content-security-policy-report-only",
         "content-type", "content-length", "content-encoding", "transfer-encoding",
         "location", "date", "etag", "age", "expires", "last-modified",
         "content-disposition", "strict-transport-security", "report-to", "nel"
@@ -87,4 +87,13 @@ internal object ResponseHeaderMerge {
         val bare = contentType?.substringBefore(';')?.trim()
         return bare?.takeIf { it.isNotEmpty() }
     }
+
+    /**
+     * True when [contentType]'s media type is exactly `text/html`, ignoring
+     * parameters and case. Use this at HTML gates instead of a substring
+     * match: `text/plain; note="text/html"` is not HTML, and a store that
+     * admits it rewrites the MIME to text/html at serve time.
+     */
+    fun isHtmlMediaType(contentType: String?): Boolean =
+        bareMediaType(contentType)?.equals("text/html", ignoreCase = true) == true
 }

@@ -16,7 +16,6 @@ import androidx.core.view.WindowInsetsControllerCompat
 import io.github.thunderfun.vendroid.BuildConfig
 import io.github.thunderfun.vendroid.MainActivity
 import io.github.thunderfun.vendroid.R
-import io.github.thunderfun.vendroid.utils.Constants
 import io.github.thunderfun.vendroid.utils.VDELog
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
@@ -76,8 +75,8 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         // third-party Activity/iframe page cannot forge trusted diagnostics
         // into the shareable log.
         if (message.startsWith("[Vendroid]") || message.startsWith("[VDE]")) {
-            val host = activityRef.get()?.currentHostForBridge
-            if (host == null || !Constants.isDiscordAppOrigin(host)) {
+            val url = activityRef.get()?.currentUrlForBridge
+            if (url == null || !isDiscordAppOriginUrl(url)) {
                 // Drop without persisting: emitted by a non-app-origin page.
                 return true
             }
@@ -96,8 +95,8 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         // ERROR messages from Discord app origins are persisted (capped,
         // deduped) since they signal bundle boot failures.
         if (msg.messageLevel() == MessageLevel.ERROR) {
-            val host = activityRef.get()?.currentHostForBridge
-            if (host != null && Constants.isDiscordAppOrigin(host)) {
+            val url = activityRef.get()?.currentUrlForBridge
+            if (url != null && isDiscordAppOriginUrl(url)) {
                 val source = msg.sourceId() ?: ""
                 val titled = "$message @ ${UrlNormalizer.redactForLog(source)}:${msg.lineNumber()}"
                 val dedupeKey = titled.take(80)

@@ -78,12 +78,14 @@ class ResponseHeaderMergeTest {
         assertEquals("""{"group":"b"}""", headers["report-to"])
     }
 
-    @Test fun duplicateContentSecurityPolicy_lastWins_notCommaJoined() {
+    @Test fun duplicateContentSecurityPolicy_commaJoined_notDropped() {
+        // A CSP value is a comma-delimited policy list (CSP3 §2.2); Chromium
+        // enforces every policy, so folding duplicates must preserve both.
         val (headers, _) = merge(
             "content-security-policy" to "default-src 'self'",
             "content-security-policy" to "object-src 'none'"
         )
-        assertEquals("object-src 'none'", headers["content-security-policy"])
+        assertEquals("default-src 'self', object-src 'none'", headers["content-security-policy"])
     }
 
     @Test fun mixedCaseNames_foldedIntoLowercaseSingleEntry() {

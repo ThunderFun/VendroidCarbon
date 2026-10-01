@@ -46,6 +46,7 @@ import io.github.thunderfun.vendroid.webview.BarColorManager
 import io.github.thunderfun.vendroid.webview.HttpCacheTuner
 import io.github.thunderfun.vendroid.webview.HttpClient
 import io.github.thunderfun.vendroid.webview.HttpClient.fetchVencord
+import io.github.thunderfun.vendroid.webview.isDiscordAppOriginUrl
 import io.github.thunderfun.vendroid.webview.LinkHandler
 import io.github.thunderfun.vendroid.webview.MainFrameDiskCache
 import io.github.thunderfun.vendroid.webview.NavigationPolicy
@@ -66,6 +67,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.annotation.RequiresApi
 import androidx.webkit.ServiceWorkerClientCompat
 import androidx.webkit.ServiceWorkerControllerCompat
+import androidx.webkit.ServiceWorkerWebSettingsCompat
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
 
@@ -90,6 +92,14 @@ class MainActivity : AppCompatActivity() {
     var currentUrlForBridge: String? = null
     @Volatile
     var currentHostForBridge: String? = null
+
+    /**
+     * Bumped in VWebviewClient.onPageStarted for every main-frame navigation.
+     * Bridges that must stay bound to the document that opened them (the
+     * QuickCSS editor) capture this and reject work once it changes.
+     */
+    @Volatile
+    var documentGeneration: Long = 0
 
     /**
      * The Discord branch this session opens. Snapshotted from the
@@ -600,6 +610,15 @@ class MainActivity : AppCompatActivity() {
         if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) {
             WebSettingsCompat.setSafeBrowsingEnabled(s, false)
         }
+
+        // Deliver the real Cookie header into shouldInterceptRequest
+        // requestHeaders and honor WebResourceResponseCompat.setCookies().
+        // Chromium computes it with the full SameSite / third-party /
+        // partitioning policy the app cannot reproduce. Older WebViews
+        // without the feature keep the fallback behavior unchanged.
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.COOKIE_INTERCEPT)) {
+            WebSettingsCompat.setCookiesIncludedInShouldInterceptRequest(s, true)
+        }
     }
 
     /** Applies the View-level half of [installWebView]'s setup. */
@@ -655,6 +674,14 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 )
+            // Twin of the cookie setting in applyWebViewSettings: without it,
+            // SW-served intercepts carry no Cookie header and ignore
+            // setCookies(), so the SW path would diverge from the WebView path.
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.COOKIE_INTERCEPT)) {
+                ServiceWorkerControllerCompat.getInstance()
+                    .serviceWorkerWebSettings
+                    .setIncludeCookiesOnShouldInterceptRequestEnabled(true)
+            }
         }
     }
 
@@ -810,13 +837,13 @@ class MainActivity : AppCompatActivity() {
         fetchExecutor.execute { runSafetyNetLoad(sPrefs, res, dir, weakSelf) }
     }
 
-    /** Loads the app shell and re-anchors the bridge host to it. Returns the
-     *  shell URL so callers can mirror it into currentUrlForBridge where the
-     *  bridge must name the shell before the document commits. */
+    /** Loads the app shell and re-anchors the bridge URL/host to it. Returns
+     *  the shell URL for callers that need it. */
     private fun loadAppShell(): String {
         val shellUrl = appShell.appShellUrl
-        wv!!.loadUrl(shellUrl)
+        currentUrlForBridge = shellUrl
         currentHostForBridge = appShell.host
+        wv!!.loadUrl(shellUrl)
         return shellUrl
     }
 
@@ -931,7 +958,7 @@ class MainActivity : AppCompatActivity() {
             VDELog.d("Main", "Deep link policy popup: ${UrlNormalizer.redactForLog(url.toString())}")
             return
         }
-        if (!Constants.isDiscordAppOrigin(host)) {
+        if (!isDiscordAppOriginUrl(url.toString())) {
             // discord.gg invites and Activity hosts load as a full navigation,
             // never via transitionTo. An SPA route change fires no page
             // events, so currentHostForBridge would stay non-app-origin and
@@ -1172,10 +1199,10 @@ class MainActivity : AppCompatActivity() {
         if (HttpClient.vencordDisabled) return
         val (runtime, mobileRuntime) = HttpClient.runtimeSnapshot()
         if (wv == null || runtime == null || mobileRuntime == null) return
-        // Only inject on Discord pages; the runtimes are designed for Discord
-        // and must not run on whitelisted non-Discord pages.
+        // Only inject on app-origin pages (https + app host + default port).
+        // The runtimes must not run on whitelisted non-Discord pages.
         val url = currentUrlForBridge ?: return
-        if (!Constants.isDiscordAppOrigin(Uri.parse(url).host ?: "")) return
+        if (!isDiscordAppOriginUrl(url)) return
         injectVencordAttempt(runtime, mobileRuntime, 0)
     }
 
@@ -1191,7 +1218,11 @@ class MainActivity : AppCompatActivity() {
         // Destroy-guard: after onDestroy, wv == null and the probe eval below
         // never runs. The probe result callback re-checks liveness itself.
         val w = wv ?: return
-        val expectedHost = Uri.parse(currentUrlForBridge ?: return).host
+        val currentUrl = currentUrlForBridge ?: return
+        // Re-check every attempt: a poll can outlive the navigation that
+        // scheduled it.
+        if (!isDiscordAppOriginUrl(currentUrl)) return
+        val expectedHost = Uri.parse(currentUrl).host
             ?.let { vdeGson.toJson(it) } ?: return
         // The renderer must already sit on the expected Discord host. A
         // mismatch means a provisional document (mid-navigation commit)
@@ -1199,7 +1230,8 @@ class MainActivity : AppCompatActivity() {
         // bundle in that state has broken boot before.
         w.evaluateJavascript(
             "(document.readyState==='loading'?'L'" +
-            ":location.hostname!==$expectedHost?'H'" +
+            ":(location.protocol!=='https:'||location.hostname!==$expectedHost" +
+                "||(location.port!==''&&location.port!=='443'))?'H'" +
             ":(typeof Vencord!=='undefined'" +
                 "?(typeof VencordMobile!=='undefined'?'B':'V')" +
                 ":'N'))"
@@ -1276,8 +1308,7 @@ class MainActivity : AppCompatActivity() {
         val w = wv ?: return
         if (isFinishing || isDestroyed) return
         val url = currentUrlForBridge ?: return
-        val host = Uri.parse(url).host ?: return
-        if (!Constants.isDiscordAppOrigin(host)) return
+        if (!isDiscordAppOriginUrl(url)) return
         // Probing in safe mode would report a healthy boot as failed and
         // overwrite the crash state that brought the user to recovery.
         // Record that safe mode ran instead.

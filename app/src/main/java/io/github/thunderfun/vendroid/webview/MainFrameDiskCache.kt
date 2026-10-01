@@ -28,6 +28,10 @@ import kotlin.concurrent.withLock
  *    **never** cached, so a stale copy cannot be re-served into a sensitive flow.
  *  - Stale entries are served only within [MAX_AGE_MS]; beyond that the cache is
  *    treated as a miss so ancient markup is never shown.
+ *  - Each entry stores the credential partition token of the fetch. The serve
+ *    path rejects a shell whose token differs from the requesting
+ *    navigation's, so URL-keyed storage cannot swap bodies across credential
+ *    contexts.
  *  - Disk is self-reclaiming: each committed write sweeps entries older than
  *    [MAX_AGE_MS], so evicted or orphaned entries cannot accumulate on disk.
  *  - Writes are atomic (`.tmp` + `renameTo`) and the file is size-capped.
@@ -38,13 +42,17 @@ import kotlin.concurrent.withLock
     const val MAX_AGE_MS = 24L * 60 * 60 * 1000 // 24 hours
 
     /** Upper bound on a persisted body so a malformed huge response can't fill disk. */
-    private const val MAX_BODY_BYTES = 2 * 1024 * 1024
+    internal const val MAX_BODY_BYTES = 2 * 1024 * 1024
 
     /** Cap on the number of URLs recorded in the preload index. */
     private const val MAX_INDEXED_URLS = 64
 
     /** Entry files are named "$base.<suffix>"; base is this many lowercase hex chars. */
     private const val ENTRY_BASE_LEN = 32
+
+    /** Reserved meta key carrying the credential partition; "@" is not valid
+     *  in an HTTP field name, so it can never collide with a stored header. */
+    private const val CREDENTIAL_META_KEY = "@cred"
 
     /** Serializes the index.txt read-modify-write and the post-write stale sweep. */
     private val indexAddLock = ReentrantLock()
@@ -83,12 +91,17 @@ import kotlin.concurrent.withLock
 
     /**
      * True if the URL may be persisted and re-served as a stale HTML shell.
-     * Requires HTTPS, a Discord **app origin** (discord.com / ptb. / canary. /
-     * discordapp.com apex, never CDN/media subdomains, which serve
-     * attacker-uploaded content) and an app-shell path ([isAppShellPath]).
+     * Requires HTTPS, the default HTTPS port, a Discord **app origin**
+     * (discord.com / ptb. / canary. / discordapp.com apex, never CDN/media
+     * subdomains, which serve attacker-uploaded content) and an app-shell
+     * path ([isAppShellPath]). A non-443 port is a different origin, so it
+     * never qualifies.
      */
     fun isCacheableRoute(url: Uri): Boolean {
         if (url.scheme != "https") return false
+        // Uri.port is -1 when the URL omits the default port.
+        val port = url.port
+        if (port != -1 && port != 443) return false
         val host = url.host ?: return false
         if (!Constants.isDiscordAppOrigin(host)) return false
         val path = url.path ?: return false
@@ -108,13 +121,16 @@ import kotlin.concurrent.withLock
      * Persists a raw HTML main-frame response. No-op unless [isCacheableRoute]
      * passes and the body is within the size cap. [headers] must be the
      * fetch-path's sanitized headers so a stale serve preserves security headers.
-     * [reasonPhrase] is stored in the meta and replayed on a stale serve.
+     * [credentialPartition] is the request's credential-context token ("" when
+     * none was visible); it is stored in the meta and checked by the serve
+     * path. [reasonPhrase] is stored in the meta and replayed on a stale serve.
      */
     fun writeMainFrame(
         urlString: String,
         rawBody: ByteArray,
         headers: Map<String, String>,
         reasonPhrase: String = "OK",
+        credentialPartition: String = "",
         nowMs: Long = System.currentTimeMillis()
     ): Boolean {
         val dir = cacheDir ?: return false
@@ -146,20 +162,24 @@ import kotlin.concurrent.withLock
             //   0: fetch timestamp (== the body filename timestamp)
             //   1: base64 reason phrase
             //   2..: "key\tbase64value" header pairs (bounded, no newlines in values)
+            //   last: "@cred\tbase64value" credential partition; absent in
+            //         older entries (reads as "")
             val sb = StringBuilder()
             sb.append(nowMs).append('\n')
             sb.append(Base64.getEncoder().encodeToString(reasonPhrase.toByteArray(Charsets.UTF_8))).append('\n')
             val enc = Base64.getEncoder()
             for ((k, v) in headers) {
-                // Keep only headers that matter to re-serve (security/content-type).
+                // Keep the headers the stale serve can replay: content-type
+                // and the security policies in STALE_PRESERVED_HEADERS.
                 val lk = k.lowercase()
                 if (lk == "content-length" || lk == "content-encoding" || lk == "transfer-encoding") continue
-                if (lk == "content-type" || lk == "content-security-policy" ||
-                    lk == "content-security-policy-report-only" || lk == "strict-transport-security") {
+                if (lk == "content-type" || lk in STALE_PRESERVED_HEADERS) {
                     val kv = "$k\t${enc.encodeToString(v.toByteArray(Charsets.UTF_8))}"
                     sb.append(kv).append('\n')
                 }
             }
+            sb.append(CREDENTIAL_META_KEY).append('\t')
+                .append(enc.encodeToString(credentialPartition.toByteArray(Charsets.UTF_8))).append('\n')
             // Write meta atomically LAST. It is the commit point.
             metaTmp.writeText(sb.toString())
             if (!metaTmp.renameTo(meta)) {
@@ -214,7 +234,10 @@ import kotlin.concurrent.withLock
         val body: ByteArray,
         val reasonPhrase: String,
         val headers: Map<String, String>,
-        val fetchedAt: Long
+        val fetchedAt: Long,
+        /** Credential context the body was fetched under ("" when none was
+         *  visible); the serve path rejects a shell whose token differs. */
+        val credentialPartition: String = ""
     )
 
     /**
@@ -254,8 +277,11 @@ import kotlin.concurrent.withLock
             } catch (_: Exception) {
                 "OK"
             }
-            // Rebuild headers from any "key\tvalue" pairs in lines 2+.
+            // Rebuild headers from any "key\tvalue" pairs in lines 2+. The
+            // reserved "@cred" line carries the credential partition; every
+            // other line is a header.
             val headers = HashMap<String, String>()
+            var credentialPartition = ""
             val dec = Base64.getDecoder()
             for (line in metaLines.drop(2)) {
                 if (line.isEmpty()) continue
@@ -263,13 +289,15 @@ import kotlin.concurrent.withLock
                 if (tab <= 0) continue
                 val k = line.substring(0, tab)
                 val vEnc = line.substring(tab + 1)
-                // Undecodable header line: skip it; the content-type default below covers an empty map.
+                // Undecodable line: skip it; the content-type default below covers an empty map.
                 try {
-                    headers[k] = String(dec.decode(vEnc), Charsets.UTF_8)
+                    val value = String(dec.decode(vEnc), Charsets.UTF_8)
+                    if (k == CREDENTIAL_META_KEY) credentialPartition = value
+                    else headers[k] = value
                 } catch (_: Exception) {}
             }
             if (headers.isEmpty()) headers["content-type"] = "text/html"
-            CachedMainFrame(body, reason, headers, fetchedAt)
+            CachedMainFrame(body, reason, headers, fetchedAt, credentialPartition)
         } catch (e: Exception) {
             VDELog.d("MainFrameDiskCache", "read failed: ${e.message}")
             null

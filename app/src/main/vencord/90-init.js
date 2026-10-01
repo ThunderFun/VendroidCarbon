@@ -1214,6 +1214,31 @@ video {
             }
         }, true);
 
+        // Discord's connecting-screen logo is a <video data-testid="app-spinner">.
+        // Reduced motion (system media query, which Android WebView maps from
+        // the OS "Remove animations" setting, or Discord's Accessibility
+        // setting) makes Discord drop autoplay and loop. While paused, the
+        // video renders VChromeClient's transparent poster and no logo
+        // appears. The native splash ignores reduced motion for the same reason.
+        function forceSpinnerVideoPlayback() {
+            document.querySelectorAll('video[data-testid="app-spinner"]').forEach(v => {
+                if (!v.paused) return;
+                v.muted = true;
+                v.loop = true;
+                v.play().catch(() => {});
+            });
+        }
+        forceSpinnerVideoPlayback();
+        // Sources attach after insertion, so the first pass usually finds a
+        // video with no metadata. Retry on loadedmetadata. A theme swap
+        // re-keys the element, and this catches the new one too.
+        document.addEventListener("loadedmetadata", e => {
+            if (e.target.tagName === "VIDEO" &&
+                e.target.getAttribute("data-testid") === "app-spinner") {
+                forceSpinnerVideoPlayback();
+            }
+        }, true);
+
         let observerRafId = 0;
         let lastNonLightboxDialog = null;
         let lastNonLightboxDialogHash = "";
