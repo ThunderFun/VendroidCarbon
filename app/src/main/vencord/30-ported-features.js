@@ -118,6 +118,7 @@ div[class^="prompt_"] {
     var _vendroidBaseCssInjected = false;
     var _vendroidMstyleInjected = false;
     var _vendroidScreenWidthLoopStarted = false;
+    var _vendroidScreenWidthLast = -1;
 
     // Result of PlatformUtils.isAndroidWeb() captured BEFORE the Slate fix
     // overrides it to false (setupSlateOverride stores it). The plugin's
@@ -165,19 +166,39 @@ div[class^="prompt_"] {
         startScreenWidthUpdater();
     }
 
+    // The layout viewport width, not screen.availWidth: the display width
+    // overstates it in split-screen, freeform/DeX, and half-folded states,
+    // overflowing the sidebar past the base CSS's overflow-x: hidden.
+    function currentScreenWidth() {
+        try {
+            return document.documentElement.clientWidth || window.innerWidth || 0;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    function updateScreenWidthVar() {
+        try {
+            var width = currentScreenWidth();
+            if (width <= 0 || width === _vendroidScreenWidthLast) return;
+            _vendroidScreenWidthLast = width;
+            var style = document.querySelector("#vde-screen-width") || document.createElement("style");
+            style.setAttribute("id", "vde-screen-width");
+            style.textContent = ":root { --screen-width: " + width + "px }";
+            (document.head || document.documentElement).appendChild(style);
+        } catch (e) {}
+    }
+
     // Ported from vendroidEnhancements.start(): keeps --screen-width in
-    // sync with the real available width for the mstyle sidebar layout.
+    // sync with the viewport. Events handle rotation/resizes immediately;
+    // the interval is a fallback for WebViews that miss one.
     function startScreenWidthUpdater() {
         if (_vendroidScreenWidthLoopStarted) return;
         _vendroidScreenWidthLoopStarted = true;
-        setInterval(function() {
-            try {
-                var style = document.querySelector("#vde-screen-width") || document.createElement("style");
-                style.setAttribute("id", "vde-screen-width");
-                style.textContent = ":root { --screen-width: " + (screen && screen.availWidth || 0) + "px }";
-                (document.head || document.documentElement).appendChild(style);
-            } catch (e) {}
-        }, 1000);
+        updateScreenWidthVar();
+        window.addEventListener("resize", updateScreenWidthVar);
+        window.addEventListener("orientationchange", updateScreenWidthVar);
+        setInterval(updateScreenWidthVar, 1000);
     }
 
     // Ported gesture navigation (vendroidEnhancements.start()): swipe
@@ -186,10 +207,12 @@ div[class^="prompt_"] {
     // applies without a restart; the listeners stay attached for the page
     // lifetime either way.
     //
-    // State is re-derived on every swipe from the same source back press
-    // uses: the MOBILE_WEB_SIDEBAR_* subscriptions in 31-do-init.js feed
-    // isSidebarOpen. The members panel has no Flux event and is read from
-    // its DOM at swipe time.
+    // Sidebar state is re-derived from the DOM through
+    // syncSidebarOpenFromDom() (00-boot.js) on every swipe. The
+    // MOBILE_WEB_SIDEBAR_* Flux flag is only a fast path: the Slate override
+    // leaves isAndroidWeb() false, which stops Discord's sidebar store from
+    // tracking the rendered sidebar. The members panel has no Flux event and
+    // is read from its DOM at swipe time.
     var _vendroidGesturesSetupDone = false;
     function gesturesEnabled() {
         try {
@@ -214,22 +237,7 @@ div[class^="prompt_"] {
         var startT = 0;
         var startTarget = null;
 
-        var sidebarDriftLogged = false;
         var layerDriftLogged = false;
-
-        // The DOM read never overrides isSidebarOpen; back press reads the
-        // same flag and a second truth would drift. A mismatch is logged
-        // once so selector rot or a lost Flux event shows up in VDELog.
-        function sidebarDriftCanary() {
-            if (sidebarDriftLogged) return;
-            try {
-                var domOpen = !!document.querySelector("div[class^='sidebar_']");
-                if (domOpen === isSidebarOpen) return;
-                sidebarDriftLogged = true;
-                console.error("[Vendroid] Swipe: sidebar state drift, flux=" + isSidebarOpen +
-                    " dom=" + domOpen + " (selector rot or missing Flux event)");
-            } catch (e) {}
-        }
 
         // Layer gate. Reuses the back-press helper but exempts the
         // sidebar's own layer container while the sidebar is open, so
@@ -359,6 +367,7 @@ div[class^="prompt_"] {
             if (fd) {
                 try {
                     fd.dispatch({ type: "MOBILE_WEB_SIDEBAR_OPEN" });
+                    console.warn("[Vendroid] sidebar OPEN dispatched");
                     return true;
                 } catch (e) {
                     console.error("[Vendroid] Swipe: sidebar OPEN dispatch failed: " + e.message);
@@ -377,6 +386,7 @@ div[class^="prompt_"] {
             if (!fd) return false;
             try {
                 fd.dispatch({ type: "MOBILE_WEB_SIDEBAR_CLOSE" });
+                console.warn("[Vendroid] sidebar CLOSE dispatched");
                 return true;
             } catch (e) {
                 console.error("[Vendroid] Swipe: sidebar CLOSE dispatch failed: " + e.message);
@@ -402,7 +412,10 @@ div[class^="prompt_"] {
                 if (gid) {
                     var router = navRouter();
                     if (router && typeof router.transitionToGuild === "function") {
-                        try { router.transitionToGuild(gid); return true; } catch (e) {
+                        try {
+                            console.warn("[Vendroid] sidebar close: transitionToGuild " + gid);
+                            router.transitionToGuild(gid); return true;
+                        } catch (e) {
                             console.error("[Vendroid] Swipe: transitionToGuild failed: " + e.message);
                         }
                     }
@@ -412,7 +425,10 @@ div[class^="prompt_"] {
                 dispatchSidebarClose();
             }
             try {
-                if (window.history.length > 1) { window.history.back(); return true; }
+                if (window.history.length > 1) {
+                    console.warn("[Vendroid] sidebar close: history.back");
+                    window.history.back(); return true;
+                }
             } catch (e) {}
             return false;
         }
@@ -425,6 +441,18 @@ div[class^="prompt_"] {
                 }
             }
             return false;
+        }
+
+        // One VDELog line per qualifying horizontal swipe, whether it acts
+        // or is rejected, so a dead swipe always leaves a trace. Gates before
+        // the geometry check stay silent (they fire on every tap/scroll).
+        function swipeLog(msg, dx, dy) {
+            try {
+                var s = sidebarDebugState();
+                console.warn("[Vendroid] swipe " + msg + " dx=" + dx + " dy=" + dy +
+                    " flux=" + s.flux + " dom=" + s.dom + " store=" + s.store +
+                    " burger=" + s.burger + " path=" + s.path);
+            } catch (e) {}
         }
 
         document.addEventListener("touchstart", function(event) {
@@ -464,35 +492,49 @@ div[class^="prompt_"] {
                 // long horizontal drag with vertical drift.
                 if (Math.abs(dx) < 60 || Math.abs(dx) < 1.5 * Math.abs(dy)) return;
                 if (Date.now() - startT > 600) return;       // drag, not swipe
-                if (swipeTargetScrollable(startTarget)) return;
+                if (swipeTargetScrollable(startTarget)) { swipeLog("rejected: scrollable target", dx, dy); return; }
 
-                if (searchOverlayVisible()) return;
+                if (searchOverlayVisible()) { swipeLog("rejected: search overlay", dx, dy); return; }
 
                 // Fresh state per swipe; each branch performs at most one
                 // action.
-                var sidebarOpen = isSidebarOpen;
-                sidebarDriftCanary();
-                if (layerBlocksSwipe(sidebarOpen)) return;
+                var sidebarOpen = syncSidebarOpenFromDom();
+                if (layerBlocksSwipe(sidebarOpen)) {
+                    swipeLog("rejected: layer open, sidebarOpen=" + (sidebarOpen ? 1 : 0), dx, dy);
+                    return;
+                }
 
                 var membersOpen = false;
                 try { membersOpen = !!document.querySelector("div[class^='members_']"); } catch (e) {}
+                var inGuild = guildContext();
 
                 if (dx < 0) {
                     // Left swipe (right to left).
                     if (sidebarOpen) {
+                        swipeLog("action: closeSidebar", dx, dy);
                         closeSidebar();
-                    } else if (!membersOpen && guildContext()) {
+                    } else if (!membersOpen && inGuild) {
+                        swipeLog("action: toggleMembers (open)", dx, dy);
                         toggleMembers();
+                    } else {
+                        swipeLog("no-op: left, sidebar=" + (sidebarOpen ? 1 : 0) +
+                            " members=" + (membersOpen ? 1 : 0) + " guild=" + (inGuild ? 1 : 0), dx, dy);
                     }
                     return;
                 }
 
                 // Right swipe (left to right).
                 if (membersOpen && !sidebarOpen) {
+                    swipeLog("action: toggleMembers (close)", dx, dy);
                     toggleMembers();
                     return;
                 }
-                if (!sidebarOpen) openSidebar();
+                if (!sidebarOpen) {
+                    swipeLog("action: openSidebar", dx, dy);
+                    openSidebar();
+                } else {
+                    swipeLog("no-op: right, sidebar already open", dx, dy);
+                }
             } catch (e) {
                 console.error("[Vendroid] gesture handler error: " + e.message);
             }

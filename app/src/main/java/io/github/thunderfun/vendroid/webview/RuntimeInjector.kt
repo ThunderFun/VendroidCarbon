@@ -32,7 +32,7 @@ internal object RuntimeInjector {
             // Gate flag + env shim must precede the bundle
             // (see JsPatches.vencordPreludeJs).
             view.evaluateJavascript(
-                JsPatches.vencordPreludeJs(HttpClient.userCssDisabled) + ";" + runtime + ";",
+                JsPatches.vencordPreludeJs(HttpClient.userCssDisabled, HttpClient.userPluginsDisabled) + ";" + runtime + ";",
                 null
             )
             view.evaluateJavascript(mobileRuntime + ";", null)

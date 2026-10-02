@@ -6,11 +6,33 @@
         var fd = findFluxDispatcher();
         if (fd) {
             try {
-                fd.subscribe("MOBILE_WEB_SIDEBAR_OPEN", () => { isSidebarOpen = true; });
-                fd.subscribe("MOBILE_WEB_SIDEBAR_CLOSE", () => { isSidebarOpen = false; });
+                fd.subscribe("MOBILE_WEB_SIDEBAR_OPEN", () => { isSidebarOpen = true; logSidebarState("sub OPEN"); });
+                fd.subscribe("MOBILE_WEB_SIDEBAR_CLOSE", () => { isSidebarOpen = false; logSidebarState("sub CLOSE"); });
                 console.warn("[Vendroid] FluxDispatcher subscribed OK");
             } catch(e) {
                 console.error("[Vendroid] FluxDispatcher subscribe FAILED: " + e.message);
+            }
+            // Diagnostic: log every sidebar-related dispatch Discord itself
+            // sends (route switches included) plus CHANNEL_SELECT as the
+            // channel-switch marker. Transparent passthrough otherwise.
+            try {
+                if (!fd.__vdeSidebarLogInstalled) {
+                    fd.__vdeSidebarLogInstalled = true;
+                    var rawDispatch = fd.dispatch.bind(fd);
+                    fd.dispatch = function(action) {
+                        try {
+                            var t = action && action.type;
+                            if (typeof t === "string" &&
+                                (t.indexOf("SIDEBAR") !== -1 || t === "CHANNEL_SELECT")) {
+                                logSidebarState("dispatch " + t);
+                            }
+                        } catch(e) {}
+                        return rawDispatch(action);
+                    };
+                    console.warn("[Vendroid] sidebar dispatch logger installed");
+                }
+            } catch(e) {
+                console.error("[Vendroid] sidebar dispatch logger FAILED: " + e.message);
             }
         } else {
             console.error("[Vendroid] FluxDispatcher not available!");

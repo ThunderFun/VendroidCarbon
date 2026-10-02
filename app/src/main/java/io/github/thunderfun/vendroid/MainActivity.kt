@@ -722,6 +722,22 @@ class MainActivity : AppCompatActivity() {
             editor.putBoolean(SettingKeys.KEY_DISABLE_THEMES, false)
             editor.apply()
         }
+        // One-shot recovery flag for the "Disable plugins" card. VendroidApp
+        // already raised the in-memory gate at process start; this read only
+        // drives the toast and the reset, and sits outside the branch below
+        // because a plugins-disabled session loads Vencord normally.
+        val disablePlugins = sPrefs.getBooleanSafe(
+            SettingKeys.KEY_DISABLE_PLUGINS, false, poisonDefault = true
+        ) {
+            VDELog.w("Main", "disablePlugins type-poisoned; failing safe: $it")
+        }
+        if (disablePlugins) {
+            Toast.makeText(this, "User plugins disabled for this session", Toast.LENGTH_SHORT)
+                .show()
+            VDELog.w("Main", "User plugins disabled for this session; resetting one-shot flag")
+            editor.putBoolean(SettingKeys.KEY_DISABLE_PLUGINS, false)
+            editor.apply()
+        }
         if (!HttpClient.vencordDisabled && !safeMode) {
             vencordNative = VencordNative(WeakReference(this), wv!!)
             wv?.addJavascriptInterface(vencordNative, "VencordMobileNative")

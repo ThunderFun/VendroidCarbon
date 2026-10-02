@@ -41,6 +41,15 @@ internal object SettingKeys {
      */
     const val KEY_DISABLE_THEMES = "disableThemes"
 
+    /**
+     * One-shot flag for the recovery "Disable plugins" action: the next :web
+     * boot starts only required plugins and their dependencies, while Vencord
+     * keeps loading. Reset by MainActivity's first boot read, like
+     * [KEY_DISABLE_THEMES]. Kept out of the bridge allowlist so page JS can
+     * neither read nor write it.
+     */
+    const val KEY_DISABLE_PLUGINS = "disablePlugins"
+
     /** First-run security warning acceptance; gates WebView prewarm and startup. */
     const val KEY_RISK_WARNING_ACCEPTED = "riskWarningAccepted"
 

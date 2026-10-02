@@ -149,19 +149,20 @@ object JsPatches {
         get() = NETWORK_FIREWALL_JS + ";" + ANIMATION_PATCH_JS + ";" + CSP_VIOLATION_REPORTER_JS
 
     /**
-     * [VENCORD_PRELUDE_JS] prefixed with the user-theme gate flag. The flag
-     * must be set before the prelude runs: the prelude installs the
-     * VencordNative setter trap that neuters uploaded themes only when the
-     * flag is on. Both injection paths (RuntimeInjector's eval chain and
-     * ResponseHtmlInjector's `</head>` embed) must call this function, not
-     * use the raw prelude, or that path runs without the trap.
+     * [VENCORD_PRELUDE_JS] prefixed with the recovery session gates. The
+     * flags must be set before the prelude runs; the themes flag gates the
+     * prelude's VencordNative setter trap, and the plugins flag is read later
+     * by the patched plugin manager and by vencord_mobile.js. Both injection
+     * paths (RuntimeInjector's eval chain and ResponseHtmlInjector's
+     * `</head>` embed) must call this function, not use the raw prelude.
      *
-     * Callers pass the in-memory gate (HttpClient.userCssDisabled), not the
-     * pref: MainActivity resets the pref one-shot while the gate stays
-     * raised for the life of the process.
+     * Callers pass the in-memory gates (HttpClient.userCssDisabled,
+     * HttpClient.userPluginsDisabled), not the prefs: MainActivity resets the
+     * prefs one-shot while the gates stay raised for the life of the process.
      */
-    fun vencordPreludeJs(userThemesDisabled: Boolean): String =
-        "window.VENCORD_USER_THEMES_DISABLED=$userThemesDisabled;" + VENCORD_PRELUDE_JS
+    fun vencordPreludeJs(userThemesDisabled: Boolean, userPluginsDisabled: Boolean): String =
+        "window.VENCORD_USER_THEMES_DISABLED=$userThemesDisabled;" +
+            "window.VENCORD_USER_PLUGINS_DISABLED=$userPluginsDisabled;" + VENCORD_PRELUDE_JS
 
     /**
      * Environment prelude that must run BEFORE the Vencord bundle on every

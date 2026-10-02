@@ -37,15 +37,49 @@ internal object BundlePatcher {
      * three sourceURL anchors are verified present exactly once in both
      * vanilla release bundles (vencord_snapshot.js / equicord_snapshot.js).
      *
-     * The vde-off-* patches are the only ones that change behavior. They
-     * turn WebPWA, WebScreenShare and WebScreenShareFixes off by default;
-     * all three are desktop-oriented and are dead weight or dead code
-     * inside the Android WebView.
-     * They pair with the runtime's one-time default-off sweep in
+     * The vde-off-* patches flip WebPWA, WebScreenShare and
+     * WebScreenShareFixes off by default; all three are desktop-oriented
+     * and are dead weight or dead code inside the Android WebView. They
+     * pair with the runtime's one-time default-off sweep in
      * vencord_mobile.js (00-boot.js), which migrates settings persisted by
-     * older builds and covers a missed anchor.
+     * older builds and covers a missed anchor. The vde-user-plugins-gate
+     * patch is the other behavior-changing one: it makes startAllPlugins
+     * honor the recovery plugins gate.
      */
     private const val SAME_ORIGIN_SOURCE_URL = "https://discord.com/vencord-web.js"
+
+    private const val USER_PLUGINS_GATE_MARKER = "/*vde-user-plugins-gate*/"
+
+    /**
+     * Makes startAllPlugins skip every plugin that is not required and not a
+     * dependency while the recovery session flag is raised. The condition goes
+     * into the enablement check, so staged starts (Init, WebpackReady,
+     * DOMContentLoaded) keep their normal ordering for required plugins and
+     * skip user plugins.
+     *
+     * Anchored on the "Starting plugins (stage ...)" log literal; all minified
+     * identifiers (loop var, registry, isPluginEnabled, predicate argument)
+     * are captured, so a rename in a future bundle keeps matching. A miss
+     * logs "Patch matched nothing" and the 00-boot belt is the fallback.
+     */
+    private val userPluginsGatePatch = BundlePatch(
+        Regex(
+            "(Starting plugins \\(stage \\$\\{[A-Za-z_$][\\w$]*\\}\\)`\\);)" +
+                "(for\\(let ([A-Za-z_$][\\w$]*) in ([A-Za-z_$][\\w$]*)\\)if\\()" +
+                "([A-Za-z_$][\\w$]*)\\(\\3\\)(\\)\\{)"
+        ),
+        replacement = USER_PLUGINS_GATE_MARKER,
+        marker = USER_PLUGINS_GATE_MARKER,
+        transform = { m ->
+            m.groupValues[1] + m.groupValues[2] +
+                m.groupValues[5] + "(" + m.groupValues[3] + ")" +
+                "&&(!window.VENCORD_USER_PLUGINS_DISABLED||" +
+                m.groupValues[4] + "[" + m.groupValues[3] + "].required||" +
+                m.groupValues[4] + "[" + m.groupValues[3] + "].isDependency)" +
+                m.groupValues[6] + USER_PLUGINS_GATE_MARKER
+        }
+    )
+
     internal val vencordRuntimePatches: List<BundlePatch> = listOf(
         BundlePatch(
             Regex.escape("//# sourceURL=file:///VencordWeb").toRegex(),
@@ -64,7 +98,8 @@ internal object BundlePatcher {
         ),
         defaultOffPatch("WebPWA", "/*vde-off-pwa*/"),
         defaultOffPatch("WebScreenShare", "/*vde-off-wss*/"),
-        defaultOffPatch("WebScreenShareFixes", "/*vde-off-wssf*/")
+        defaultOffPatch("WebScreenShareFixes", "/*vde-off-wssf*/"),
+        userPluginsGatePatch
     )
 
     /**

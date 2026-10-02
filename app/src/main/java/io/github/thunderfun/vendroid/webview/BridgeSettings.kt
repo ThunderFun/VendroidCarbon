@@ -102,9 +102,9 @@ internal object BridgeSettings {
     // as writes: it selects the code the app downloads and executes, and
     // a custom value can carry credentials in its query string.
     //
-    // Recovery-only flags (SettingKeys.KEY_SAFE_MODE, KEY_DISABLE_THEMES)
-    // stay absent: the recovery screen owns them, and page JS must not be
-    // able to read or flip them.
+    // Recovery-only flags (SettingKeys.KEY_SAFE_MODE, KEY_DISABLE_THEMES,
+    // KEY_DISABLE_PLUGINS) stay absent: the recovery screen owns them, and
+    // page JS must not be able to read or flip them.
     internal fun isBridgeKeyAllowed(id: String): Boolean =
         id != SettingKeys.KEY_VENCORD_LOCATION &&
             (id == SettingKeys.KEY_CLIENT_MOD ||

@@ -105,6 +105,20 @@ object HttpClient {
     var userCssDisabled: Boolean = false
 
     /**
+     * Session switch for the recovery "Disable plugins" action. Raised at
+     * process start by VendroidApp.applyUserPluginsGate from the one-shot
+     * "disablePlugins" pref; never cleared for the life of the process, and
+     * not re-read from the pref because MainActivity resets it one-shot at
+     * startup (same shape as [vencordDisabled] and [userCssDisabled]).
+     *
+     * While raised, the plugin manager starts only required plugins and
+     * dependencies. Plugin settings stay untouched, so the Plugins tab shows
+     * real state and the user's own toggles persist normally.
+     */
+    @Volatile
+    var userPluginsDisabled: Boolean = false
+
+    /**
      * True once a bundle fetch or revalidation has completed in this process
      * (via [fetchVencord]). The warm-navigation
      * fast path keys on this rather than `VencordRuntime != null`, which the

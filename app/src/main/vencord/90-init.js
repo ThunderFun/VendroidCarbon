@@ -109,6 +109,8 @@
                         String(_vendroidSearchOverlay.el.style.display) : "absent") +
                     " side=" + isSidebarOpen);
             } catch(e) {}
+            // Diagnostic: full sidebar signal snapshot at press time.
+            logSidebarState("back");
 
             if (!initialized) {
                 try {
@@ -142,19 +144,22 @@
                 return true;
             }
 
-            // Modal-fallback sessions skip our overlay root; Discord's esc
-            // binding drives them, so its action consumes the press here —
-            // falling through would open the sidebar over an open Discord
-            // layer. Skipped when no layer is open (see discordLayerOpen): the
-            // press must unwind the sidebar below.
+            // Modal-fallback sessions skip our overlay root, so Discord's esc
+            // binding drives them; its action consumes the press. Falling
+            // through would open the sidebar over an open Discord layer. Only
+            // runs when discordLayerOpen() reports a layer; otherwise the
+            // press reaches the sidebar logic below.
             var meh = getModalEscapeHandler();
             if (meh && typeof meh.action === "function" && discordLayerOpen()) {
                 try {
                     meh.action();
-                    return true;
                 } catch(e) {
+                    // Esc bindings read the key event, which we do not pass.
+                    // The layer is still open, so consume the press rather
+                    // than opening the sidebar over it.
                     console.error("[Vendroid] ModalEscapeHandler action threw: " + e.message);
                 }
+                return true;
             }
 
             const quickCssWin = window.__VENCORD_MONACO_WIN__?.deref();
@@ -163,6 +168,11 @@
                 delete window.__VENCORD_MONACO_WIN__;
                 return true;
             }
+
+            // The Flux flag can be stale (see syncSidebarOpenFromDom in
+            // 00-boot.js). Re-derive from the DOM before branching so back
+            // and swipes never disagree about the sidebar state.
+            syncSidebarOpenFromDom();
 
             if (!isSidebarOpen) {
                 var fd = findFluxDispatcher();

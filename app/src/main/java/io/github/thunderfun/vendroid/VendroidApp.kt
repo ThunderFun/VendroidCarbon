@@ -79,21 +79,26 @@ class VendroidApp : Application() {
             // (see HttpClient.userCssDisabled).
             applyUserCssGate()
 
-            // 8. Pre-load the Vencord runtimes on a background thread.
+            // 8. Read the one-shot disablePlugins flag and raise the plugin
+            // session gate; Vencord keeps loading
+            // (see HttpClient.userPluginsDisabled).
+            applyUserPluginsGate()
+
+            // 9. Pre-load the Vencord runtimes on a background thread.
             preloadVencordRuntimes()
 
-            // 9. Pre-fetch the Vencord CSS files, the only startup work that
+            // 10. Pre-fetch the Vencord CSS files, the only startup work that
             // touches the network; gated on first-run consent (step 4) and
             // safe mode (step 6).
             if (riskAccepted && !safeMode) prefetchVencordCss()
 
-            // 10. Sweep stale CSS cache entries; local prefs only, no network.
+            // 11. Sweep stale CSS cache entries; local prefs only, no network.
             sweepStaleCssCacheEntries(bootPrefs)
 
-            // 11. Warm up the Chromium cookie DB.
+            // 12. Warm up the Chromium cookie DB.
             warmUpCookieManager()
 
-            // 12. Preload the persisted main-frame shell off the UI thread.
+            // 13. Preload the persisted main-frame shell off the UI thread.
             preloadMainFrameDiskCache()
         }
     }
@@ -313,6 +318,29 @@ class VendroidApp : Application() {
         if (disabled) {
             HttpClient.userCssDisabled = true
             VDELog.w("VDE", "User themes disabled for this session (recovery one-shot)")
+        }
+    }
+
+    /**
+     * Recovery "Disable plugins": raise the session switch that makes
+     * Vencord's plugin manager skip non-required plugins. Read
+     * synchronously before any WebView request, same ordering rationale as
+     * [applyUserCssGate].
+     *
+     * MainActivity owns the one-shot reset, so the toast and the type-poison
+     * heal happen once per launch on the UI path. poisonDefault = true: a
+     * String-typed key reads as "suppressed" instead of crash-looping :web.
+     * A wrong read only skips plugins for one session; MainActivity's reset
+     * rewrites the key as a Boolean.
+     */
+    private fun applyUserPluginsGate() {
+        val disabled = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
+            .getBooleanSafe(SettingKeys.KEY_DISABLE_PLUGINS, false, poisonDefault = true) {
+                VDELog.w("VDE", "disablePlugins type-poisoned; failing safe: $it")
+            }
+        if (disabled) {
+            HttpClient.userPluginsDisabled = true
+            VDELog.w("VDE", "User plugins disabled for this session (recovery one-shot)")
         }
     }
 

@@ -64,11 +64,12 @@ class RecoveryActivity : AppCompatActivity() {
 
         findViewById<MaterialCardView>(R.id.start_normally).setOnClickListener {
             it.isClickable = false
-            // Clear both one-shot recovery flags so "Start normally" boots
-            // clean and re-enables themes.
+            // Clear all three one-shot recovery flags so "Start normally"
+            // boots clean and re-enables themes and plugins.
             restartWith { e ->
                 e.putBoolean(SettingKeys.KEY_SAFE_MODE, false)
                 e.putBoolean(SettingKeys.KEY_DISABLE_THEMES, false)
+                e.putBoolean(SettingKeys.KEY_DISABLE_PLUGINS, false)
             }
         }
         findViewById<MaterialCardView>(R.id.safe_mode).setOnClickListener {
@@ -81,6 +82,13 @@ class RecoveryActivity : AppCompatActivity() {
         findViewById<MaterialCardView>(R.id.disable_themes).setOnClickListener {
             it.isClickable = false
             restartWith { e -> e.putBoolean(SettingKeys.KEY_DISABLE_THEMES, true) }
+        }
+        // One-shot: the next boot starts only required plugins (Vencord still
+        // loads) so the user can disable the broken plugin in Vencord's
+        // Plugins panel; plugins return on the next normal start.
+        findViewById<MaterialCardView>(R.id.disable_plugins).setOnClickListener {
+            it.isClickable = false
+            restartWith { e -> e.putBoolean(SettingKeys.KEY_DISABLE_PLUGINS, true) }
         }
         findViewById<MaterialCardView>(R.id.force_update).setOnClickListener {
             it.isClickable = false

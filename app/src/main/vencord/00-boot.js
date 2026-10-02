@@ -397,18 +397,56 @@
         console.error("[Vendroid] ModalEscapeHandler FAILED: " + e.message);
     }
 
-    // Discord's esc binding throws "Reflect.get called on non-object" on an
-    // empty layer stack, so the action only runs when a layer is rendered.
-    // Modals, popouts and context menus mount in the layer containers;
-    // tooltips match too, and a throw there just lands in the call-site catch.
+    // Webpack lookups for the stores that report open overlays: the flux
+    // layer stack, the modal stack, the context menu. Late chunks need
+    // retries; whatever resolves is kept.
+    var _vdeOverlayStores = { layers: null, modals: null, ctx: null, tries: 0 };
+    function vendroidOverlayStores() {
+        var s = _vdeOverlayStores;
+        if (s.tries >= 30) return s;
+        s.tries++;
+        try {
+            if (typeof Vencord === "undefined" || !Vencord.Webpack) return s;
+            s.layers = s.layers || Vencord.Webpack.findByProps("hasLayers", "getLayers") || null;
+            s.modals = s.modals || Vencord.Webpack.findByProps("getOpenModalKeys", "closeModal") || null;
+            s.ctx = s.ctx || Vencord.Webpack.findByProps("getContextMenu", "isOpen") || null;
+        } catch(e) {}
+        return s;
+    }
+
+    // Is a Discord overlay open? Gate for the back press and swipes. Reads
+    // the stores Discord's own shortcuts use (mod+k checks
+    // LayerStore.hasLayers()). The layer containers keep mounted-but-empty
+    // children, so the old childElementCount probe reported "open" with
+    // nothing on screen, rejecting swipes and consuming back presses. The
+    // DOM probe remains only when webpack is unavailable, and counts a
+    // child only if it renders.
     function discordLayerOpen() {
+        var s = vendroidOverlayStores();
+        if (s.layers || s.modals || s.ctx) {
+            try {
+                if (s.layers && s.layers.hasLayers && s.layers.hasLayers()) return true;
+                if (s.ctx && s.ctx.isOpen && s.ctx.isOpen()) return true;
+                if (s.modals && s.modals.getOpenModalKeys) {
+                    var keys = s.modals.getOpenModalKeys();
+                    if (keys && (keys.length > 0 || (typeof keys.size === "number" && keys.size > 0))) return true;
+                }
+            } catch(e) {
+                return true;
+            }
+            return false;
+        }
         try {
             var containers = document.querySelectorAll('[class*="layerContainer"]');
             // No containers at all (markup change): fail open to the previous
             // unconditional call instead of breaking modal closing.
             if (containers.length === 0) return true;
             for (var i = 0; i < containers.length; i++) {
-                if (containers[i].childElementCount > 0) return true;
+                var kids = containers[i].children;
+                for (var j = 0; j < kids.length; j++) {
+                    var r = kids[j].getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) return true;
+                }
             }
         } catch(e) {
             return true;
@@ -422,6 +460,114 @@
         // Sidebar is typically showing (channel/DM list) when not inside a specific channel view.
         isSidebarOpen = !/^\/channels\/[^\/]+\/[^\/]+$/.test(path);
     } catch(e) {}
+
+    // Sidebar state reconciliation + diagnostics (temporary, for the
+    // channel-switch gesture bug).
+    //
+    // What the current Discord bundle actually does:
+    //   - MobileWebSidebarStore.getIsOpen() = !platform.isMobile || sI, with
+    //     sI flipped only by MOBILE_WEB_SIDEBAR_OPEN/CLOSE.
+    //   - Its own route listener dispatches those actions on channel switches,
+    //     and the sidebar container unmounts when closed.
+    //   - btnHamburger__ is dead: the open button dispatches OPEN directly.
+    //   - div[class^='sidebar_'] also matches unrelated components (settings
+    //     pages, thread sidebars), so a bare DOM probe can read a false
+    //     "open".
+    //
+    // Reconciliation order in syncSidebarOpenFromDom(): the store when it
+    // resolves (same source Discord's UI uses), then a rendered-shell check
+    // with sidebar_ absence meaning closed, then the legacy hamburger. Every
+    // correction and every state change logs to VDELog so a dead swipe can
+    // be traced.
+
+    var _vendroidSidebarStore = null;
+    var _vendroidSidebarStoreScans = 0;
+    var _vendroidSidebarStoreLogged = false;
+    function mobileWebSidebarStore() {
+        if (_vendroidSidebarStore || _vendroidSidebarStoreScans >= 60) return _vendroidSidebarStore;
+        try {
+            if (typeof Vencord === "undefined" || !Vencord.Webpack) return null;
+            _vendroidSidebarStoreScans++;
+            _vendroidSidebarStore = Vencord.Webpack.find(function(m) {
+                return m && m.displayName === "MobileWebSidebarStore" && typeof m.getIsOpen === "function";
+            }) || null;
+            if (_vendroidSidebarStore && !_vendroidSidebarStoreLogged) {
+                _vendroidSidebarStoreLogged = true;
+                console.warn("[Vendroid] sidebar: MobileWebSidebarStore resolved");
+            }
+        } catch(e) {}
+        if (!_vendroidSidebarStore && _vendroidSidebarStoreScans >= 60 && !_vendroidSidebarStoreLogged) {
+            _vendroidSidebarStoreLogged = true;
+            console.warn("[Vendroid] sidebar: MobileWebSidebarStore not reachable via webpack (store=null in logs)");
+        }
+        return _vendroidSidebarStore;
+    }
+
+    // One snapshot of every sidebar-related signal. dom=null/burger=null/
+    // store=null mean the probe threw, not "absent".
+    function sidebarDebugState() {
+        var s = { flux: isSidebarOpen ? 1 : 0, dom: null, burger: null, store: null, path: "" };
+        try { s.dom = document.querySelector("div[class^='sidebar_']") ? 1 : 0; } catch(e) {}
+        try { s.burger = document.querySelector("button[class^='btnHamburger__']") ? 1 : 0; } catch(e) {}
+        try {
+            var store = mobileWebSidebarStore();
+            if (store && typeof store.getIsOpen === "function") s.store = store.getIsOpen() ? 1 : 0;
+        } catch(e) {}
+        try { s.path = window.location.pathname; } catch(e) {}
+        return s;
+    }
+
+    function logSidebarState(event) {
+        try {
+            var s = sidebarDebugState();
+            console.warn("[Vendroid] sidebar " + event + ": flux=" + s.flux + " dom=" + s.dom +
+                " store=" + s.store + " burger=" + s.burger + " path=" + s.path);
+        } catch(e) {}
+    }
+
+    function syncSidebarOpenFromDom() {
+        var s;
+        try { s = sidebarDebugState(); } catch(e) { return isSidebarOpen; }
+        var resolved = null;
+        if (s.store !== null) {
+            resolved = s.store === 1;
+        } else if (s.dom === 1) {
+            // sidebar_ present. Can also match settings/thread sidebars, so
+            // never force the flag open from this alone.
+            resolved = null;
+        } else {
+            // No sidebar_ element anywhere. Closed, but only trust it once
+            // the app shell exists (pre-render would clobber the boot
+            // path-derived value).
+            var shell = s.burger === 1;
+            if (!shell) {
+                try { shell = !!document.querySelector("[class^='base_'], [class^='chat_']"); } catch(e) {}
+            }
+            if (shell) resolved = false;
+        }
+        if (resolved === null || resolved === isSidebarOpen) return isSidebarOpen;
+        console.warn("[Vendroid] sidebar correct: flux=" + (isSidebarOpen ? 1 : 0) + " -> " + (resolved ? 1 : 0) +
+            " dom=" + s.dom + " store=" + s.store + " burger=" + s.burger + " path=" + s.path);
+        isSidebarOpen = resolved;
+        return isSidebarOpen;
+    }
+
+    // Diagnostic 1s poll: logs only when a signal changes (including route),
+    // so a channel switch shows exactly which signal moved and when.
+    // Remove together with the other sidebar diagnostics once the drift is
+    // identified.
+    var _vendroidSidebarPollSig = null;
+    setInterval(function() {
+        try {
+            if (document.hidden) return;
+            var s = sidebarDebugState();
+            var sig = s.flux + "|" + s.dom + "|" + s.store + "|" + s.burger + "|" + s.path;
+            if (sig === _vendroidSidebarPollSig) return;
+            _vendroidSidebarPollSig = sig;
+            logSidebarState("poll");
+        } catch(e) {}
+    }, 1000);
+
     let initialized = false;
 
     // Desktop-oriented plugins upstream ships with enabledByDefault:true
@@ -504,14 +650,21 @@
 
     function recoverPlugins() {
         applyPluginDefaultOff();
+        stopGateSuppressedPlugins();
         try {
             const plugins = Vencord.Plugins.plugins;
             const total = Object.keys(plugins).length;
             const enabled = Object.values(plugins).filter(p => Vencord.Plugins.isPluginEnabled(p.name)).length;
             console.warn("[Vendroid] Plugin state: " + enabled + "/" + total + " enabled");
 
+            // Gated session: force-enable only required plugins. An
+            // enabledByDefault plugin the user disabled must stay off; this
+            // pass starts directly (bypassing startAllPlugins) and writes
+            // enabled:true, outside the gate's no-settings-writes contract.
+            const gated = !!window.VENCORD_USER_PLUGINS_DISABLED;
             const disabledRequired = Object.values(plugins).filter(p =>
-                (p.required || p.enabledByDefault) && !Vencord.Plugins.isPluginEnabled(p.name)
+                (p.required || (p.enabledByDefault && !gated)) &&
+                !Vencord.Plugins.isPluginEnabled(p.name)
             );
             console.warn("[Vendroid] " + disabledRequired.length + " required/default plugins are disabled");
             let successCount = 0;
@@ -542,7 +695,35 @@
         }
     }
 
+    // Belt for a missed bundle patch: the patch gates startAllPlugins at
+    // download time; this stops anything it already started. It only covers
+    // the WebpackReady-stage set, so a bundle-driven start after this pass
+    // still slips through. The patch remains the primary gate.
+    function stopGateSuppressedPlugins() {
+        if (!window.VENCORD_USER_PLUGINS_DISABLED) return;
+        try {
+            var stopped = 0;
+            Object.values(Vencord.Plugins.plugins).forEach(function(p) {
+                if (p.started && !p.required && !p.isDependency) {
+                    try {
+                        Vencord.Plugins.stopPlugin(p);
+                        stopped++;
+                    } catch(e) {}
+                }
+            });
+            if (stopped) {
+                console.warn("[Vendroid] User plugins gate: stopped " + stopped + " running plugin(s)");
+            }
+        } catch(e) {
+            console.error("[Vendroid] User plugins gate failed: " + e.message);
+        }
+    }
+
     function tryStartPluginsStage() {
+        if (window.VENCORD_USER_PLUGINS_DISABLED) {
+            console.warn("[Vendroid] startAllPlugins skipped: user plugins disabled for this session");
+            return;
+        }
         try {
             var stages = {};
             Object.values(Vencord.Plugins.plugins).forEach(function(p) {

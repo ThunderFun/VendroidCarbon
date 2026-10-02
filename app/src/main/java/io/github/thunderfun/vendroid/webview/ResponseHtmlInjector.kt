@@ -80,7 +80,7 @@ internal object ResponseHtmlInjector {
                 .append("</script>")
                 // Gate flag then env shim must precede the bundle
                 // (see JsPatches.vencordPreludeJs).
-                .append("<script>").append(JsPatches.vencordPreludeJs(HttpClient.userCssDisabled)).append(';')
+                .append("<script>").append(JsPatches.vencordPreludeJs(HttpClient.userCssDisabled, HttpClient.userPluginsDisabled)).append(';')
                 .append(escapedOf(escapedRuntimeRef, runtime!!)).append(';')
                 .append(escapedOf(escapedMobileRuntimeRef, mobileRuntime!!)).append(";</script>")
         }
