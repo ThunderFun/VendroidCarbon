@@ -14,7 +14,7 @@ object ShareHelper {
 
     /**
      * Opens the system share sheet with [text] as the body and a fixed
-     * "VendroidEnhanced Logs" subject. Falls back to a toast when no app can
+     * "VendroidCarbon Logs" subject. Falls back to a toast when no app can
      * handle the share intent.
      */
     fun shareLogs(context: Context, text: String) {
@@ -22,7 +22,7 @@ object ShareHelper {
             val intent = Intent(Intent.ACTION_SEND).apply {
                 type = "text/plain"
                 putExtra(Intent.EXTRA_TEXT, text)
-                putExtra(Intent.EXTRA_SUBJECT, "VendroidEnhanced Logs")
+                putExtra(Intent.EXTRA_SUBJECT, "VendroidCarbon Logs")
             }
             context.startActivity(Intent.createChooser(intent, "Share logs"))
         } catch (_: ActivityNotFoundException) {

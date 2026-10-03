@@ -68,7 +68,7 @@ class BundleLocationGateTest {
     @Test
     fun disallowedHost_rejected() {
         val problem = HttpClient.bundleLocationFetchProblem(
-            "https://raw.githubusercontent.com/VendroidEnhanced/x/browser.js"
+            "https://raw.githubusercontent.com/VendroidCarbon/x/browser.js"
         )
         assertTrue(problem!!.contains("not in the allowed list"))
     }

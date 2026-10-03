@@ -23,10 +23,17 @@ internal object RuntimeInjector {
      * Runs the three injection evals on [view] in the pinned order:
      * bootstrap → prelude + main runtime → mobile runtime. Returns false when
      * the WebView was destroyed between the caller's liveness check and these
-     * calls (IllegalStateException), true otherwise. Boot-verify scheduling,
-     * logging, and missedInjection bookkeeping stay with the callers.
+     * calls (IllegalStateException) or when the live URL is not an app origin,
+     * true otherwise. Boot-verify scheduling, logging, and missedInjection
+     * bookkeeping stay with the callers.
      */
     fun injectViaBridge(view: WebView, runtime: String, mobileRuntime: String): Boolean {
+        // The first eval carries the process-lifetime capability token, so
+        // never evaluate unless the committed document is an app origin. Both
+        // callers check first; this keeps a future caller from reintroducing
+        // stale-document delivery.
+        val liveUrl = try { view.url } catch (_: Exception) { null }
+        if (liveUrl == null || !isDiscordAppOriginUrl(liveUrl)) return false
         try {
             view.evaluateJavascript(VencordNative.bridgeBootstrapJs() + ";", null)
             // Gate flag + env shim must precede the bundle

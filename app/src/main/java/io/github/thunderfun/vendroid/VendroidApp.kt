@@ -397,8 +397,7 @@ class VendroidApp : Application() {
                     VDELog.w("VDE", "clientMod type-poisoned; CSS prefetch assumes vencord")
                 } == "equicord"
                 val cssUrls = listOf(
-                    if (isEquicord) Constants.EQUICORD_CSS_URL else Constants.VENCORD_CSS_URL,
-                    MORE_FIXES_CSS_URL
+                    if (isEquicord) Constants.EQUICORD_CSS_URL else Constants.VENCORD_CSS_URL
                 )
                 val editor = cssPrefs.edit()
                 val now = System.currentTimeMillis()
@@ -492,8 +491,7 @@ class VendroidApp : Application() {
                 val cssPrefs = getSharedPreferences(SettingKeys.CSS_CACHE_PREFS_NAME, Context.MODE_PRIVATE)
                 val isEquicord = bootPrefs.getStringSafe(SettingKeys.KEY_CLIENT_MOD, "vencord") == "equicord"
                 val expectedKeys = setOf(
-                    CssCacheKeys.keyFor(if (isEquicord) Constants.EQUICORD_CSS_URL else Constants.VENCORD_CSS_URL),
-                    CssCacheKeys.keyFor(MORE_FIXES_CSS_URL)
+                    CssCacheKeys.keyFor(if (isEquicord) Constants.EQUICORD_CSS_URL else Constants.VENCORD_CSS_URL)
                 )
                 val editor = cssPrefs.edit()
                 var removed = 0
@@ -547,12 +545,6 @@ class VendroidApp : Application() {
         @Volatile
         var prewarmedWebView: WebView? = null
             internal set
-
-        /** Shared moreFixes.css URL, injected by vencord_mobile.js on every
-         *  page load; kept here so the prefetch and the stale-cache sweep
-         *  address the same key the runtime derives. */
-        internal const val MORE_FIXES_CSS_URL =
-            "https://raw.githubusercontent.com/VendroidEnhanced/random-files/refs/heads/main/moreFixes.css"
 
         /**
          * One-shot notice flag for MainActivity, set when

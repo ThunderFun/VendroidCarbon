@@ -6,33 +6,11 @@
         var fd = findFluxDispatcher();
         if (fd) {
             try {
-                fd.subscribe("MOBILE_WEB_SIDEBAR_OPEN", () => { isSidebarOpen = true; logSidebarState("sub OPEN"); });
-                fd.subscribe("MOBILE_WEB_SIDEBAR_CLOSE", () => { isSidebarOpen = false; logSidebarState("sub CLOSE"); });
+                fd.subscribe("MOBILE_WEB_SIDEBAR_OPEN", () => { isSidebarOpen = true; });
+                fd.subscribe("MOBILE_WEB_SIDEBAR_CLOSE", () => { isSidebarOpen = false; });
                 console.warn("[Vendroid] FluxDispatcher subscribed OK");
             } catch(e) {
                 console.error("[Vendroid] FluxDispatcher subscribe FAILED: " + e.message);
-            }
-            // Diagnostic: log every sidebar-related dispatch Discord itself
-            // sends (route switches included) plus CHANNEL_SELECT as the
-            // channel-switch marker. Transparent passthrough otherwise.
-            try {
-                if (!fd.__vdeSidebarLogInstalled) {
-                    fd.__vdeSidebarLogInstalled = true;
-                    var rawDispatch = fd.dispatch.bind(fd);
-                    fd.dispatch = function(action) {
-                        try {
-                            var t = action && action.type;
-                            if (typeof t === "string" &&
-                                (t.indexOf("SIDEBAR") !== -1 || t === "CHANNEL_SELECT")) {
-                                logSidebarState("dispatch " + t);
-                            }
-                        } catch(e) {}
-                        return rawDispatch(action);
-                    };
-                    console.warn("[Vendroid] sidebar dispatch logger installed");
-                }
-            } catch(e) {
-                console.error("[Vendroid] sidebar dispatch logger FAILED: " + e.message);
             }
         } else {
             console.error("[Vendroid] FluxDispatcher not available!");
@@ -64,6 +42,38 @@
         setTimeout(() => {
             try { VencordMobileNative.dismissLoadingScreen(); } catch(e) {}
         }, 800);
+    }
+
+    // Webpack-independent subset for sessions where Vencord never boots.
+    // Called only from the init-timeout branch in 90-init.js, and does not
+    // set `initialized`: that flag marks the full doInit path.
+    var _vendroidStandaloneInitDone = false;
+    function doInitStandalone(reason) {
+        if (_vendroidStandaloneInitDone) return;
+        _vendroidStandaloneInitDone = true;
+        // extractWebpackRequire() is otherwise reachable only through
+        // tryInitWebpack(), which needs Vencord.Webpack. Extract here so a
+        // no-Vencord session still gets a captured wreq for raw lookups.
+        if (!_vendroidCapturedWreq) {
+            try {
+                var captured = extractWebpackRequire();
+                if (captured) _vendroidCapturedWreq = captured;
+            } catch (e) {}
+        }
+        console.warn("[Vendroid] Standalone init (" + reason + "), rawWreq=" + (_vendroidCapturedWreq ? "yes" : "no"));
+        try { logVdePatchStats("standalone"); } catch (e) {}
+        // Isolated: a CSS failure must not cost gestures, and vice versa.
+        try { applyVendroidPluginCss(); } catch (e) {
+            console.error("[Vendroid] Standalone CSS failed: " + (e && e.message ? e.message : e));
+        }
+        try { setupGestures(); } catch (e) {
+            console.error("[Vendroid] Standalone gestures failed: " + (e && e.message ? e.message : e));
+        }
+        // Native splash timeout is 30s; the init timeout is 15s, so dismiss
+        // here or the splash would linger for another 15s.
+        setTimeout(() => {
+            try { VencordMobileNative.dismissLoadingScreen(); } catch (e) {}
+        }, 0);
     }
 
     // Force Slate on Android to restore the command browser. Discord disables

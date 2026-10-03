@@ -135,6 +135,24 @@ internal fun credentialHeadersPartition(headers: Map<String, String>): String {
     return sb.toString()
 }
 
+/**
+ * True when a URL-keyed stale shell may serve a request. The shell's
+ * [shellRequestKey] must equal [requestKey] (method + [VARIANT_HEADERS] +
+ * credential partition; see VWebviewClient.cacheKey) and both partitions must
+ * match. A null [shellRequestKey] (legacy entry) always misses. The partition
+ * is checked separately even though it is part of the key, so a future
+ * cacheKey change cannot drop account isolation.
+ */
+internal fun staleShellMatches(
+    shellRequestKey: String?,
+    shellCredentialPartition: String,
+    requestKey: String,
+    requestCredentialPartition: String
+): Boolean =
+    shellRequestKey != null &&
+        shellRequestKey == requestKey &&
+        shellCredentialPartition == requestCredentialPartition
+
 private val VENCORD_INCOMPATIBLE_CSP_DIRECTIVES = hashSetOf(
     "default-src", "script-src", "script-src-elem", "script-src-attr",
     "style-src", "style-src-elem", "style-src-attr",

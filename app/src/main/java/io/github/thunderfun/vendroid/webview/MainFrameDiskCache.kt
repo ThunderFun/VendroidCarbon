@@ -28,10 +28,12 @@ import kotlin.concurrent.withLock
  *    **never** cached, so a stale copy cannot be re-served into a sensitive flow.
  *  - Stale entries are served only within [MAX_AGE_MS]; beyond that the cache is
  *    treated as a miss so ancient markup is never shown.
- *  - Each entry stores the credential partition token of the fetch. The serve
- *    path rejects a shell whose token differs from the requesting
- *    navigation's, so URL-keyed storage cannot swap bodies across credential
- *    contexts.
+ *  - Each entry stores both the credential partition token and the full
+ *    request key of the fetch (method + variant headers + credential
+ *    partition). The serve path rejects a shell whose key or token differs
+ *    from the request's, so URL-keyed storage cannot swap bodies across
+ *    credential contexts or request variants (e.g. a different Accept).
+ *    Entries written before the key existed always miss.
  *  - Disk is self-reclaiming: each committed write sweeps entries older than
  *    [MAX_AGE_MS], so evicted or orphaned entries cannot accumulate on disk.
  *  - Writes are atomic (`.tmp` + `renameTo`) and the file is size-capped.
@@ -53,6 +55,10 @@ import kotlin.concurrent.withLock
     /** Reserved meta key carrying the credential partition; "@" is not valid
      *  in an HTTP field name, so it can never collide with a stored header. */
     private const val CREDENTIAL_META_KEY = "@cred"
+
+    /** Reserved meta key carrying the full request key; see
+     *  [CachedMainFrame.requestKey]. */
+    private const val REQUEST_KEY_META_KEY = "@rkey"
 
     /** Serializes the index.txt read-modify-write and the post-write stale sweep. */
     private val indexAddLock = ReentrantLock()
@@ -121,9 +127,11 @@ import kotlin.concurrent.withLock
      * Persists a raw HTML main-frame response. No-op unless [isCacheableRoute]
      * passes and the body is within the size cap. [headers] must be the
      * fetch-path's sanitized headers so a stale serve preserves security headers.
-     * [credentialPartition] is the request's credential-context token ("" when
-     * none was visible); it is stored in the meta and checked by the serve
-     * path. [reasonPhrase] is stored in the meta and replayed on a stale serve.
+     * [credentialPartition] is the request's credential partition token ("" when
+     * none was visible); [requestKey] is its full request key (see
+     * [CachedMainFrame.requestKey]). The serve path checks both; a null
+     * [requestKey] marks a legacy entry that always misses. [reasonPhrase] is
+     * stored and replayed on a stale serve.
      */
     fun writeMainFrame(
         urlString: String,
@@ -131,7 +139,8 @@ import kotlin.concurrent.withLock
         headers: Map<String, String>,
         reasonPhrase: String = "OK",
         credentialPartition: String = "",
-        nowMs: Long = System.currentTimeMillis()
+        nowMs: Long = System.currentTimeMillis(),
+        requestKey: String? = null
     ): Boolean {
         val dir = cacheDir ?: return false
         if (rawBody.isEmpty() || rawBody.size > MAX_BODY_BYTES) return false
@@ -162,6 +171,8 @@ import kotlin.concurrent.withLock
             //   0: fetch timestamp (== the body filename timestamp)
             //   1: base64 reason phrase
             //   2..: "key\tbase64value" header pairs (bounded, no newlines in values)
+            //   "@rkey\tbase64value" request key; absent in older entries
+            //         (reads as null, so the serve path always misses)
             //   last: "@cred\tbase64value" credential partition; absent in
             //         older entries (reads as "")
             val sb = StringBuilder()
@@ -177,6 +188,10 @@ import kotlin.concurrent.withLock
                     val kv = "$k\t${enc.encodeToString(v.toByteArray(Charsets.UTF_8))}"
                     sb.append(kv).append('\n')
                 }
+            }
+            if (requestKey != null) {
+                sb.append(REQUEST_KEY_META_KEY).append('\t')
+                    .append(enc.encodeToString(requestKey.toByteArray(Charsets.UTF_8))).append('\n')
             }
             sb.append(CREDENTIAL_META_KEY).append('\t')
                 .append(enc.encodeToString(credentialPartition.toByteArray(Charsets.UTF_8))).append('\n')
@@ -237,7 +252,11 @@ import kotlin.concurrent.withLock
         val fetchedAt: Long,
         /** Credential context the body was fetched under ("" when none was
          *  visible); the serve path rejects a shell whose token differs. */
-        val credentialPartition: String = ""
+        val credentialPartition: String = "",
+        /** Full request key (method + variant headers + credential partition)
+         *  of the fetch, or null for legacy entries; the serve path rejects a
+         *  null or mismatched key. */
+        val requestKey: String? = null
     )
 
     /**
@@ -282,6 +301,7 @@ import kotlin.concurrent.withLock
             // other line is a header.
             val headers = HashMap<String, String>()
             var credentialPartition = ""
+            var requestKey: String? = null
             val dec = Base64.getDecoder()
             for (line in metaLines.drop(2)) {
                 if (line.isEmpty()) continue
@@ -292,12 +312,15 @@ import kotlin.concurrent.withLock
                 // Undecodable line: skip it; the content-type default below covers an empty map.
                 try {
                     val value = String(dec.decode(vEnc), Charsets.UTF_8)
-                    if (k == CREDENTIAL_META_KEY) credentialPartition = value
-                    else headers[k] = value
+                    when (k) {
+                        CREDENTIAL_META_KEY -> credentialPartition = value
+                        REQUEST_KEY_META_KEY -> requestKey = value
+                        else -> headers[k] = value
+                    }
                 } catch (_: Exception) {}
             }
             if (headers.isEmpty()) headers["content-type"] = "text/html"
-            CachedMainFrame(body, reason, headers, fetchedAt, credentialPartition)
+            CachedMainFrame(body, reason, headers, fetchedAt, credentialPartition, requestKey)
         } catch (e: Exception) {
             VDELog.d("MainFrameDiskCache", "read failed: ${e.message}")
             null

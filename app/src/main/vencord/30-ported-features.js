@@ -105,6 +105,33 @@ div[class^="sidebarList_"] {
         width: 200px;
     }
 }
+`.trim();
+
+    // Ported from upstream moreFixes.css (VendroidEnhanced/random-files).
+    // The app-launcher and .vde-* rules already live in baseCss and
+    // VENDROID_ENHANCEMENTS_CSS; the prompt rules moved here from
+    // VENDROID_MSTYLE_CSS so they apply in desktop mode too.
+    var VENDROID_MORE_FIXES_CSS = `
+/* Download Desktop button in guilds list */
+[class^=listItem_]:has([data-list-item-id=guildsnav___app-download-button]),
+[class^=listItem_]:has(+ [class^=listItem_] [data-list-item-id=guildsnav___app-download-button]) {
+    display: none;
+}
+
+/* Chromium >=121 scrollbar workaround; remove once Discord fixes it. */
+* {
+    scrollbar-width: unset !important;
+    scrollbar-color: unset !important;
+}
+
+section[class*="mobileHeaderCollapsed_"] {
+    display: none !important;
+}
+
+/* Equicord fixes */
+.vc-plugins-info-card {
+    height: unset !important;
+}
 
 div[class^="prompt_"] {
     width: 95vw !important;
@@ -242,8 +269,8 @@ div[class^="prompt_"] {
         // Layer gate. Reuses the back-press helper but exempts the
         // sidebar's own layer container while the sidebar is open, so
         // left-swipe can still close it. discordLayerOpen() fails open when
-        // the layer markup is missing; for swipes that would silently kill
-        // the feature, so that case logs once.
+        // the layer markup is missing, which would silently kill swipe
+        // navigation, so that case logs once.
         function layerBlocksSwipe(sidebarOpen) {
             var open;
             try { open = discordLayerOpen(); } catch (e) { return true; }
@@ -327,18 +354,32 @@ div[class^="prompt_"] {
         // used via @webpack/common. Accessed on swipe, long after boot.
         function navRouter() {
             try {
-                return (Vencord.Webpack.Common && Vencord.Webpack.Common.NavigationRouter) ||
+                var r = (Vencord.Webpack.Common && Vencord.Webpack.Common.NavigationRouter) ||
                     Vencord.Webpack.findByProps("transitionTo", "transitionToGuild");
-            } catch (e) { return null; }
+                if (r && typeof r.transitionTo === "function") return r;
+            } catch (e) {}
+            return rawFindModule("navRouter", function(m) {
+                return typeof m.transitionTo === "function" && typeof m.transitionToGuild === "function";
+            });
         }
         function selectedGuildStore() {
             try {
-                return (Vencord.Webpack.Common && Vencord.Webpack.Common.SelectedGuildStore) ||
+                var s = (Vencord.Webpack.Common && Vencord.Webpack.Common.SelectedGuildStore) ||
                     Vencord.Webpack.findByProps("getGuildId", "getLastSelectedGuildId");
-            } catch (e) { return null; }
+                if (s) return s;
+            } catch (e) {}
+            return rawFindModule("selectedGuildStore", function(m) {
+                return typeof m.getGuildId === "function" && typeof m.getLastSelectedGuildId === "function";
+            });
         }
         function channelSidebarActions() {
-            try { return Vencord.Webpack.findByProps("toggleMembersSection"); } catch (e) { return null; }
+            try {
+                var a = Vencord.Webpack.findByProps("toggleMembersSection");
+                if (a && typeof a.toggleMembersSection === "function") return a;
+            } catch (e) {}
+            return rawFindModule("channelSidebarActions", function(m) {
+                return typeof m.toggleMembersSection === "function";
+            });
         }
 
         function currentGuildId() {
@@ -367,7 +408,9 @@ div[class^="prompt_"] {
             if (fd) {
                 try {
                     fd.dispatch({ type: "MOBILE_WEB_SIDEBAR_OPEN" });
-                    console.warn("[Vendroid] sidebar OPEN dispatched");
+                    // Mirror the state locally when the store lookup is
+                    // unavailable, so the next swipe reads it as open.
+                    isSidebarOpen = true;
                     return true;
                 } catch (e) {
                     console.error("[Vendroid] Swipe: sidebar OPEN dispatch failed: " + e.message);
@@ -375,8 +418,8 @@ div[class^="prompt_"] {
             }
             try {
                 var hamburger = document.querySelector("button[class^='btnHamburger__']");
-                if (hamburger) { hamburger.click(); return true; }
-                console.warn("[Vendroid] Swipe: no dispatcher and no hamburger, sidebar not opened");
+                if (hamburger) { hamburger.click(); isSidebarOpen = true; return true; }
+                console.error("[Vendroid] Swipe: no dispatcher and no hamburger, sidebar not opened");
             } catch (e) {}
             return false;
         }
@@ -386,7 +429,7 @@ div[class^="prompt_"] {
             if (!fd) return false;
             try {
                 fd.dispatch({ type: "MOBILE_WEB_SIDEBAR_CLOSE" });
-                console.warn("[Vendroid] sidebar CLOSE dispatched");
+                isSidebarOpen = false;
                 return true;
             } catch (e) {
                 console.error("[Vendroid] Swipe: sidebar CLOSE dispatch failed: " + e.message);
@@ -413,8 +456,9 @@ div[class^="prompt_"] {
                     var router = navRouter();
                     if (router && typeof router.transitionToGuild === "function") {
                         try {
-                            console.warn("[Vendroid] sidebar close: transitionToGuild " + gid);
-                            router.transitionToGuild(gid); return true;
+                            router.transitionToGuild(gid);
+                            isSidebarOpen = false;
+                            return true;
                         } catch (e) {
                             console.error("[Vendroid] Swipe: transitionToGuild failed: " + e.message);
                         }
@@ -426,8 +470,9 @@ div[class^="prompt_"] {
             }
             try {
                 if (window.history.length > 1) {
-                    console.warn("[Vendroid] sidebar close: history.back");
-                    window.history.back(); return true;
+                    window.history.back();
+                    isSidebarOpen = false;
+                    return true;
                 }
             } catch (e) {}
             return false;
@@ -441,18 +486,6 @@ div[class^="prompt_"] {
                 }
             }
             return false;
-        }
-
-        // One VDELog line per qualifying horizontal swipe, whether it acts
-        // or is rejected, so a dead swipe always leaves a trace. Gates before
-        // the geometry check stay silent (they fire on every tap/scroll).
-        function swipeLog(msg, dx, dy) {
-            try {
-                var s = sidebarDebugState();
-                console.warn("[Vendroid] swipe " + msg + " dx=" + dx + " dy=" + dy +
-                    " flux=" + s.flux + " dom=" + s.dom + " store=" + s.store +
-                    " burger=" + s.burger + " path=" + s.path);
-            } catch (e) {}
         }
 
         document.addEventListener("touchstart", function(event) {
@@ -492,17 +525,14 @@ div[class^="prompt_"] {
                 // long horizontal drag with vertical drift.
                 if (Math.abs(dx) < 60 || Math.abs(dx) < 1.5 * Math.abs(dy)) return;
                 if (Date.now() - startT > 600) return;       // drag, not swipe
-                if (swipeTargetScrollable(startTarget)) { swipeLog("rejected: scrollable target", dx, dy); return; }
+                if (swipeTargetScrollable(startTarget)) return;
 
-                if (searchOverlayVisible()) { swipeLog("rejected: search overlay", dx, dy); return; }
+                if (searchOverlayVisible()) return;
 
                 // Fresh state per swipe; each branch performs at most one
                 // action.
                 var sidebarOpen = syncSidebarOpenFromDom();
-                if (layerBlocksSwipe(sidebarOpen)) {
-                    swipeLog("rejected: layer open, sidebarOpen=" + (sidebarOpen ? 1 : 0), dx, dy);
-                    return;
-                }
+                if (layerBlocksSwipe(sidebarOpen)) return;
 
                 var membersOpen = false;
                 try { membersOpen = !!document.querySelector("div[class^='members_']"); } catch (e) {}
@@ -511,40 +541,25 @@ div[class^="prompt_"] {
                 if (dx < 0) {
                     // Left swipe (right to left).
                     if (sidebarOpen) {
-                        swipeLog("action: closeSidebar", dx, dy);
                         closeSidebar();
                     } else if (!membersOpen && inGuild) {
-                        swipeLog("action: toggleMembers (open)", dx, dy);
                         toggleMembers();
-                    } else {
-                        swipeLog("no-op: left, sidebar=" + (sidebarOpen ? 1 : 0) +
-                            " members=" + (membersOpen ? 1 : 0) + " guild=" + (inGuild ? 1 : 0), dx, dy);
                     }
                     return;
                 }
 
                 // Right swipe (left to right).
                 if (membersOpen && !sidebarOpen) {
-                    swipeLog("action: toggleMembers (close)", dx, dy);
                     toggleMembers();
                     return;
                 }
                 if (!sidebarOpen) {
-                    swipeLog("action: openSidebar", dx, dy);
                     openSidebar();
-                } else {
-                    swipeLog("no-op: right, sidebar already open", dx, dy);
                 }
             } catch (e) {
                 console.error("[Vendroid] gesture handler error: " + e.message);
             }
         }, { passive: true });
-
-        if (gesturesEnabled()) {
-            console.warn("[Vendroid] Gesture navigation enabled");
-        } else {
-            console.warn("[Vendroid] Gesture handler attached (enabled=false)");
-        }
     }
 
     // Ported support-server warnings (vendroidEnhancements). Alerts on
@@ -637,11 +652,6 @@ div[class^="prompt_"] {
             var p = function(children, style) {
                 return React.createElement("p", { style: Object.assign({}, pStyle, style || {}) }, children);
             };
-            var link = React.createElement(
-                "a",
-                { href: "https://discord.gg/qtmpcF56Yf", target: "_blank", style: { color: "var(--text-link)" } },
-                "VendroidEnhanced support server"
-            );
             var body = React.createElement(
                 "div",
                 { style: { maxWidth: "420px" } },
@@ -650,8 +660,8 @@ div[class^="prompt_"] {
                     src: "https://github.com/user-attachments/assets/4a351bfb-a2a1-4693-be2d-d19f18d76684",
                     style: { maxWidth: "100%", borderRadius: "8px" }
                 }),
-                p("You are using VendroidEnhanced, which the " + name + " Server does not provide support for!"),
-                p([name + " only provides support for official builds. Therefore, please ask for support in the ", link, "."]),
+                p("You are using VendroidCarbon, which the " + name + " Server does not provide support for!"),
+                p(name + " only provides support for official builds."),
                 p("You will be banned from receiving support if you ignore this rule.", { color: "var(--header-primary)", fontWeight: "700" }),
                 p("You can disable this warning and regain message sending permissions in the Vendroid settings tab.", { fontSize: "12px" })
             );

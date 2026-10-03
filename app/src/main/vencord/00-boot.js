@@ -461,73 +461,65 @@
         isSidebarOpen = !/^\/channels\/[^\/]+\/[^\/]+$/.test(path);
     } catch(e) {}
 
-    // Sidebar state reconciliation + diagnostics (temporary, for the
-    // channel-switch gesture bug).
+    // Sidebar state reconciliation.
     //
-    // What the current Discord bundle actually does:
+    // What the Discord bundle does:
     //   - MobileWebSidebarStore.getIsOpen() = !platform.isMobile || sI, with
     //     sI flipped only by MOBILE_WEB_SIDEBAR_OPEN/CLOSE.
-    //   - Its own route listener dispatches those actions on channel switches,
+    //   - Its route listener dispatches those actions on channel switches,
     //     and the sidebar container unmounts when closed.
-    //   - btnHamburger__ is dead: the open button dispatches OPEN directly.
-    //   - div[class^='sidebar_'] also matches unrelated components (settings
-    //     pages, thread sidebars), so a bare DOM probe can read a false
-    //     "open".
+    //   - btnHamburger__ is not used: the open button dispatches
+    //     MOBILE_WEB_SIDEBAR_OPEN directly.
+    //   - div[class^='sidebar_'] also matches unrelated components such as
+    //     settings pages and thread sidebars, so a bare DOM probe can read a
+    //     false "open".
     //
-    // Reconciliation order in syncSidebarOpenFromDom(): the store when it
-    // resolves (same source Discord's UI uses), then a rendered-shell check
-    // with sidebar_ absence meaning closed, then the legacy hamburger. Every
-    // correction and every state change logs to VDELog so a dead swipe can
-    // be traced.
+    // syncSidebarOpenFromDom() reconciles in this order: first the store when
+    // it resolves, since that is what Discord's UI reads; then a rendered-shell
+    // check, where sidebar_ absence means closed; last the legacy hamburger.
 
     var _vendroidSidebarStore = null;
     var _vendroidSidebarStoreScans = 0;
-    var _vendroidSidebarStoreLogged = false;
     function mobileWebSidebarStore() {
-        if (_vendroidSidebarStore || _vendroidSidebarStoreScans >= 60) return _vendroidSidebarStore;
-        try {
-            if (typeof Vencord === "undefined" || !Vencord.Webpack) return null;
-            _vendroidSidebarStoreScans++;
-            _vendroidSidebarStore = Vencord.Webpack.find(function(m) {
+        if (_vendroidSidebarStore) return _vendroidSidebarStore;
+        // Cap the Vencord finder so a missing store isn't rescanned forever.
+        // The raw fallback below keeps looking after the cap.
+        if (_vendroidSidebarStoreScans < 60) {
+            try {
+                if (typeof Vencord !== "undefined" && Vencord.Webpack) {
+                    _vendroidSidebarStoreScans++;
+                    _vendroidSidebarStore = Vencord.Webpack.find(function(m) {
+                        return m && m.displayName === "MobileWebSidebarStore" && typeof m.getIsOpen === "function";
+                    }) || null;
+                }
+            } catch(e) {}
+        }
+        // Raw fallback for standalone sessions. rawFindModule memoizes hits
+        // only, so a late-loading store is still picked up.
+        if (!_vendroidSidebarStore) {
+            _vendroidSidebarStore = rawFindModule("mobileWebSidebarStore", function(m) {
                 return m && m.displayName === "MobileWebSidebarStore" && typeof m.getIsOpen === "function";
-            }) || null;
-            if (_vendroidSidebarStore && !_vendroidSidebarStoreLogged) {
-                _vendroidSidebarStoreLogged = true;
-                console.warn("[Vendroid] sidebar: MobileWebSidebarStore resolved");
-            }
-        } catch(e) {}
-        if (!_vendroidSidebarStore && _vendroidSidebarStoreScans >= 60 && !_vendroidSidebarStoreLogged) {
-            _vendroidSidebarStoreLogged = true;
-            console.warn("[Vendroid] sidebar: MobileWebSidebarStore not reachable via webpack (store=null in logs)");
+            });
         }
         return _vendroidSidebarStore;
     }
 
-    // One snapshot of every sidebar-related signal. dom=null/burger=null/
-    // store=null mean the probe threw, not "absent".
-    function sidebarDebugState() {
-        var s = { flux: isSidebarOpen ? 1 : 0, dom: null, burger: null, store: null, path: "" };
+    // Snapshot of the rendered sidebar signals. A null field means the
+    // probe threw, not that the signal is absent.
+    function sidebarSignals() {
+        var s = { dom: null, burger: null, store: null };
         try { s.dom = document.querySelector("div[class^='sidebar_']") ? 1 : 0; } catch(e) {}
         try { s.burger = document.querySelector("button[class^='btnHamburger__']") ? 1 : 0; } catch(e) {}
         try {
             var store = mobileWebSidebarStore();
             if (store && typeof store.getIsOpen === "function") s.store = store.getIsOpen() ? 1 : 0;
         } catch(e) {}
-        try { s.path = window.location.pathname; } catch(e) {}
         return s;
-    }
-
-    function logSidebarState(event) {
-        try {
-            var s = sidebarDebugState();
-            console.warn("[Vendroid] sidebar " + event + ": flux=" + s.flux + " dom=" + s.dom +
-                " store=" + s.store + " burger=" + s.burger + " path=" + s.path);
-        } catch(e) {}
     }
 
     function syncSidebarOpenFromDom() {
         var s;
-        try { s = sidebarDebugState(); } catch(e) { return isSidebarOpen; }
+        try { s = sidebarSignals(); } catch(e) { return isSidebarOpen; }
         var resolved = null;
         if (s.store !== null) {
             resolved = s.store === 1;
@@ -546,27 +538,9 @@
             if (shell) resolved = false;
         }
         if (resolved === null || resolved === isSidebarOpen) return isSidebarOpen;
-        console.warn("[Vendroid] sidebar correct: flux=" + (isSidebarOpen ? 1 : 0) + " -> " + (resolved ? 1 : 0) +
-            " dom=" + s.dom + " store=" + s.store + " burger=" + s.burger + " path=" + s.path);
         isSidebarOpen = resolved;
         return isSidebarOpen;
     }
-
-    // Diagnostic 1s poll: logs only when a signal changes (including route),
-    // so a channel switch shows exactly which signal moved and when.
-    // Remove together with the other sidebar diagnostics once the drift is
-    // identified.
-    var _vendroidSidebarPollSig = null;
-    setInterval(function() {
-        try {
-            if (document.hidden) return;
-            var s = sidebarDebugState();
-            var sig = s.flux + "|" + s.dom + "|" + s.store + "|" + s.burger + "|" + s.path;
-            if (sig === _vendroidSidebarPollSig) return;
-            _vendroidSidebarPollSig = sig;
-            logSidebarState("poll");
-        } catch(e) {}
-    }, 1000);
 
     let initialized = false;
 
@@ -856,6 +830,46 @@
         return false;
     }
 
+    // Last-resort webpack lookup for sessions where Vencord's helpers are
+    // unusable (bundle eval failed, _initWebpack never ran). Reads only the
+    // captured require's module cache (wreq.c); never executes factories.
+    // Hits are memoized, misses are not, since a module may load late.
+    var _vendroidRawFindCache = Object.create(null);
+
+    function vendroidRawWreq() {
+        if (_vendroidCapturedWreq) return _vendroidCapturedWreq;
+        try {
+            if (typeof Vencord !== "undefined" && Vencord.Webpack && Vencord.Webpack.wreq) {
+                return Vencord.Webpack.wreq;
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function rawFindModule(cacheKey, predicate) {
+        var hit = _vendroidRawFindCache[cacheKey];
+        if (hit) return hit;
+        var wreq = vendroidRawWreq();
+        if (!wreq || !wreq.c) return null;
+        var ids;
+        try { ids = Object.keys(wreq.c); } catch (e) { return null; }
+        for (var i = 0; i < ids.length; i++) {
+            var exp;
+            try {
+                var mod = wreq.c[ids[i]];
+                exp = mod ? mod.exports : null;
+            } catch (e) { continue; }
+            if (exp === null || exp === undefined) continue;
+            if (typeof exp !== "object" && typeof exp !== "function") continue;
+            var ok = false;
+            try { ok = !!predicate(exp); } catch (e) { ok = false; }
+            if (!ok) continue;
+            _vendroidRawFindCache[cacheKey] = exp;
+            return exp;
+        }
+        return null;
+    }
+
     let cachedFluxDispatcher = null;
 
     function findFluxDispatcher() {
@@ -874,6 +888,11 @@
             });
             if (fd3 && typeof fd3 === "object" && fd3.subscribe) { cachedFluxDispatcher = fd3; return fd3; }
         } catch(e) {}
+        // Vencord webpack helpers unavailable; use the app's own capture.
+        var fd4 = rawFindModule("fluxDispatcher", function(m) {
+            return typeof m.dispatch === "function" && typeof m.subscribe === "function";
+        });
+        if (fd4) { cachedFluxDispatcher = fd4; return fd4; }
         return null;
     }
 

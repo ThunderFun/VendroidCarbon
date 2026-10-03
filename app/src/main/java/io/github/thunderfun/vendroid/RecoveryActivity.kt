@@ -142,7 +142,7 @@ class RecoveryActivity : AppCompatActivity() {
         }
         scrollView.addView(textView)
         return AlertDialog.Builder(this)
-            .setTitle("VendroidEnhanced Logs")
+            .setTitle("VendroidCarbon Logs")
             .setView(scrollView)
             .setPositiveButton("Close", null)
             .setNeutralButton("Copy") { _, _ ->

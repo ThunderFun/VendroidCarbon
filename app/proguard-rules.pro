@@ -39,6 +39,8 @@
 # Keep source file names and line numbers for crash reports in debug
 -keepattributes SourceFile,LineNumberTable
 
+-printmapping build/outputs/mapping/mapping.txt
+
 # Aggressive R8 optimization: enables inlining, class merging,
 # access modification, and multiple optimization passes for a
 # smaller DEX and faster class loading.

@@ -55,12 +55,19 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // Maximum length of a single String value a page script may persist via
         // setString; bounds the settings XML size from any single write.
         private const val MAX_STRING_VALUE_LENGTH = 64 * 1024 // 64 KB
+        // Maximum bridge settings-key length accepted on any prefs path;
+        // matches DistinctKeyBudget. Longer ids are rejected before the rate
+        // limiter, prefs, or any log can retain them.
+        private const val MAX_BRIDGE_KEY_CHARS = DistinctKeyBudget.MAX_KEY_LENGTH
         // Delegates: the implementations live in BridgeSettings.kt; the
         // contract tests reach these as VencordNative.<member>.
         internal val BOOLEAN_SETTING_KEYS get() = BridgeSettings.BOOLEAN_SETTING_KEYS
         internal val STRING_SETTING_KEYS get() = BridgeSettings.STRING_SETTING_KEYS
         internal fun isTypeSafeBridgeWrite(op: String, key: String) = BridgeSettings.isTypeSafeBridgeWrite(op, key)
         internal fun isBridgeKeyAllowed(id: String) = BridgeSettings.isBridgeKeyAllowed(id)
+
+        /** True when [id] is short enough to be admitted to any prefs path. */
+        internal fun isBridgeKeyLengthAllowed(id: String) = id.length <= MAX_BRIDGE_KEY_CHARS
 
         /**
          * Value validation for setString, kept ahead of guardedPrefs so only a
@@ -119,23 +126,28 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         private const val QUICKCSS_POLL_INTERVAL_MS = 250L
         private const val QUICKCSS_POLL_ATTEMPTS = 8
 
-        // Kicks off quickCss.get() and parks the settled value in
-        // window.__vdeQcss.
-        private const val QUICKCSS_GET_START_JS =
+        // Kicks off quickCss.get(), parking the settled value in
+        // window.__vdeQcss. typeof guards against a shadowed String coercion;
+        // null means empty CSS and over-cap strings park as null.
+        private val QUICKCSS_GET_START_JS =
             "(function(){try{" +
             "if(typeof VencordNative==='undefined'||!VencordNative.quickCss||typeof VencordNative.quickCss.get!=='function'){" +
             "window.__vdeQcss={settled:true,value:null};return}" +
             "VencordNative.quickCss.get().then(function(v){" +
-            "window.__vdeQcss={settled:true,value:(v==null?'':String(v))}}," +
+            "window.__vdeQcss={settled:true,value:(typeof v==='string'&&v.length<=$MAX_QUICKCSS_CHARS?v:(v==null?'':null))}}," +
             "function(){window.__vdeQcss={settled:true,value:null}})" +
             "}catch(e){window.__vdeQcss={settled:true,value:null}}})()"
 
-        // Returns 0 while pending, null when there is nothing to load, else
-        // the raw CSS text. WebView JSON-encodes each result unambiguously.
-        private const val QUICKCSS_GET_POLL_JS =
+        // Returns 0 while pending, null when there is nothing to load, -1
+        // when the parked string exceeds the cap, else the raw CSS text.
+        // typeof rejects non-strings before WebView can serialize them.
+        private val QUICKCSS_GET_POLL_JS =
             "(function(){try{var s=window.__vdeQcss;" +
             "if(!s||s.settled!==true)return 0;" +
-            "return s.value==null?null:String(s.value)}catch(e){return null}})()"
+            "var v=s.value;" +
+            "if(typeof v!=='string')return null;" +
+            "if(v.length>$MAX_QUICKCSS_CHARS)return -1;" +
+            "return v}catch(e){return null}})()"
 
         // Save wrapper for QuickCssBridge.quickCssSet. Returns true only when
         // the Vencord web shim exists and quickCss.set() invoked without
@@ -148,6 +160,27 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             "if(p&&typeof p.then==='function')p.catch(function(e){console.error('VDE QuickCSS save failed:',e)});" +
             "return true" +
             "}catch(e){console.error('VDE QuickCSS save failed:',e);return false}})()"
+
+        /**
+         * Validates a QuickCSS fallback poll result. Returns the WebView's
+         * JSON encoding for the editor, or null when missing, malformed, or
+         * over MAX_QUICKCSS_CHARS. The 6x serialized precheck admits
+         * worst-case \uXXXX inflation; the exact raw-length check runs after
+         * decode.
+         */
+        internal fun validatedQuickCssPollResult(json: String?): String? {
+            val value = json?.trim() ?: return null
+            // Only a JSON string is valid here; anything else comes from a
+            // shadowed builtin.
+            if (value.length < 2 || value[0] != '"' || value[value.length - 1] != '"') return null
+            if (value.length > MAX_QUICKCSS_CHARS * 6 + 16) return null
+            val css = try {
+                vdeGson.fromJson(value, String::class.java)
+            } catch (_: Exception) {
+                return null
+            } ?: return null
+            return if (css.length <= MAX_QUICKCSS_CHARS) value else null
+        }
 
         // Icon art for the settings-tab picker. Icons are build-time static,
         // so the JSON is computed once per process and reused by every
@@ -245,8 +278,22 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             val t = ensureToken()
             // JSON-encode so the token is safely embedded in a JS string literal.
             val tokenLiteral = vdeGson.toJson(t)
+            val appHostsLiteral = vdeGson.toJson(Constants.DISCORD_APP_ORIGIN_HOSTS)
             return ("(function(){" +
                 "'use strict';" +
+                // Renderer-side origin guard: this payload embeds the
+                // capability token, so it installs only on an app origin, even
+                // if a stale async eval lands in a replacement document
+                // despite the Kotlin-side checks. Hosts mirror
+                // Constants.DISCORD_APP_ORIGIN_HOSTS. location.* is
+                // LegacyUnforgeable; the walk uses ===, not indexOf, since page
+                // scripts run first and can patch prototypes.
+                "if(location.protocol!=='https:'" +
+                "||(location.port!==''&&location.port!=='443'))return;" +
+                "var vdeHosts=$appHostsLiteral,vdeHostOk=false;" +
+                "for(var vdeI=0;vdeI<vdeHosts.length;vdeI++){" +
+                "if(vdeHosts[vdeI]===location.hostname){vdeHostOk=true;break;}}" +
+                "if(!vdeHostOk)return;" +
                 // Capture uncaught errors so bundle boot crashes are visible
                 // in the logs (otherwise "Vencord undefined" is the only
                 // symptom). Idempotent; throttled to avoid spam.
@@ -294,6 +341,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     private val firewallDialogActive = AtomicBoolean(false)
 
     private val quickCssDialogActive = AtomicBoolean(false)
+
+    // One restart confirmation at a time. requestNative cannot prove a user
+    // gesture, so a script loop could otherwise queue unbounded dialogs.
+    private val restartDialogActive = AtomicBoolean(false)
 
     // Drops duplicate overlay publishes. The manager reacts to edges, and a
     // tight script loop would otherwise run UI work per call.
@@ -418,9 +469,9 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         val last = lastWriteTime[id]
         if (last != null && now - last < minIntervalNanos) return false
         if (lastWriteTime.size >= LAST_WRITE_CAP && !lastWriteTime.containsKey(id)) {
-            // Cap reached and this is a new key: evict an old entry so the map
-            // stays bounded. Pick the oldest single entry (cheap, no full
-            // scan on the hot path).
+            // Cap reached and this is a new key: evict the oldest entry to
+            // stay bounded. The scan is O(n) over the capped map; key length
+            // is bounded upstream, so each pass stays cheap.
             var oldestId: String? = null
             var oldestTs = Long.MAX_VALUE
             for ((k, v) in lastWriteTime) {
@@ -435,7 +486,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     private fun isKeyAllowed(id: String, forWrite: Boolean): Boolean {
         if (isBridgeKeyAllowed(id)) return true
         val op = if (forWrite) "write" else "read"
-        VDELog.w("VN", "Blocked $op for disallowed key: $id")
+        // Bounded preview: the length gate caps ids at MAX_BRIDGE_KEY_CHARS,
+        // but keep the log bounded if that gate ever changes.
+        val preview = if (id.length <= 64) id else "${id.take(64)}...(${id.length} chars)"
+        VDELog.w("VN", "Blocked $op for disallowed key: $preview")
         return false
     }
 
@@ -454,11 +508,21 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         block: (SharedPreferences) -> T
     ): T {
         val safeId = id ?: return default
+        // Gate before any map, prefs, or log retains the id; covers reads and
+        // writes. The setters check early to skip hashing oversized ids in
+        // their type-contract lookups.
+        if (!isBridgeKeyLengthAllowed(safeId)) {
+            VDELog.w("VN", "Rejected $op for oversized key id (${safeId.length} chars)")
+            return default
+        }
         return try {
             val onDomain = if (strictDomain) isOnDiscordDomainStrict() else isOnDiscordDomain()
             if (!onDomain) return default
-            if (forWrite && !rateLimitWrite(safeId)) return default
+            // Allowlist before the rate limiter: only a key that can reach a
+            // pref may consume a limiter slot, so rejected ids are never
+            // retained by lastWriteTime.
             if (!isKeyAllowed(safeId, forWrite)) return default
+            if (forWrite && !rateLimitWrite(safeId)) return default
             // Bound the number of distinct persisted keys a script can
             // introduce (the per-key rate limiter only bounds the timing map).
             // css_cache_* keys are write-rejected in the block, so they are
@@ -670,25 +734,44 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // non-Discord page still must not bounce the app.
         if (!isOnDiscordDomain()) return
         val act = activity.get() ?: return
+        // Reserve before the UI post so a burst of bridge calls cannot queue
+        // one dialog per call. Released on every exit path below.
+        if (!restartDialogActive.compareAndSet(false, true)) return
         act.runOnUiThread {
-            if (act.isFinishing || act.isDestroyed) return@runOnUiThread
-            // The bridge cannot prove a user gesture, so confirm natively.
-            // Without this a script loop could restart the process repeatedly.
-            val dialog = AlertDialog.Builder(act)
-                .setMessage("Restart the app to apply this change?")
-                .setPositiveButton("Restart") { _, _ ->
-                    act.startActivity(
-                        Intent(act, RecoveryActivity::class.java)
-                            .putExtra(RecoveryActivity.EXTRA_RELAUNCH_MAIN, true)
-                    )
+            if (act.isFinishing || act.isDestroyed) {
+                restartDialogActive.set(false)
+                return@runOnUiThread
+            }
+            var registered: AlertDialog? = null
+            try {
+                // The bridge cannot prove a user gesture, so confirm natively.
+                // Without this a script loop could restart the process repeatedly.
+                val dialog = AlertDialog.Builder(act)
+                    .setMessage("Restart the app to apply this change?")
+                    .setPositiveButton("Restart") { _, _ ->
+                        act.startActivity(
+                            Intent(act, RecoveryActivity::class.java)
+                                .putExtra(RecoveryActivity.EXTRA_RELAUNCH_MAIN, true)
+                        )
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .create()
+                // Tracked so activity teardown dismisses it instead of leaking
+                // the window, matching LinkHandler.showLinkPopup.
+                act.registerDialog(dialog)
+                registered = dialog
+                dialog.setOnDismissListener {
+                    act.unregisterDialog(dialog)
+                    restartDialogActive.set(false)
                 }
-                .setNegativeButton("Cancel", null)
-                .create()
-            // Tracked so activity teardown dismisses it instead of leaking the
-            // window, matching LinkHandler.showLinkPopup.
-            act.registerDialog(dialog)
-            dialog.setOnDismissListener { act.unregisterDialog(dialog) }
-            dialog.show()
+                dialog.show()
+            } catch (t: Throwable) {
+                // show() can throw (BadTokenException) if the window is gone;
+                // release so a later request can retry.
+                registered?.let { act.unregisterDialog(it) }
+                restartDialogActive.set(false)
+                VDELog.e("VN", "restartApp dialog failed", t)
+            }
         }
     }
 
@@ -718,6 +801,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun setString(token: String?, id: String?, value: String?) {
         if (!isBridgeAuthorized(token)) return
         val safeId = id ?: return
+        if (!isBridgeKeyLengthAllowed(safeId)) {
+            VDELog.w("VN", "Rejected setString for oversized key id (${safeId.length} chars)")
+            return
+        }
         val safeValue = value ?: return
         // Type-safety: never write a String to a key the app reads as a
         // Boolean (see BOOLEAN_SETTING_KEYS). A String there silently
@@ -884,6 +971,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun setBool(token: String?, id: String?, value: Boolean) {
         if (!isBridgeAuthorized(token)) return
         val safeId = id ?: return
+        if (!isBridgeKeyLengthAllowed(safeId)) {
+            VDELog.w("VN", "Rejected setBool for oversized key id (${safeId.length} chars)")
+            return
+        }
         // Type-safety: never write a Boolean to a key the app reads as a
         // String. guardedPrefs' write-path ClassCastException recovery cannot
         // cover this: putBoolean never reads the old value, so the write
@@ -1220,7 +1311,20 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                             } else {
                                 handler.postDelayed({ poll(attempt + 1) }, QUICKCSS_POLL_INTERVAL_MS)
                             }
-                        else -> deliver(value) // WebView's own JSON encoding
+                        // -1 = the parked value exceeds MAX_QUICKCSS_CHARS.
+                        "-1" -> {
+                            VDELog.w("VN", "quickCss fallback: oversized value, editor opened empty")
+                            deliver(null)
+                        }
+                        else -> {
+                            // In-page checks are bypassable, so re-validate
+                            // before the editor WebView hop.
+                            val validated = validatedQuickCssPollResult(value)
+                            if (validated == null) {
+                                VDELog.w("VN", "quickCss fallback: rejected poll payload (${value.length} chars)")
+                            }
+                            deliver(validated)
+                        }
                     }
                 }
             } catch (_: IllegalStateException) {

@@ -251,11 +251,17 @@ class VWebviewClient(
         // worker.
         val cached: MainFrameDiskCache.CachedMainFrame? = StaleMainFrame.inMemoryShell(urlString)
         val shell = cached ?: return null
-        // Bind the URL-keyed shell to the credential context it was fetched
-        // under. A mismatch is a miss; the foreground fetch repopulates the
-        // entry. The write-time directive gate cannot prove account
-        // independence, so this check does not rely on that assumption.
-        if (shell.credentialPartition != requestCredentialPartition(req)) return null
+        // Bind the URL-keyed shell to the request it was fetched for:
+        // credentials plus the cache-key variant fields (method +
+        // VARIANT_HEADERS). A mismatch, including a legacy null request key,
+        // is a miss; the foreground fetch repopulates the entry.
+        if (!staleShellMatches(
+                shellRequestKey = shell.requestKey,
+                shellCredentialPartition = shell.credentialPartition,
+                requestKey = responseCacheKey,
+                requestCredentialPartition = requestCredentialPartition(req)
+            )
+        ) return null
         // Pre-fix builds could persist a non-HTML body under a parameterized
         // type; never rewrite such an entry to text/html. A miss just refetches.
         val storedCt = ResponseHeaderMerge.valueFor(shell.headers, "content-type")
@@ -297,27 +303,20 @@ class VWebviewClient(
                             // (blocked chain) skips the refresh and leaves the caches
                             // untouched; the shell MAX_AGE bounds that staleness, after
                             // which the blocking foreground fetch self-heals.
-                            val resolved = resolveRedirects(refreshIsMainFrame, refreshResponse, urlString, 0, hashSetOf(urlString), refreshCookiePairs)
+                            // Cookie writes are suppressed for the background
+                            // refresh (see resolveRedirects): a late Set-Cookie
+                            // must not survive a logout or account switch.
+                            val resolved = resolveRedirects(refreshIsMainFrame, refreshResponse, urlString, 0, hashSetOf(urlString), refreshCookiePairs, writeCookies = false)
                             if (resolved != null) {
                                 if (resolved !== refreshResponse) {
                                     // Close the consumed 3xx (resolveRedirects never closes its input).
                                     refreshResponse.close()
                                     refreshResponse = resolved
                                 }
-                                // fetchAndProcessResponse's return value is discarded
-                                // here, so the Chromium M138+ multi-cookie channel
-                                // (Set-Cookie attached to that object) would drop the
-                                // final response's cookies; replay them into the store
-                                // like resolveRedirects does for hops. Pre-M138,
-                                // fetchAndProcessResponse replays Set-Cookie into the
-                                // store itself, making this an idempotent overwrite.
-                                // Main frame only: subresource chains never touch the
-                                // cookie store (see resolveRedirects).
-                                if (refreshIsMainFrame) harvestRedirectCookies(resolved)
                                 fetchAndProcessResponse(
                                     refreshIsMainFrame, resolved, false, CacheTarget.MAIN_FRAME,
                                     urlString, responseCacheKey, credentialPartition = refreshCredentialPartition,
-                                    publishInjectionClaims = false
+                                    publishInjectionClaims = false, deliverCookies = false
                                 )
                             }
                         }
@@ -512,14 +511,23 @@ class VWebviewClient(
      * on the intercept thread, not the request object: the SWR refresh calls
      * this off-thread, where the Chromium-owned request must not be
      * dereferenced.
+     *
+     * [writeCookies] is false for the background stale-while-revalidate
+     * refresh: it may follow the chain to refresh the caches, but never the
+     * cookie store. The response belongs to the credentials snapshotted when
+     * the refresh was scheduled; a delayed Set-Cookie landing after a logout
+     * or account switch could resurrect the old session. Foreground callers
+     * keep the default. When false, the hop's Set-Cookie is also not added to
+     * [eligibleCookiePairs], since it was not stored.
      */
-    private fun resolveRedirects(
+    internal fun resolveRedirects(
         isMainFrame: Boolean,
         response: Response,
         urlString: String,
         depth: Int,
         seen: MutableSet<String>,
-        eligibleCookiePairs: MutableSet<Pair<String, String>>
+        eligibleCookiePairs: MutableSet<Pair<String, String>>,
+        writeCookies: Boolean = true
     ): Response? {
         if (response.code !in 300..399) return response
 
@@ -533,7 +541,7 @@ class VWebviewClient(
         // fetchAndProcessResponse, so for main frames this is its only delivery
         // path. resolveRedirects validates each hop URL before fetching it, so
         // replays never target an unvalidated host.
-        if (isMainFrame) harvestRedirectCookies(response, eligibleCookiePairs)
+        if (isMainFrame && writeCookies) harvestRedirectCookies(response, eligibleCookiePairs)
         // Fail closed on non-standard 3xx: 304 has no Location (its
         // conditional headers are stripped here anyway), and 300-with-Location
         // and 305/306 carry semantics this path does not implement. Runs
@@ -624,7 +632,7 @@ class VWebviewClient(
         }
         val follow = HttpClient.sharedClient.newCall(rb.build()).execute()
         return try {
-            val next = resolveRedirects(isMainFrame, follow, urlString, depth + 1, seen, eligibleCookiePairs)
+            val next = resolveRedirects(isMainFrame, follow, urlString, depth + 1, seen, eligibleCookiePairs, writeCookies)
             if (next !== follow) {
                 // Close the consumed intermediate response; keep the deeper one.
                 follow.close()
@@ -914,7 +922,8 @@ class VWebviewClient(
         urlString: String = "",
         cacheKey: String = urlString,
         credentialPartition: String = "",
-        publishInjectionClaims: Boolean = true
+        publishInjectionClaims: Boolean = true,
+        deliverCookies: Boolean = true
     ): WebResourceResponse {
         // The injection/CSP/MIME gates must be keyed on the FINAL response host
         // (the target after the app-followed redirect chain in
@@ -948,7 +957,7 @@ class VWebviewClient(
 
         pinMainFrameMime(isAppOrigin, isForMainFrame, state)
         readBodyBounded(response, state)
-        persistRawMainFrame(response, urlString, isAppOrigin, isForMainFrame, credentialPartition, state)
+        persistRawMainFrame(response, urlString, cacheKey, isAppOrigin, isForMainFrame, credentialPartition, state)
         // A cache-only refresh (see serveStaleMainFrame) discards the returned
         // response, so it must not publish claims for a body Chromium never
         // receives.
@@ -956,7 +965,7 @@ class VWebviewClient(
             injectAndRecordClaims(urlString, host, isAppOrigin, isForMainFrame, state)
         }
         cacheResult(response, urlString, cacheKey, credentialPartition, cacheTarget, isAppOrigin, state)
-        return deliverCookiesAndBuild(response, state, urlString, isForMainFrame)
+        return deliverCookiesAndBuild(response, state, urlString, isForMainFrame, deliverCookies)
     }
 
     /** Header fold + CSP policy switch stage of [fetchAndProcessResponse]. */
@@ -1077,6 +1086,7 @@ class VWebviewClient(
     private fun persistRawMainFrame(
         response: Response,
         urlString: String,
+        cacheKey: String,
         isAppOrigin: Boolean,
         isMainFrame: Boolean,
         credentialPartition: String,
@@ -1089,9 +1099,9 @@ class VWebviewClient(
         // is stale-served to GET navigations. A real HEAD body is empty anyway
         // (isNotEmpty skips it); the gate exists for the 307-preserved POST
         // whose HTML would otherwise seed the store.
-        // Each entry is bound to the credential context of its fetch (see
-        // credentialPartition), so the directive gate need not prove account
-        // independence on its own.
+        // Each entry is bound to the fetch's full request key (credentials +
+        // variant fields; see MainFrameDiskCache.requestKey), so the URL-keyed
+        // store cannot share a body across contexts or variants.
         if (isAppOrigin && isMainFrame && state.statusCode in 200..299 && state.body.isNotEmpty() &&
             response.request.method == "GET" &&
             !cacheExcludedByDirectives(state.headers)
@@ -1104,7 +1114,7 @@ class VWebviewClient(
                 // body is still raw here; injection happens below. Persist
                 // off the network thread with the sanitized headers so a stale
                 // serve matches the in-memory cache (incl. security headers).
-                enqueueMainFrameWrite(urlString, state.body, HashMap(state.headers), state.reasonPhrase, credentialPartition)
+                enqueueMainFrameWrite(urlString, state.body, HashMap(state.headers), state.reasonPhrase, credentialPartition, cacheKey)
             }
         }
     }
@@ -1227,7 +1237,8 @@ class VWebviewClient(
                     if (urlString == activeShellUrl && isAppOrigin) {
                         val refreshed = MainFrameDiskCache.CachedMainFrame(
                             state.rawBody, state.reasonPhrase, headersToCache,
-                            System.currentTimeMillis(), credentialPartition
+                            System.currentTimeMillis(), credentialPartition,
+                            requestKey = cacheKey
                         )
                         val shells = HashMap(StaleMainFrame.preloadedShells)
                         shells[urlString] = refreshed
@@ -1255,14 +1266,19 @@ class VWebviewClient(
      * the original request URL, so a cross-host chain lands them under the
      * wrong host, and a same-origin path change derives a no-Path cookie's
      * default path from the wrong URL (see [multiCookieChannelAllowed]).
+     *
+     * [deliverCookies] is false for the background SWR refresh, whose
+     * response is discarded and must not touch the shared cookie store (see
+     * [resolveRedirects]).
      */
     private fun deliverCookiesAndBuild(
         response: Response,
         state: ProcessedResponse,
         originalUrlString: String,
-        isForMainFrame: Boolean
+        isForMainFrame: Boolean,
+        deliverCookies: Boolean
     ): WebResourceResponse {
-        if (isForMainFrame && state.setCookies.isNotEmpty()) {
+        if (deliverCookies && isForMainFrame && state.setCookies.isNotEmpty()) {
             val responseUrl = response.request.url.toString()
             if (isMultiCookieChannelSupported() &&
                 multiCookieChannelAllowed(originalUrlString, response.request.url)
@@ -1542,10 +1558,10 @@ class VWebviewClient(
             )
 
         /**
-         * The operator-controlled stylesheets vencord_mobile.js fetches on
-         * every page load (browser.css / moreFixes.css). They live on forge
-         * hosts and end in .css, so the recovery user-theme gate must exempt
-         * them or it would break the mod's own fix CSS.
+         * The operator-controlled stylesheet vencord_mobile.js fetches on
+         * every page load (browser.css). It lives on a forge host and ends
+         * in .css, so the recovery user-theme gate must exempt it or it
+         * would break the mod's own base CSS.
          *
          * Compared on scheme + host + effective port + path; the query is
          * ignored (cache-busting variants). Port is part of the origin: the
@@ -1560,8 +1576,7 @@ class VWebviewClient(
 
         private val OPERATOR_CSS_URLS: List<OperatorCssUrl> = listOf(
             Constants.VENCORD_CSS_URL,
-            Constants.EQUICORD_CSS_URL,
-            VendroidApp.MORE_FIXES_CSS_URL
+            Constants.EQUICORD_CSS_URL
         ).map { url ->
             val uri = Uri.parse(url)
             OperatorCssUrl(
@@ -1795,7 +1810,8 @@ class VWebviewClient(
             val body: ByteArray,
             val headers: Map<String, String>,
             val reasonPhrase: String,
-            val credentialPartition: String
+            val credentialPartition: String,
+            val requestKey: String
         )
         private val pendingDiskWrites = HashMap<String, PendingMainFrameWrite>()
         private var pendingDiskBytes = 0L
@@ -1813,10 +1829,11 @@ class VWebviewClient(
             body: ByteArray,
             headers: Map<String, String>,
             reasonPhrase: String,
-            credentialPartition: String
+            credentialPartition: String,
+            requestKey: String
         ) {
             if (body.isEmpty() || body.size > MainFrameDiskCache.MAX_BODY_BYTES) return
-            val entry = PendingMainFrameWrite(urlString, body, headers, reasonPhrase, credentialPartition)
+            val entry = PendingMainFrameWrite(urlString, body, headers, reasonPhrase, credentialPartition, requestKey)
             val schedule: Boolean
             synchronized(pendingDiskLock) {
                 val previous = pendingDiskWrites.put(urlString, entry)
@@ -1860,7 +1877,8 @@ class VWebviewClient(
                 try {
                     MainFrameDiskCache.writeMainFrame(
                         next.url, next.body, next.headers, next.reasonPhrase,
-                        credentialPartition = next.credentialPartition
+                        credentialPartition = next.credentialPartition,
+                        requestKey = next.requestKey
                     )
                 } catch (_: Exception) {
                     // Best-effort; keep draining.

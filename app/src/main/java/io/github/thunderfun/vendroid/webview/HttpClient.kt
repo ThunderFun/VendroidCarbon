@@ -11,6 +11,7 @@ import io.github.thunderfun.vendroid.MainActivity
 import io.github.thunderfun.vendroid.utils.Constants
 import io.github.thunderfun.vendroid.utils.SettingKeys
 import io.github.thunderfun.vendroid.utils.VDELog
+import io.github.thunderfun.vendroid.utils.getBooleanSafe
 import io.github.thunderfun.vendroid.utils.getStringSafe
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -128,6 +129,19 @@ object HttpClient {
      */
     @Volatile
     private var bundleCheckedThisSession = false
+
+    /**
+     * In-memory half of the one-shot cached-bundle fallback notice; the
+     * persisted half is [PREF_BUNDLE_FALLBACK_NOTIFIED]. The startup check
+     * and the clientMod prefetch run on different executors, so both halves
+     * are read and written under [bundleFallbackNoticeLock] to stop one
+     * failure episode from raising two notices. Reset by
+     * [clearBundleFallbackNotice].
+     */
+    private var bundleFallbackNoticeShown = false
+
+    /** Guards [bundleFallbackNoticeShown] and the persisted notice flag. */
+    private val bundleFallbackNoticeLock = Any()
 
     /**
      * Serializes bundle file and prefs writes between the startup fetch and
@@ -282,6 +296,17 @@ object HttpClient {
 
     /** SharedPreferences key of the app version that last fetched the bundle. */
     const val PREF_LAST_BUNDLE_UPDATE = "lastMajorUpdateThatUserHasUpdatedVencord"
+
+    /**
+     * SharedPreferences key of the one-shot "bundle fetch fell back to the
+     * cached copy" notice. Set when the notice is shown and cleared only by
+     * a definitive fetch success: a 304 over a live cache, or an installed
+     * download. An offline user is warned once per failure episode rather
+     * than on every boot. Deliberately not part of
+     * [clearBundleIdentityKeys]; cache invalidation must not re-arm a
+     * suppressed notice.
+     */
+    const val PREF_BUNDLE_FALLBACK_NOTIFIED = "vencordBundleFallbackNotified"
 
 
     /**
@@ -698,7 +723,9 @@ object HttpClient {
     /**
      * Startup bundle fetch: [planFetch]'s decision preamble followed by the
      * download tail (ETag-conditional GET, 304/2xx/error branching, fallback
-     * to the cached bundle, store-and-publish).
+     * to the cached bundle, store-and-publish). A failed refresh that leaves
+     * a cached bundle in use raises the one-shot [notifyBundleFallback]
+     * notice; a definitive success clears it.
      */
     @JvmStatic
     @Throws(IOException::class)
@@ -716,6 +743,10 @@ object HttpClient {
         // Set while a cache read inside the try is in flight, so the catch
         // can tell a cache-read failure from a network failure.
         var readingCache = false
+        // True once this fetch produced a definitive freshness answer: a
+        // 304 over a live cache, or an installed download. Gates the
+        // fallback-notice reset after the try.
+        var bundleFreshConfirmed = false
         try {
             // ETag-conditional GET: 304 keeps the cache (cheap), 200 swaps in
             // a newer build. Detects new Vencord builds without wiping app
@@ -751,6 +782,7 @@ object HttpClient {
                     sPrefs.edit()
                         .putLong(PREF_LAST_BUNDLE_CHECK, System.currentTimeMillis())
                         .apply()
+                    bundleFreshConfirmed = true
                 }
 
                 responseCode == HttpURLConnection.HTTP_NOT_MODIFIED -> {
@@ -762,11 +794,15 @@ object HttpClient {
                     if (responseCode !in 200..299) {
                         throw bundleHttpFailure(responseCode, vencordLocation)
                     }
-                    downloadStoreAndSync(resp, vendroidFile, sPrefs, bundleLocation = vencordLocation)
+                    if (downloadStoreAndSync(resp, vendroidFile, sPrefs, bundleLocation = vencordLocation)) {
+                        bundleFreshConfirmed = true
+                    }
                 }
 
                 responseCode in 200..299 -> {
-                    downloadStoreAndSync(resp, vendroidFile, sPrefs, bundleLocation = vencordLocation)
+                    if (downloadStoreAndSync(resp, vendroidFile, sPrefs, bundleLocation = vencordLocation)) {
+                        bundleFreshConfirmed = true
+                    }
                 }
 
                 else -> {
@@ -780,7 +816,10 @@ object HttpClient {
                         setVencordRuntimeIfNull(cached) {
                             vendroidFile.exists()
                         }
+                        notifyBundleFallback(activity, sPrefs)
                     } else {
+                        // Caught by the handler below, which raises the
+                        // fallback notice when a cached file remains.
                         throw bundleHttpFailure(responseCode, vencordLocation)
                     }
                 }
@@ -804,13 +843,19 @@ object HttpClient {
                 setVencordRuntimeIfNull(readBundleFromDisk(sPrefs, vendroidFile)) {
                     vendroidFile.exists()
                 }
+                notifyBundleFallback(activity, sPrefs)
             } else {
+                // A runtime is already published from the disk preload or an
+                // earlier fetch, so the app keeps the last downloaded bundle
+                // when a cached file exists.
+                if (vendroidFile.exists()) notifyBundleFallback(activity, sPrefs)
                 throw io
             }
         } finally {
             // Close to return the pooled connection (not disconnect()).
             resp?.close()
         }
+        if (bundleFreshConfirmed) clearBundleFallbackNotice(sPrefs)
         activity.runOnUiThread {
             (activity as? MainActivity)?.injectVencordIfReady()
         }
@@ -860,6 +905,72 @@ object HttpClient {
      */
     private fun bundleHttpFailure(code: Int, location: String): IOException =
         IOException("HTTP $code fetching Vencord bundle from ${UrlNormalizer.redactForLog(location)}")
+
+    /**
+     * One-shot notice that the bundle could not be updated and the last
+     * downloaded copy is in use. The Toast is posted to the UI thread
+     * because [fetchVencord] runs on a background executor.
+     *
+     * Claiming is per failure episode: [bundleFallbackNoticeShown] covers a
+     * concurrent fetch in this process, [PREF_BUNDLE_FALLBACK_NOTIFIED]
+     * covers later boots, and [clearBundleFallbackNotice] re-arms both after
+     * a definitive success.
+     */
+    private fun notifyBundleFallback(activity: Activity, sPrefs: SharedPreferences) {
+        if (!claimBundleFallbackNotice(sPrefs)) return
+        val modName = if (sPrefs.getStringSafe(SettingKeys.KEY_CLIENT_MOD, "vencord") == "equicord") {
+            "Equicord"
+        } else {
+            "Vencord"
+        }
+        activity.runOnUiThread {
+            Toast.makeText(
+                activity,
+                "Couldn't update $modName; using the last downloaded version",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    /**
+     * Claims the one-shot fallback notice for this failure episode. Returns
+     * true only when the notice was neither shown in this process nor
+     * recorded by a previous boot. A wrong-typed persisted flag counts as
+     * not notified: the notice shows once, then the write heals the poison.
+     *
+     * internal so BundleFallbackNoticeTest can pin the one-shot contract.
+     */
+    internal fun claimBundleFallbackNotice(sPrefs: SharedPreferences): Boolean =
+        synchronized(bundleFallbackNoticeLock) {
+            if (bundleFallbackNoticeShown) {
+                false
+            } else {
+                bundleFallbackNoticeShown = true
+                val alreadyNotified = sPrefs.getBooleanSafe(PREF_BUNDLE_FALLBACK_NOTIFIED, false) {
+                    VDELog.w("HTTP", "Bundle fallback notice flag wrong-typed; showing notice")
+                }
+                if (!alreadyNotified) {
+                    sPrefs.edit().putBoolean(PREF_BUNDLE_FALLBACK_NOTIFIED, true).apply()
+                }
+                !alreadyNotified
+            }
+        }
+
+    /**
+     * Ends the current failure episode so the next fallback can alert again.
+     * Called only on a definitive freshness answer: a 304 over a live cache,
+     * or an installed download.
+     *
+     * internal so BundleFallbackNoticeTest can pin the one-shot contract.
+     */
+    internal fun clearBundleFallbackNotice(sPrefs: SharedPreferences) {
+        synchronized(bundleFallbackNoticeLock) {
+            bundleFallbackNoticeShown = false
+            if (sPrefs.getBooleanSafe(PREF_BUNDLE_FALLBACK_NOTIFIED, false)) {
+                sPrefs.edit().remove(PREF_BUNDLE_FALLBACK_NOTIFIED).apply()
+            }
+        }
+    }
 
     /**
      * Executes a conditional GET for the Vencord bundle over the shared pooled
@@ -997,6 +1108,10 @@ object HttpClient {
      * The in-memory runtime is replaced immediately via
      * [setVencordRuntimeIfEnabled], which respects the safe-mode kill switch
      * (a raised switch saves to disk only).
+     *
+     * Returns true when the response was installed, false when it was
+     * discarded because the bundle location changed mid-fetch. The caller
+     * resets the fallback notice only on true.
      */
     @Throws(IOException::class)
     fun downloadStoreAndSync(
@@ -1004,7 +1119,7 @@ object HttpClient {
         vendroidFile: File,
         sPrefs: SharedPreferences,
         bundleLocation: String
-    ) {
+    ): Boolean {
         if (resp.code !in 200..299) {
             throw IOException("HTTP ${resp.code} while storing Vencord bundle")
         }
@@ -1042,7 +1157,7 @@ object HttpClient {
                     "Discarding bundle download: location changed mid-fetch " +
                         "(fetched=${UrlNormalizer.redactForLog(bundleLocation)})"
                 )
-                return
+                return false
             }
             // Unique temp name so concurrent download attempts cannot clobber
             // each other's file; a shared "vencord.js.tmp" once let one
@@ -1096,6 +1211,7 @@ object HttpClient {
             bundleCheckedThisSession = true
             VDELog.i("HTTP", "Bundle patched and saved to disk (build=${buildTag ?: "unknown"} sha256=$hash)")
         }
+        return true
     }
 
     /**

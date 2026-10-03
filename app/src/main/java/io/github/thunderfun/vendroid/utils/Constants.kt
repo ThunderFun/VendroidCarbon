@@ -156,14 +156,21 @@ object Constants {
      */
     fun isDiscordAppOrigin(host: String): Boolean = isDiscordAppOriginLower(host.lowercase())
 
+    /**
+     * Hosts accepted by [isDiscordAppOriginLower] and embedded in the
+     * renderer-side guard in VencordNative.bridgeBootstrapJs(), so the two
+     * lists cannot drift.
+     */
+    val DISCORD_APP_ORIGIN_HOSTS = setOf(
+        "discord.com",
+        "ptb.discord.com",
+        "canary.discord.com",
+        "discordapp.com"
+    )
+
     /** [isDiscordAppOrigin] for callers that already hold a lowercased host. */
     fun isDiscordAppOriginLower(h: String): Boolean =
-        appOriginCache.computeIfAbsent(h) { key ->
-            key == "discord.com" ||
-                key == "ptb.discord.com" ||
-                key == "canary.discord.com" ||
-                key == "discordapp.com"
-        }
+        appOriginCache.computeIfAbsent(h) { key -> key in DISCORD_APP_ORIGIN_HOSTS }
 
     fun isAllowedVencordHost(host: String): Boolean {
         val h = host.lowercase()

@@ -75,9 +75,10 @@
             initStage = 2;
             recoverPlugins();
             tryStartPluginsStage();
-            // Static plugin CSS is webpack-independent; inject it even on a
-            // failed boot so theme/layout parity does not depend on Vencord.
-            applyVendroidPluginCss();
+            // Vencord never became ready. Run the webpack-independent subset
+            // (ported CSS + gestures). initStage = 2 has stopped the poll, so
+            // late Vencord boot cannot reach doInit.
+            doInitStandalone("init-timeout");
             return;
         }
         setTimeout(initTick, 50);
@@ -102,16 +103,6 @@
 
     window.VencordMobile = {
         onBackPress() {
-            // Per-press breadcrumb for logcat forensics.
-            try {
-                console.warn("[Vendroid] back path=" + window.location.pathname +
-                    " searchOv=" + (_vendroidSearchOverlay ?
-                        String(_vendroidSearchOverlay.el.style.display) : "absent") +
-                    " side=" + isSidebarOpen);
-            } catch(e) {}
-            // Diagnostic: full sidebar signal snapshot at press time.
-            logSidebarState("back");
-
             if (!initialized) {
                 try {
                     var path = window.location.pathname;
@@ -210,8 +201,7 @@
     const cssUrls = [
         (typeof Vencord !== "undefined" && Vencord.Api && Vencord.Api.isEquicord)
             ? "https://github.com/Equicord/Equicord/releases/latest/download/browser.css"
-            : "https://github.com/Vendicated/Vencord/releases/latest/download/browser.css",
-        "https://raw.githubusercontent.com/VendroidEnhanced/random-files/refs/heads/main/moreFixes.css"
+            : "https://github.com/Vendicated/Vencord/releases/latest/download/browser.css"
     ];
 
     function injectStyle(url, css) {
@@ -219,32 +209,6 @@
         style.dataset.cacheUrl = url;
         style.textContent = css;
         document.documentElement.appendChild(style);
-    }
-
-    function patchMoreFixesCss(css) {
-        css = css.replace(/\/\*[\s\S]*?\*\//g, "");
-        css = css.replace(
-            /width:\s*var\(--screen-width\)\s*!important/g,
-            "width: 100vw !important"
-        );
-        const marker = 'div[role="dialog"]';
-        const segments = [];
-        let pos = 0;
-        while (true) {
-            const idx = css.indexOf(marker, pos);
-            if (idx === -1) { segments.push(css.substring(pos)); break; }
-            segments.push(css.substring(pos, idx));
-            const braceStart = css.indexOf('{', idx + marker.length);
-            if (braceStart === -1) { pos = idx + marker.length; continue; }
-            let depth = 0, i = braceStart;
-            while (i < css.length) {
-                if (css[i] === '{') depth++;
-                else if (css[i] === '}') { depth--; if (depth === 0) break; }
-                i++;
-            }
-            pos = i + 1;
-        }
-        return segments.join('');
     }
 
     const baseCss = `
@@ -1338,7 +1302,9 @@ video {
         var fetchedCssBuffer = [];
         function flushFetchedCss() {
             if (fetchedCssCount < cssUrls.length) return;
-            injectStyle("vendroid_fetched", fetchedCssBuffer.join("\n"));
+            // Vendored moreFixes rules follow browser.css, as the remote
+            // stylesheet did.
+            injectStyle("vendroid_fetched", fetchedCssBuffer.join("\n") + "\n" + VENDROID_MORE_FIXES_CSS);
         }
         function cssCacheKey(url) {
             var h = 0;
@@ -1355,7 +1321,6 @@ video {
                 }
             } catch(e) { cached = null; }
             if (cached) {
-                if (url.includes("moreFixes")) cached = patchMoreFixesCss(cached);
                 fetchedCssBuffer[idx] = cached;
                 fetchedCssCount++;
                 flushFetchedCss();
@@ -1364,7 +1329,6 @@ video {
             fetch(url)
                 .then(r => r.text())
                 .then(css => {
-                    if (url.includes("moreFixes")) css = patchMoreFixesCss(css);
                     fetchedCssBuffer[idx] = css;
                     fetchedCssCount++;
                     flushFetchedCss();

@@ -95,8 +95,9 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Bumped in VWebviewClient.onPageStarted for every main-frame navigation.
-     * Bridges that must stay bound to the document that opened them (the
-     * QuickCSS editor) capture this and reject work once it changes.
+     * Async work that must stay bound to the document that scheduled it
+     * captures this and bails once it changes: the QuickCSS editor bridge and
+     * injectVencordAttempt's runtime probe.
      */
     @Volatile
     var documentGeneration: Long = 0
@@ -1238,6 +1239,11 @@ class MainActivity : AppCompatActivity() {
         // Re-check every attempt: a poll can outlive the navigation that
         // scheduled it.
         if (!isDiscordAppOriginUrl(currentUrl)) return
+        // Bind this probe and its callback to the document current at
+        // scheduling time. onPageStarted bumps documentGeneration for every
+        // main-frame navigation, so a stale generation means the document was
+        // replaced and must not be injected.
+        val generation = documentGeneration
         val expectedHost = Uri.parse(currentUrl).host
             ?.let { vdeGson.toJson(it) } ?: return
         // The renderer must already sit on the expected Discord host. A
@@ -1259,6 +1265,21 @@ class MainActivity : AppCompatActivity() {
             // WebView reload() throws NPE inside Chromium on many builds, not
             // IllegalStateException, so a catch would not contain it.
             if (wv !== w) return@evaluateJavascript
+            // The probe describes the document that ran it, not the one now
+            // in the WebView, and RuntimeInjector.injectViaBridge's first eval
+            // carries the process-lifetime capability token. A stale result
+            // must not reach it.
+            if (documentGeneration != generation) {
+                VDELog.d("Main", "Dropping runtime probe for a replaced document")
+                return@evaluateJavascript
+            }
+            // The generation check catches a navigation whose onPageStarted
+            // already ran; the live read catches a commit to a non-app origin
+            // that has not fired yet. It cannot tell two app origins apart.
+            // The catch covers a WebView destroyed between the liveness check
+            // above and here.
+            val liveUrl = try { w.url } catch (_: Exception) { null }
+            if (liveUrl == null || !isDiscordAppOriginUrl(liveUrl)) return@evaluateJavascript
             when (raw?.trim('"')) {
                 "L", "H" -> {
                     // Still parsing or wrong document; retry briefly, then
@@ -1282,7 +1303,7 @@ class MainActivity : AppCompatActivity() {
                     scheduleBootVerify("mobile-repair")
                     routePendingDeepLink()
                 }
-                else -> {
+                "N" -> {
                     if (missedInjection) {
                         missedInjection = false
                         VDELog.w("Main", "Missed injection, scheduling reload")
@@ -1295,6 +1316,12 @@ class MainActivity : AppCompatActivity() {
                     // runs even if the bundle eval died mid-script).
                     scheduleBootVerify("eval-inject")
                     routePendingDeepLink()
+                }
+                else -> {
+                    // null or an unexpected renderer value. Fail closed: inject
+                    // nothing, leave missedInjection set for the next
+                    // navigation to consume.
+                    VDELog.w("Main", "Ignoring unexpected runtime probe result: $raw")
                 }
             }
         }

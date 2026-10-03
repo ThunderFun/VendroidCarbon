@@ -9,21 +9,22 @@ import java.io.File
 /**
  * Pins the download-time patch set against the vanilla upstream bundles.
  *
- * The patch list is the three sourceURL relabels plus the three vde-off
- * default flips (WebPWA, WebScreenShare, WebScreenShareFixes). The
- * VENDROID_DISABLED and vde-prune-* patches were removed with the
- * vendored plugin bundle and must stay retired. The regression this suite catches is a pattern
- * drifting out of upstream text; applyPatches would log "Patch matched
- * nothing". For the relabels, uncaught errors would collapse back to
- * "Script error." with lineno 0. For the default flips, the three desktop
- * plugins would come back enabled by default (the runtime sweep still
- * disables them, so this is defense in depth, not the only guard).
+ * The patch list is three sourceURL relabels, three vde-off default flips
+ * for WebPWA, WebScreenShare, and WebScreenShareFixes, and the user-plugins
+ * gate. The VENDROID_DISABLED and vde-prune-* patches were removed with the
+ * vendored plugin bundle and must stay retired.
  *
- * The fixtures are the vanilla release bundles vendored in the repo root
- * (vencord_snapshot.js / equicord_snapshot.js).
- * Each test first asserts its precondition on the raw snapshot so an
- * upstream re-bundle that drops an anchor fails with a precise message
- * instead of a confusing post-patch assertion.
+ * This suite catches a patch pattern drifting out of upstream text, which
+ * makes applyPatches log "Patch matched nothing". For the relabels,
+ * uncaught errors would collapse back to "Script error." with lineno 0.
+ * For the default flips, the three desktop plugins would come back enabled
+ * by default. The runtime sweep still disables them, so this is defense in
+ * depth, not the only guard.
+ *
+ * The repo root vendors the vanilla release bundles as vencord_snapshot.js
+ * and equicord_snapshot.js. Each test first asserts its precondition on the
+ * raw snapshot, so an upstream re-bundle that drops an anchor fails with a
+ * precise message instead of a confusing post-patch assertion.
  */
 class HttpClientBundlePatchTest {
 
@@ -97,16 +98,25 @@ class HttpClientBundlePatchTest {
         assertTrue(patched.contains("https://discord.com/vencord-web.js"))
         assertTrue(patched.contains("https://discord.com/vencord-ext-module"))
         assertTrue(patched.contains("https://discord.com/vencord-module"))
-        // Relabels are comment-only, so their only length change is the
-        // URL delta. Each vde-off flip swaps !0 for !1 (length-neutral)
-        // and adds its marker; any other length change means the patch
-        // mangled code.
+        // Relabels are comment-only, so their only length change is the URL
+        // delta. Each vde-off flip swaps !0 for !1 without changing length
+        // and adds its marker. The user-plugins gate inserts a condition, so
+        // measure that insertion from the snapshot's anchor before checking
+        // the total. Any other length change means a patch mangled code.
         val relabelDelta =
             ("https://discord.com/vencord-web.js".length - "file:///VencordWeb".length) +
             ("https://discord.com/vencord-ext-module".length - "file:///ExtractedWebpackModule".length) +
             ("https://discord.com/vencord-module".length - "file:///WebpackModule".length)
+        val gateAnchor = Regex(
+            """Starting plugins \(stage \$\{[A-Za-z_$][\w$]*\}\)`\);for\(let [A-Za-z_$][\w$]* in [A-Za-z_$][\w$]*\)if\([A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\)\)\{"""
+        ).find(raw)
+        assertTrue("user-plugins gate anchor must exist in the raw snapshot", gateAnchor != null)
+        val anchorText = gateAnchor!!.value
+        val gateDelta =
+            HttpClient.applyPatches(anchorText).length - anchorText.length
+        assertEquals(1, countOccurrences(patched, "/*vde-user-plugins-gate*/"))
         assertEquals(
-            raw.length + relabelDelta +
+            raw.length + relabelDelta + gateDelta +
                 "/*vde-off-pwa*/".length + "/*vde-off-wss*/".length + "/*vde-off-wssf*/".length,
             patched.length
         )
