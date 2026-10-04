@@ -63,7 +63,7 @@ class VencordCspTest {
         val script = csp.split("; ").first { it.startsWith("script-src") }
         val style = csp.split("; ").first { it.startsWith("style-src") }
         assertFalse(script.contains("github"))
-        assertFalse(style.contains("github.com"))
+        assertFalse(style.contains("release-assets.githubusercontent.com"))
     }
 
     @Test fun objectSrcLockedDown() {

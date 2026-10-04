@@ -25,9 +25,10 @@ object VencordCsp {
         "default-src 'self'; " +
             "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
             "style-src 'self' 'unsafe-inline' data: " +
+            "https://github.com https://gist.githubusercontent.com " +
             "https://*.githack.com https://cbcdn.githack.com " +
             "https://raw.githubusercontent.com https://cdn.jsdelivr.net " +
-            "https://*.github.io https://*.codeberg.page; " +
+            "https://*.github.io https://*.codeberg.page https://codeberg.org; " +
             "connect-src 'self' https://*.discord.com https://*.discordapp.com " +
             "https://*.discord.media https://*.discord.media:* " +
             "https://*.discordapp.net " +
