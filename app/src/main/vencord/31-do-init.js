@@ -81,4 +81,5 @@
     // Slate is used, and setupSlateInputFix handles the resulting input issues.
     var _vendroidSlateOverrideDone = false;
     var _vendroidSlateOverrideRetries = 0;
+    var _vendroidSlateOverrideGaveUp = false;
 

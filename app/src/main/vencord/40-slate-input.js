@@ -1,16 +1,42 @@
+    // Discord exposes the platform helpers in a friendly-name re-export
+    // (isAndroidWeb/isDesktop/isIOS/...) and a minified source module. The
+    // composer reads isAndroidWeb from the re-export at render time, so that
+    // module is the override target. Discord can split the re-export, so try
+    // the full shape first, then the single prop. Both probes use the silent
+    // scan; findByProps would log on every poll miss.
+    function vendroidPlatformUtilsFilter(requireFullShape) {
+        return function(m) {
+            if (!m || typeof m.isAndroidWeb !== "function") return false;
+            if (!requireFullShape) return true;
+            return typeof m.isDesktop === "function" && typeof m.isIOS === "function";
+        };
+    }
+
+    function vendroidFindPlatformUtils(out) {
+        return vendroidScanModuleCaches(vendroidPlatformUtilsFilter(true), out) ||
+               vendroidScanModuleCaches(vendroidPlatformUtilsFilter(false), out);
+    }
+
     function setupSlateOverride() {
         if (_vendroidSlateOverrideDone) return;
         try {
-            if (typeof Vencord === "undefined" || !Vencord.Webpack || !Vencord.Webpack.findByProps) {
+            if (typeof Vencord === "undefined" || !Vencord.Webpack) {
                 if (_vendroidSlateOverrideRetries++ < 300) setTimeout(setupSlateOverride, 50);
                 return;
             }
-            var PlatformUtils = null;
-            try {
-                PlatformUtils = Vencord.Webpack.findByProps("isAndroidWeb", "isDesktop", "isIOS");
-            } catch(e) {}
-            if (!PlatformUtils || typeof PlatformUtils.isAndroidWeb !== "function") {
-                if (_vendroidSlateOverrideRetries++ < 300) setTimeout(setupSlateOverride, 50);
+            // Silent lookup only; Vencord.Webpack.findByProps logs on every miss.
+            var target = {};
+            var PlatformUtils = vendroidFindPlatformUtils(target);
+            if (!PlatformUtils) {
+                if (_vendroidSlateOverrideRetries++ < 300) {
+                    setTimeout(setupSlateOverride, 50);
+                } else if (!_vendroidSlateOverrideGaveUp) {
+                    // Warn once at give-up. The UA fallback in
+                    // isAndroidWebDevicePreOverride() still drives the mstyle gate.
+                    _vendroidSlateOverrideGaveUp = true;
+                    console.warn("[Vendroid] Slate override: platform module not found after 300 " +
+                        "attempts; staying on the stock mobile editor");
+                }
                 return;
             }
             var origResult = false;
@@ -28,12 +54,14 @@
                     writable: true, configurable: true, enumerable: true
                 });
                 _vendroidSlateOverrideDone = true;
-                console.warn("[Vendroid] Slate override: isAndroidWeb → false (enables Slate + command browser)");
+                console.warn("[Vendroid] Slate override: isAndroidWeb → false (enables Slate + " +
+                    "command browser; module " + target.id + ")");
             } catch(e) {
                 try {
                     PlatformUtils.isAndroidWeb = function() { return false; };
                     _vendroidSlateOverrideDone = true;
-                    console.warn("[Vendroid] Slate override: isAndroidWeb → false (fallback)");
+                    console.warn("[Vendroid] Slate override: isAndroidWeb → false (fallback; " +
+                        "module " + target.id + ")");
                 } catch(e2) {
                     console.error("[Vendroid] Slate override failed: " + e2.message);
                 }

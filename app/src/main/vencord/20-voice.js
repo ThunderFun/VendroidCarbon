@@ -215,7 +215,7 @@
     function setupVoiceSupport() {
         if (_vendroidVoiceSetupDone) return;
         try {
-            if (typeof Vencord === "undefined" || !Vencord.Webpack || !Vencord.Webpack.findByProps) {
+            if (typeof Vencord === "undefined" || !Vencord.Webpack) {
                 vendroidVoiceRetry("Vencord not ready");
                 return;
             }
@@ -223,11 +223,11 @@
             // 1. Best-effort: flip the capability flag the picker reads. It
             //    may be a non-configurable webpack getter, in which case this
             //    logs and moves on; step 2 is the one that must succeed.
-            //    Prefer the known minified prop set (Vencord's proxy is
-            //    redefinable), then a source signature if the letters changed.
+            //    Prefer the known minified prop set, then a source signature
+            //    if the letters changed.
             try {
                 var caps = null;
-                try { caps = Vencord.Webpack.findByProps("g7", "fA", "zU"); } catch (e0) {}
+                try { caps = vendroidFindByProps("g7", "fA", "zU"); } catch (e0) {}
                 if (!caps || caps.Hz === undefined) {
                     try { caps = findModuleByCode(['ua.indexOf("OculusBrowser")']); } catch (e0) {}
                 }
@@ -244,12 +244,12 @@
                         });
                         console.warn("[Vendroid] Voice: Hz " + oldHz + " -> true");
                     } catch (e1) {
-                        // Raw module namespaces expose non-configurable webpack
-                        // getters; Vencord's findByProps proxy is redefinable,
-                        // so retry through it before giving up.
+                        // Hz can be a non-configurable getter on this export.
+                        // Try the single-prop lookup for another owner before
+                        // giving up.
                         var patched = false;
                         try {
-                            var proxy = Vencord.Webpack.findByProps("Hz");
+                            var proxy = vendroidFindByProps("Hz");
                             if (proxy && proxy !== caps && proxy.Hz !== true) {
                                 Object.defineProperty(proxy, "Hz", {
                                     configurable: true, enumerable: true,
@@ -288,9 +288,9 @@
             //    never minified). If it already bound the DUMMY engine, put a
             //    live WebRTC engine behind it so join/connect work now.
             var store = null;
-            try { store = Vencord.Webpack.findByProps("isSupported", "getMediaEngine", "getInputDevices"); } catch (e) {}
+            try { store = vendroidFindByProps("isSupported", "getMediaEngine", "getInputDevices"); } catch (e) {}
             if (!store || typeof store.getMediaEngine !== "function") {
-                try { store = Vencord.Webpack.findByProps("isSupported", "getMediaEngine"); } catch (e) {}
+                try { store = vendroidFindByProps("isSupported", "getMediaEngine"); } catch (e) {}
             }
             if (!store || typeof store.getMediaEngine !== "function" || typeof store.isSupported !== "function") {
                 console.warn("[Vendroid] Voice: media engine store not found");

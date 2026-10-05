@@ -2,24 +2,18 @@
 -keepattributes *Annotation*
 -keepattributes RuntimeVisibleAnnotations
 
-# WebView JS bridge: VencordNative must keep its class name, method names,
-# and parameter types exactly as-is because JavaScript calls them by name
-# via VencordMobileNative.getString(...) etc.  The default
-# proguard-android-optimize.txt keeps @JavascriptInterface methods,
-# but aggressive R8 settings (-repackageclasses, -allowaccessmodification)
-# can still break the bridge if the class itself is obfuscated or merged.
+# WebView JS bridge: JavaScript invokes VencordNative members by name via
+# VencordMobileNative.getString(...). R8 cannot see those call sites, so keep
+# the class and its @JavascriptInterface methods.
 -keep @interface android.webkit.JavascriptInterface
 -keepclassmembers class io.github.thunderfun.vendroid.webview.VencordNative {
     @android.webkit.JavascriptInterface <methods>;
 }
-# Also keep the class from being renamed/merged so the runtime type
-# matches what addJavascriptInterface() registered.
 -keep class io.github.thunderfun.vendroid.webview.VencordNative { *; }
 
-# Inner bridge classes registered via addJavascriptInterface() from
-# openLogs()/openQuickCss()/openFirewallEditor(). R8's aggressive passes
-# can merge or rename these even though @JavascriptInterface keeps their
-# method names, so keep the classes explicitly.
+# Inner bridges registered by openLogs(), openQuickCss(), and
+# openFirewallEditor(). They are only reached from JavaScript, so keep them
+# from being merged.
 -keep class io.github.thunderfun.vendroid.webview.VencordNative$LogViewerBridge { *; }
 -keep class io.github.thunderfun.vendroid.webview.VencordNative$QuickCssBridge { *; }
 -keep class io.github.thunderfun.vendroid.webview.VencordNative$FirewallEditorBridge { *; }
@@ -39,20 +33,18 @@
 # Keep source file names and line numbers for crash reports in debug
 -keepattributes SourceFile,LineNumberTable
 
--printmapping build/outputs/mapping/mapping.txt
+# AGP writes the mapping to build/outputs/mapping/<variant>/mapping.txt.
+# Do not add -printmapping: the last variant to build overwrites a fixed path.
 
-# Aggressive R8 optimization: enables inlining, class merging,
-# access modification, and multiple optimization passes for a
-# smaller DEX and faster class loading.
--repackageclasses ''
--allowaccessmodification
+# Keep shrinking and optimization; obfuscation stays off so class and member
+# names remain readable in stack traces.
+-dontobfuscate
 -optimizationpasses 5
 -mergeinterfacesaggressively
 
-# VDELog: in-app logging engine. Keep the class and all members; R8's
-# aggressive passes (-optimizationpasses 5, -allowaccessmodification,
-# -repackageclasses) can inline or merge it away if it looks unused.
-# The HandlerThread and Handler fields must survive for file I/O.
+# VDELog: in-app logging engine. Keep it and its members so R8 does not
+# inline methods or merge the class away. The HandlerThread and Handler
+# fields must survive for file I/O.
 -keep class io.github.thunderfun.vendroid.utils.VDELog { *; }
 -keep class io.github.thunderfun.vendroid.utils.VDELog$Level { *; }
 -keep class io.github.thunderfun.vendroid.utils.VDELog$LogEntry { *; }
@@ -75,10 +67,8 @@
     public static int e(...);
 }
 
-# OkHttp 5.x + Okio (aggressive R8: -repackageclasses, -allowaccessmodification,
-# -mergeinterfacesaggressively). The AAR bundles its own okhttp3.pro (mostly
-# -dontwarn); these keeps are belt-and-suspenders so the synchronous
-# Call/ConnectionPool subset survives shrinking.
+# OkHttp 5.x + Okio. The AAR's okhttp3.pro is mostly -dontwarn, so these
+# keeps protect the synchronous Call/ConnectionPool subset from shrinking.
 -keep class okhttp3.** { *; }
 -keep interface okhttp3.** { *; }
 -keep class okio.** { *; }

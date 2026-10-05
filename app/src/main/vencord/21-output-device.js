@@ -6,14 +6,14 @@
     function setupOutputDeviceSupport() {
         if (_vendroidOutputSetupDone) return;
         try {
-            if (typeof Vencord === "undefined" || !Vencord.Webpack || !Vencord.Webpack.findByProps) {
+            if (typeof Vencord === "undefined" || !Vencord.Webpack) {
                 vendroidOutputRetry("Vencord not ready");
                 return;
             }
             var store = null;
-            try { store = Vencord.Webpack.findByProps("isSupported", "getMediaEngine", "getInputDevices"); } catch (e) {}
+            try { store = vendroidFindByProps("isSupported", "getMediaEngine", "getInputDevices"); } catch (e) {}
             if (!store || typeof store.supports !== "function") {
-                try { store = Vencord.Webpack.findByProps("isSupported", "getMediaEngine"); } catch (e) {}
+                try { store = vendroidFindByProps("isSupported", "getMediaEngine"); } catch (e) {}
             }
             if (!store || typeof store.supports !== "function") {
                 vendroidOutputRetry("media engine store not found");

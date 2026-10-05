@@ -152,6 +152,7 @@
     var _vendroidGifPatched = false;
     var _vendroidGifOverlayPatched = false;
     var _vendroidGifRetryCount = 0;
+    var _vendroidGifGaveUp = false;
     // Verify failures are deterministic per webpack state (a read-only export
     // stays read-only), so unlike module resolution this budget stays small.
     var _vendroidGifPatchRetryCount = 0;
@@ -159,7 +160,7 @@
     function setupGifPickerButton() {
         if (_vendroidGifPatched) return;
         try {
-            if (typeof Vencord === "undefined" || !Vencord.Webpack || !Vencord.Webpack.findByProps) {
+            if (typeof Vencord === "undefined" || !Vencord.Webpack) {
                 if (_vendroidGifRetryCount++ < 300) setTimeout(setupGifPickerButton, 50);
                 return;
             }
@@ -167,21 +168,27 @@
             // Resolve core modules.
             var PlatformUtils = null;
             try {
-                PlatformUtils = Vencord.Webpack.findByProps("Fr", "Ct", "KY", "v1");
+                PlatformUtils = vendroidFindByProps("Fr", "Ct", "KY", "v1");
             } catch(e) {}
             var ExpressionPickerStore = null;
             try {
-                ExpressionPickerStore = Vencord.Webpack.findByProps("r$", "ed", "v8", "RQ");
+                ExpressionPickerStore = vendroidFindByProps("r$", "ed", "v8", "RQ");
             } catch(e) {}
             var ExpressionPickerViewTypes = null;
             try {
-                ExpressionPickerViewTypes = Vencord.Webpack.findByProps("kx", "VQ", "wp");
+                ExpressionPickerViewTypes = vendroidFindByProps("kx", "VQ", "wp");
             } catch(e) {}
 
             if (!PlatformUtils || PlatformUtils.Fr === undefined ||
                 !ExpressionPickerStore || !ExpressionPickerStore.r$ ||
                 !ExpressionPickerViewTypes || !ExpressionPickerViewTypes.kx) {
-                if (_vendroidGifRetryCount++ < 300) setTimeout(setupGifPickerButton, 50);
+                if (_vendroidGifRetryCount++ < 300) {
+                    setTimeout(setupGifPickerButton, 50);
+                } else if (!_vendroidGifGaveUp) {
+                    _vendroidGifGaveUp = true;
+                    console.warn("[Vendroid] GIF: core modules not found after 300 attempts; " +
+                        "picker stays stock");
+                }
                 return;
             }
             console.warn("[Vendroid] GIF: core modules resolved (Fr=" + PlatformUtils.Fr + ")");

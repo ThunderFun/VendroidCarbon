@@ -74,7 +74,10 @@
             console.error("[Vendroid] Init timed out after " + initAttempts + " attempts (" + (initAttempts * 50) + "ms) | " + bootStateSnapshot());
             initStage = 2;
             recoverPlugins();
-            tryStartPluginsStage();
+            // Best-effort full sweep. Vencord never became ready, and the
+            // started filter in vendroidStartMissingPlugins() prevents
+            // duplicates.
+            tryStartPluginsStage(true);
             // Vencord never became ready. Run the webpack-independent subset
             // (ported CSS + gestures). initStage = 2 has stopped the poll, so
             // late Vencord boot cannot reach doInit.
