@@ -533,7 +533,12 @@ class VendroidApp : Application() {
         launchStartupTask("disk-cache-preload") {
             try {
                 MainFrameDiskCache.init(applicationContext)
-                VWebviewClient.preloadMainFrameCache()
+                // Prefer the route this session will resume into, so the
+                // preload budget does not skip it.
+                val resumeUrl = getSharedPreferences(SettingKeys.PREFS_NAME, Context.MODE_PRIVATE)
+                    .getStringSafe(SettingKeys.KEY_LAST_URL, "")
+                    .takeIf { it.isNotEmpty() && MainFrameDiskCache.isResumableRoute(it) }
+                VWebviewClient.preloadMainFrameCache(resumeUrl)
                 VDELog.i("VDE", "Main-frame disk cache preloaded")
             } catch (ex: Exception) {
                 VDELog.e("VDE", "Main-frame disk cache preload failed", ex)

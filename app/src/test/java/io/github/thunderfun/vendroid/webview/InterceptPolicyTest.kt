@@ -286,6 +286,9 @@ class InterceptPolicyTest {
         val read = MainFrameDiskCache.readMainFrame(url)
         assertEquals("|ck=abc", read?.credentialPartition)
         assertEquals("no-referrer", read?.headers?.get("referrer-policy"))
-        assertFalse(read?.headers?.containsKey("cache-control") ?: true)
+        // Freshness metadata persists so the serve path can revalidate
+        // conditionally and honour the origin's directives. It must stay out
+        // of the SERVED response, which copyStalePreservedHeaders' test covers.
+        assertEquals("max-age=60", read?.headers?.get("cache-control"))
     }
 }

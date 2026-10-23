@@ -48,6 +48,10 @@ import kotlin.concurrent.withLock
 
     /** Cap on the number of URLs recorded in the preload index. */
     private const val MAX_INDEXED_URLS = 64
+    /** Total size cap for every entry in the store. */
+    internal const val MAX_DISK_BYTES = 32L * 1024 * 1024
+    private const val POLICY_META_KEY = "@policy"
+    private const val POLICY_META_VERSION = "1"
 
     /** Entry files are named "$base.<suffix>"; base is this many lowercase hex chars. */
     private const val ENTRY_BASE_LEN = 32
@@ -133,7 +137,7 @@ import kotlin.concurrent.withLock
      * [requestKey] marks a legacy entry that always misses. [reasonPhrase] is
      * stored and replayed on a stale serve.
      */
-    fun writeMainFrame(
+    @Synchronized fun writeMainFrame(
         urlString: String,
         rawBody: ByteArray,
         headers: Map<String, String>,
@@ -148,6 +152,7 @@ import kotlin.concurrent.withLock
         if (!isCacheableRoute(uri)) return false
 
         return try {
+            if (!dir.exists() && !dir.mkdirs()) return false
             val base = entryBaseName(urlString)
             // Matched-pair scheme: the body is named by the same timestamp
             // stored in the meta ("$base.<ts>.html"). The meta (renamed last)
@@ -173,18 +178,20 @@ import kotlin.concurrent.withLock
             //   2..: "key\tbase64value" header pairs (bounded, no newlines in values)
             //   "@rkey\tbase64value" request key; absent in older entries
             //         (reads as null, so the serve path always misses)
-            //   last: "@cred\tbase64value" credential partition; absent in
+            //   "@cred\tbase64value" credential partition; absent in
             //         older entries (reads as "")
+            //   "@policy\tbase64value" metadata version; absent in entries
+            //         written before freshness metadata was stored
             val sb = StringBuilder()
             sb.append(nowMs).append('\n')
             sb.append(Base64.getEncoder().encodeToString(reasonPhrase.toByteArray(Charsets.UTF_8))).append('\n')
             val enc = Base64.getEncoder()
             for ((k, v) in headers) {
-                // Keep the headers the stale serve can replay: content-type
-                // and the security policies in STALE_PRESERVED_HEADERS.
+                // Keep what a stale serve replays (content-type, security
+                // policies) plus the freshness and validator fields.
                 val lk = k.lowercase()
                 if (lk == "content-length" || lk == "content-encoding" || lk == "transfer-encoding") continue
-                if (lk == "content-type" || lk in STALE_PRESERVED_HEADERS) {
+                if (lk == "content-type" || lk in STALE_PRESERVED_HEADERS || lk in CACHE_METADATA_HEADERS) {
                     val kv = "$k\t${enc.encodeToString(v.toByteArray(Charsets.UTF_8))}"
                     sb.append(kv).append('\n')
                 }
@@ -195,6 +202,8 @@ import kotlin.concurrent.withLock
             }
             sb.append(CREDENTIAL_META_KEY).append('\t')
                 .append(enc.encodeToString(credentialPartition.toByteArray(Charsets.UTF_8))).append('\n')
+            sb.append(POLICY_META_KEY).append('\t')
+                .append(enc.encodeToString(POLICY_META_VERSION.toByteArray(Charsets.UTF_8))).append('\n')
             // Write meta atomically LAST. It is the commit point.
             metaTmp.writeText(sb.toString())
             if (!metaTmp.renameTo(meta)) {
@@ -220,22 +229,14 @@ import kotlin.concurrent.withLock
                 val lines = try {
                     idx.readLines().toMutableList()
                 } catch (_: Exception) { mutableListOf() }
-                // Keep the list bounded; drop the oldest entries beyond the cap.
-                if (!lines.contains(urlString)) {
-                    lines.add(urlString)
-                    if (lines.size > MAX_INDEXED_URLS) {
-                        // Untrack the oldest URL. Its files may still be inside
-                        // the MAX_AGE_MS serve window, so leave deletion to the
-                        // sweep below, which reclaims them once they expire.
-                        // The dead index line is a harmless preload miss until
-                        // the FIFO cycles it out.
-                        lines.removeAt(0)
-                    }
-                    // Index write is best-effort; losing it only skips a cold-start preload hint.
-                    try { idx.writeText(lines.joinToString("\n") + "\n") } catch (_: Exception) {}
-                }
-                // Reclaim aged-out entries (evicted URLs, crash debris).
+                lines.removeAll { it == urlString }
+                lines.add(urlString)
+                while (lines.size > MAX_INDEXED_URLS) deleteEntryFiles(dir, entryBaseName(lines.removeAt(0)))
                 sweepExpiredEntries(dir, nowMs)
+                trimToBudget(dir)
+                lines.removeAll { !File(dir, "${entryBaseName(it)}.meta").exists() }
+                // Losing an index hint only costs a cold-start cache miss.
+                try { idx.writeText(lines.joinToString("\n") + "\n") } catch (_: Exception) {}
             }
             true
         } catch (e: Exception) {
@@ -284,7 +285,7 @@ import kotlin.concurrent.withLock
                 return null
             }
             val bodyFile = File(dir, "$base.$fetchedAt.html")
-            if (!bodyFile.exists()) return null
+            if (!bodyFile.exists() || bodyFile.length() > MAX_BODY_BYTES) return null
             val body = bodyFile.readBytes()
             if (body.isEmpty() || body.size > MAX_BODY_BYTES) return null
             // Commit landed mid-read → treat as a miss rather than a torn pair.
@@ -302,6 +303,7 @@ import kotlin.concurrent.withLock
             val headers = HashMap<String, String>()
             var credentialPartition = ""
             var requestKey: String? = null
+            var policyVersion: String? = null
             val dec = Base64.getDecoder()
             for (line in metaLines.drop(2)) {
                 if (line.isEmpty()) continue
@@ -315,10 +317,14 @@ import kotlin.concurrent.withLock
                     when (k) {
                         CREDENTIAL_META_KEY -> credentialPartition = value
                         REQUEST_KEY_META_KEY -> requestKey = value
+                        POLICY_META_KEY -> policyVersion = value
                         else -> headers[k] = value
                     }
                 } catch (_: Exception) {}
             }
+            // An absent marker means the entry predates freshness metadata and
+            // keeps the app TTL. A marker from a newer build is a miss.
+            if (policyVersion != null && policyVersion != POLICY_META_VERSION) return null
             if (headers.isEmpty()) headers["content-type"] = "text/html"
             CachedMainFrame(body, reason, headers, fetchedAt, credentialPartition, requestKey)
         } catch (e: Exception) {
@@ -369,11 +375,50 @@ import kotlin.concurrent.withLock
         }
     }
 
+    private fun deleteEntryFiles(dir: File, base: String) {
+        dir.listFiles { _, name -> name.startsWith("$base.") }?.forEach { it.delete() }
+    }
+
+    /** Evicts the oldest entries until the store fits [MAX_DISK_BYTES]. Scans the
+     *  directory, so unindexed entries and crash debris count too. */
+    private fun trimToBudget(dir: File) {
+        val groups = dir.listFiles().orEmpty().filter {
+            val base = it.name.substringBefore('.')
+            base.length == ENTRY_BASE_LEN && base.all { c -> c in '0'..'9' || c in 'a'..'f' }
+        }.groupBy { it.name.substringBefore('.') }
+        var total = groups.values.sumOf { files -> files.sumOf { it.length() } }
+        for ((base, files) in groups.entries.sortedBy { (_, files) ->
+            readFetchedAt(files.firstOrNull { it.name.endsWith(".meta") } ?: files.first())
+                ?: files.maxOf { it.lastModified() }
+        }) {
+            if (total <= MAX_DISK_BYTES) break
+            for (file in files) {
+                val length = file.length()
+                if (file.delete()) total -= length
+            }
+        }
+    }
+
+    /** Drops the entry files and its index line, so a preload never retries it. */
+    @Synchronized fun remove(urlString: String) {
+        val dir = cacheDir ?: return
+        deleteEntryFiles(dir, entryBaseName(urlString))
+        try {
+            val idx = File(dir, "index.txt")
+            if (!idx.exists()) return
+            val lines = idx.readLines()
+            val kept = lines.filter { it != urlString }
+            if (kept.size != lines.size) idx.writeText(kept.joinToString("\n") + "\n")
+        } catch (_: Exception) {
+            // A stale index line is a harmless preload miss.
+        }
+    }
+
     /** The cacheable URLs recorded during writes, for cold-start preload. */
     fun preloadableUrls(): List<String> {
         val dir = cacheDir ?: return emptyList()
         return try {
-            File(dir, "index.txt").readLines().filter { it.isNotBlank() }
+            File(dir, "index.txt").readLines().filter { it.isNotBlank() }.takeLast(MAX_INDEXED_URLS)
         } catch (_: Exception) {
             emptyList()
         }
@@ -385,7 +430,7 @@ import kotlin.concurrent.withLock
      * path in [VWebviewClient] reads only memory and would otherwise keep
      * serving entries whose disk files no longer exist.
      */
-    fun clear() {
+    @Synchronized fun clear() {
         VWebviewClient.clearPreloadedShells()
         val dir = cacheDir ?: return
         try {

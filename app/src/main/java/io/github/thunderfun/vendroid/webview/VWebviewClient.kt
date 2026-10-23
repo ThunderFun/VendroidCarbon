@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.util.LruCache
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
@@ -18,7 +19,6 @@ import io.github.thunderfun.vendroid.BuildConfig
 import io.github.thunderfun.vendroid.MainActivity
 import io.github.thunderfun.vendroid.VendroidApp
 import io.github.thunderfun.vendroid.utils.Constants
-import io.github.thunderfun.vendroid.utils.DiscordBranch
 import io.github.thunderfun.vendroid.utils.FirewallConfig
 import io.github.thunderfun.vendroid.utils.JsPatches
 import io.github.thunderfun.vendroid.utils.VDELog
@@ -240,7 +240,7 @@ class VWebviewClient(
         // a shell nor spawn the revalidate below.
         if (req.method != "GET") return null
         // Enforce the "app-shell Discord routes only" premise at the consumer:
-        // preloadedShells is process-lifetime state and the injection below
+        // the preload store is process-lifetime state and the injection below
         // hardcodes isDiscordMainFrame = true. Mirrors the disk read gate.
         if (!MainFrameDiskCache.isCacheableRoute(req.url)) return null
         // Prefer the memory-preloaded shell (filled at cold start from the
@@ -251,6 +251,12 @@ class VWebviewClient(
         // worker.
         val cached: MainFrameDiskCache.CachedMainFrame? = StaleMainFrame.inMemoryShell(urlString)
         val shell = cached ?: return null
+        // Refuse a shell whose response forbids reuse: no-store, no-cache,
+        // private, or an expired must-revalidate.
+        if (!responseCacheMayServeShell(
+                shell.headers, shell.fetchedAt, MAIN_FRAME_TTL_MS, MainFrameDiskCache.MAX_AGE_MS
+            )
+        ) return null
         // Bind the URL-keyed shell to the request it was fetched for:
         // credentials plus the cache-key variant fields (method +
         // VARIANT_HEADERS). A mismatch, including a legacy null request key,
@@ -277,23 +283,30 @@ class VWebviewClient(
         if (result.runtimeEmbedded) {
             VDELog.i("WV", "Embedded Vencord runtime into stale main frame: ${UrlNormalizer.redactForLog(urlString)}")
         }
-        // Background revalidate; skip if one is already in flight for this URL.
-        // The slot cap bounds queued plus running refreshes globally, so
-        // distinct shell hits cannot pile unbounded work behind one slow
-        // request. A skipped refresh is harmless; the next navigation retries.
-        val claimed = revalidatingUrls.add(urlString)
+        // Revalidate in the background unless the shell is still fresh, a
+        // refresh for this key is already running, or the last attempt's
+        // cooldown (with failure backoff) has not elapsed. The slot cap bounds
+        // queued plus running refreshes, so distinct shell hits cannot pile
+        // work behind one slow request.
+        val claimed = !responseCacheIsFresh(shell.headers, shell.fetchedAt, MAIN_FRAME_TTL_MS) &&
+            refreshSchedule.isDue(responseCacheKey, SystemClock.elapsedRealtime()) &&
+            revalidatingUrls.add(responseCacheKey)
         if (claimed && revalidationSlots.tryAcquire()) {
             // Build the refresh request ON the intercept thread and snapshot
             // the main-frame flag: `req` is a Chromium-owned
             // WebResourceRequest that is not guaranteed safe to dereference
             // off-thread or after the callback returns.
             val refreshBuilder = try { okHttpRequestBuilder(req, urlString) } catch (_: Exception) { null }
+            // A matching validator turns the revalidation into a 304, so an
+            // unchanged shell costs headers instead of the HTML body.
+            val addedValidator = refreshBuilder?.let { addShellValidators(it, shell) } ?: false
             val refreshIsMainFrame = req.isForMainFrame
             val refreshCookiePairs = initialCookiePairs(req)
             val refreshCredentialPartition = requestCredentialPartition(req)
             try {
                 revalidateExecutor.execute {
                     var refreshResponse: Response? = null
+                    var success = false
                     try {
                         if (refreshBuilder != null) {
                             refreshResponse = HttpClient.sharedClient.newCall(refreshBuilder.build()).execute()
@@ -313,11 +326,29 @@ class VWebviewClient(
                                     refreshResponse.close()
                                     refreshResponse = resolved
                                 }
-                                fetchAndProcessResponse(
-                                    refreshIsMainFrame, resolved, false, CacheTarget.MAIN_FRAME,
-                                    urlString, responseCacheKey, credentialPartition = refreshCredentialPartition,
-                                    publishInjectionClaims = false, deliverCookies = false
-                                )
+                                // A 304 has no body, so replay it over the stored
+                                // shell bytes and process it like a fresh body.
+                                val validated = validatedShellResponse(resolved, shell, urlString, addedValidator)
+                                try {
+                                    fetchAndProcessResponse(
+                                        refreshIsMainFrame, validated ?: resolved, false, CacheTarget.MAIN_FRAME,
+                                        urlString, responseCacheKey, credentialPartition = refreshCredentialPartition,
+                                        publishInjectionClaims = false, deliverCookies = false
+                                    )
+                                    // Any 304 confirms the cached copy is current,
+                                    // so it earns the normal cooldown instead of
+                                    // failure backoff.
+                                    success = when {
+                                        validated != null ->
+                                            StaleMainFrame.inMemoryShell(urlString)?.let {
+                                                it.requestKey == responseCacheKey && it !== shell
+                                            } == true
+                                        resolved.code == 304 -> true
+                                        else -> false
+                                    }
+                                } finally {
+                                    validated?.close()
+                                }
                             }
                         }
                     } catch (_: Exception) {
@@ -325,19 +356,20 @@ class VWebviewClient(
                     } finally {
                         // Close to return the pooled connection (not disconnect()).
                         refreshResponse?.close()
-                        revalidatingUrls.remove(urlString)
+                        refreshSchedule.completed(responseCacheKey, success, SystemClock.elapsedRealtime())
+                        revalidatingUrls.remove(responseCacheKey)
                         revalidationSlots.release()
                     }
                 }
             } catch (_: RejectedExecutionException) {
                 // The queue is sized for the slot cap, so this should not
                 // happen; release rather than leak the slot.
-                revalidatingUrls.remove(urlString)
+                revalidatingUrls.remove(responseCacheKey)
                 revalidationSlots.release()
             }
         } else if (claimed) {
             // Global cap reached; the next navigation retries.
-            revalidatingUrls.remove(urlString)
+            revalidatingUrls.remove(responseCacheKey)
         }
 
         // A stale-served main frame is always HTML (the raw shell). Serve a
@@ -655,7 +687,11 @@ class VWebviewClient(
                 themeCssCache.remove(responseCacheKey)
                 return null
             }
-            if (System.currentTimeMillis() - cached.fetchedAt < THEME_CSS_TTL_MS) {
+            // The 5 min window, minus responses whose directives forbid reuse.
+            if (responseCacheMayServeShell(
+                    cached.headers, cached.fetchedAt, THEME_CSS_TTL_MS, THEME_CSS_TTL_MS
+                )
+            ) {
                 return WebResourceResponse("text/css", "utf-8", cached.statusCode, cached.reasonPhrase, cached.headers, ByteArrayInputStream(cached.body))
             }
             themeCssCache.remove(responseCacheKey)
@@ -687,7 +723,10 @@ class VWebviewClient(
             mainFrameCache.remove(responseCacheKey)
             return null
         }
-        if (System.currentTimeMillis() - cached.fetchedAt < MAIN_FRAME_TTL_MS) {
+        if (responseCacheMayServeShell(
+                cached.headers, cached.fetchedAt, MAIN_FRAME_TTL_MS, MAIN_FRAME_TTL_MS
+            )
+        ) {
             val text = String(cached.body, Charsets.UTF_8)
             // Derived from the request URL, not hardcoded, so a cache writer
             // that misses its gate cannot inject the shell into a non-HTTPS
@@ -1114,7 +1153,7 @@ class VWebviewClient(
                 // body is still raw here; injection happens below. Persist
                 // off the network thread with the sanitized headers so a stale
                 // serve matches the in-memory cache (incl. security headers).
-                enqueueMainFrameWrite(urlString, state.body, HashMap(state.headers), state.reasonPhrase, credentialPartition, cacheKey)
+                enqueueMainFrameWrite(urlString, state.body, shellStorageHeaders(response, urlString, state.headers), state.reasonPhrase, credentialPartition, cacheKey)
             }
         }
     }
@@ -1189,6 +1228,20 @@ class VWebviewClient(
         // runtimes are injected at serve time so a config change applies on
         // the next serve. THEME_CSS has no injected content, so it caches
         // the final bytes.
+        // A response that forbids storage also purges what an earlier fetch
+        // stored under this key.
+        if (cacheTarget != null && cacheExcludedByDirectives(state.headers)) {
+            when (cacheTarget) {
+                CacheTarget.THEME_CSS -> themeCssCache.remove(cacheKey)
+                CacheTarget.MAIN_FRAME -> {
+                    mainFrameCache.remove(cacheKey)
+                    StaleMainFrame.remove(urlString)
+                    // Empty body = delete this URL's disk entry.
+                    enqueueMainFrameWrite(urlString, byteArrayOf(), emptyMap(), "OK", credentialPartition, cacheKey)
+                }
+            }
+            return
+        }
         val bytesToCache = if (cacheTarget == CacheTarget.MAIN_FRAME) state.rawBody else state.body
         // An empty body is never a valid entry. A failed or over-cap read
         // would otherwise be cached as a blank 200 and served for the full
@@ -1201,7 +1254,7 @@ class VWebviewClient(
             // so cached headers are cookie-free by construction. A cached
             // replay cannot resurrect an old token (zombie session) or cross
             // accounts on a shared device.
-            val headersToCache = HashMap(state.headers).apply {
+            val headersToCache = shellStorageHeaders(response, urlString, state.headers).apply {
                 remove("content-length")
                 remove("content-encoding")
             }
@@ -1225,24 +1278,16 @@ class VWebviewClient(
                     // later HEAD/POST navigation. The URL-keyed shell refresh
                     // below is gated here too.
                     mainFrameCache.put(cacheKey, entry)
-                    // Refresh the in-memory preloaded shell so the preferred serve
-                    // path doesn't fall back to a stale startup-time copy.
-                    // isAppOrigin restated: this writes process-lifetime
-                    // state and must not rely on the enclosing gate.
-                    // The active branch's shell, same URL the cold start
-                    // anchors on. A hardcoded stable URL would leave PTB and
-                    // canary sessions refreshing the wrong preloaded entry.
-                    val activeShellUrl = mainActivity?.appShell?.appShellUrl
-                        ?: DiscordBranch.DEFAULT.appShellUrl
-                    if (urlString == activeShellUrl && isAppOrigin) {
+                    // Refresh the preloaded copy for every eligible route, so a
+                    // route fetched later in the session stops serving its
+                    // cold-start shell.
+                    if (isAppOrigin && MainFrameDiskCache.isCacheableRoute(Uri.parse(urlString))) {
                         val refreshed = MainFrameDiskCache.CachedMainFrame(
                             state.rawBody, state.reasonPhrase, headersToCache,
                             System.currentTimeMillis(), credentialPartition,
                             requestKey = cacheKey
                         )
-                        val shells = HashMap(StaleMainFrame.preloadedShells)
-                        shells[urlString] = refreshed
-                        StaleMainFrame.preloadedShells = shells
+                        StaleMainFrame.put(urlString, refreshed)
                     }
                 }
             }
@@ -1792,6 +1837,7 @@ class VWebviewClient(
             ThreadPoolExecutor.AbortPolicy()
         )
         private val revalidatingUrls = ConcurrentHashMap.newKeySet<String>()
+        private val refreshSchedule = ShellRefreshSchedule()
         private val revalidationSlots = Semaphore(MAX_OUTSTANDING_REVALIDATIONS)
 
         // Best-effort raw main-frame persistence. Writes are coalesced per URL
@@ -1820,9 +1866,9 @@ class VWebviewClient(
 
         /**
          * Queues [body] for disk persistence, replacing any pending write for
-         * the same URL. Drops the newest write when the pending byte budget is
-         * exhausted (the disk cache is best-effort). Bodies the disk cache
-         * would reject by size are dropped here instead of being retained.
+         * the same URL. An empty [body] queues a delete. Drops the newest write
+         * when the pending byte budget is exhausted; the disk cache is
+         * best-effort.
          */
         private fun enqueueMainFrameWrite(
             urlString: String,
@@ -1832,13 +1878,13 @@ class VWebviewClient(
             credentialPartition: String,
             requestKey: String
         ) {
-            if (body.isEmpty() || body.size > MainFrameDiskCache.MAX_BODY_BYTES) return
+            if (body.size > MainFrameDiskCache.MAX_BODY_BYTES) return
             val entry = PendingMainFrameWrite(urlString, body, headers, reasonPhrase, credentialPartition, requestKey)
             val schedule: Boolean
             synchronized(pendingDiskLock) {
                 val previous = pendingDiskWrites.put(urlString, entry)
                 pendingDiskBytes += body.size - (previous?.body?.size ?: 0)
-                if (pendingDiskBytes > MAX_PENDING_DISK_BYTES) {
+                if (pendingDiskBytes > MAX_PENDING_DISK_BYTES || pendingDiskWrites.size > 64) {
                     // Over budget: drop this capture. Restore the accounting
                     // only if no other thread has replaced the entry meanwhile.
                     if (pendingDiskWrites.remove(urlString, entry)) {
@@ -1875,7 +1921,8 @@ class VWebviewClient(
                     }
                 } ?: return
                 try {
-                    MainFrameDiskCache.writeMainFrame(
+                    if (next.body.isEmpty()) MainFrameDiskCache.remove(next.url)
+                    else MainFrameDiskCache.writeMainFrame(
                         next.url, next.body, next.headers, next.reasonPhrase,
                         credentialPartition = next.credentialPartition,
                         requestKey = next.requestKey
@@ -1888,7 +1935,7 @@ class VWebviewClient(
 
         // Delegates: the preloaded-shell store moved to StaleMainFrame;
         // VendroidApp and MainFrameDiskCache call through VWebviewClient.
-        fun preloadMainFrameCache() = StaleMainFrame.preloadMainFrameCache()
+        fun preloadMainFrameCache(preferredUrl: String? = null) = StaleMainFrame.preloadMainFrameCache(preferredUrl)
         fun clearPreloadedShells() = StaleMainFrame.clearPreloadedShells()
     }
 }
