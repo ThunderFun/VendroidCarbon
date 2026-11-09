@@ -2,7 +2,7 @@
     // Ported vendroid plugin features
     //
     // Everything below used to live in the vendored vendroidEnhancements /
-    // vendroidSheets plugins; with the bundle now coming from upstream
+    // vendroidSheets plugins; the bundle comes from upstream
     // GitHub releases, the runtime owns these features. Every entry point
     // yields while the transition guard (legacyVendroidPluginPresent) says
     // a cached operator-built bundle still carries them.
@@ -237,7 +237,7 @@ div[class^="prompt_"] {
     // Sidebar state is re-derived from the DOM through
     // syncSidebarOpenFromDom() (00-boot.js) on every swipe. The
     // MOBILE_WEB_SIDEBAR_* Flux flag is only a fast path: the Slate override
-    // leaves isAndroidWeb() false, which stops Discord's sidebar store from
+    // leaves isAndroidWeb() false, which stops the client's sidebar store from
     // tracking the rendered sidebar. The members panel has no Flux event and
     // is read from its DOM at swipe time.
     var _vendroidGesturesSetupDone = false;
@@ -350,7 +350,7 @@ div[class^="prompt_"] {
             }
         }
 
-        // Lazy module lookups; the anchors are the same ones the plugin
+        // Lazy module lookups; the signatures are the same ones the plugin
         // used via @webpack/common. Accessed on swipe, long after boot.
         function navRouter() {
             try {
@@ -718,6 +718,36 @@ div[class^="prompt_"] {
         }
     }
 
+    function logVdeFeatureStatus(feature) {
+        try {
+            var s = _vdePatchStats;
+            var label = feature === "gif" ? "GIF" : "Voice";
+            var name = feature === "gif" ? "gifTab" : "webrtcSupported";
+            var applied = !!(s.applied && s.applied[name]);
+            var moduleId = s.modules && s.modules[name];
+            var state = window.__vendroidPatchStatus &&
+                window.__vendroidPatchStatus[feature];
+            if (s.legacy) {
+                console.warn("[Vendroid] " + label +
+                    ": factory patch skipped (legacy Vendroid plugin active)");
+                return;
+            }
+            if (!s.chunks) {
+                console.warn("[Vendroid] " + label +
+                    ": factory patch pending (no Discord chunk seen yet)");
+                return;
+            }
+            var line = "[Vendroid] " + label + ": factory patch " +
+                (applied ? "applied" : "not applied") +
+                " (build " + (vendroidDiscordBuild() || "?") +
+                (moduleId ? ", module " + moduleId : "") + ")";
+            if (!applied && state && state.runtime && state.runtime !== "pending") {
+                line += " runtime=" + state.runtime;
+            }
+            console.warn(line);
+        } catch (e) {}
+    }
+
     function logVdePatchStats(source) {
         try {
             var s = _vdePatchStats;
@@ -728,14 +758,15 @@ div[class^="prompt_"] {
                 " applied=" + JSON.stringify(s.applied) +
                 " missed=" + JSON.stringify(s.missed) +
                 " retired=" + JSON.stringify(s.retired));
+            try { logVdeFeatureStatus("gif"); } catch (e) {}
+            try { logVdeFeatureStatus("voice"); } catch (e) {}
             if (missedNames.length > 0) {
-                console.error("[Vendroid] VDE patch anchors missed (upstream Discord change?): " + missedNames.join(", "));
+                console.error("[Vendroid] VDE patch patterns missed (source changed?): " + missedNames.join(", "));
             }
             if (_vdeActivePatches.length === VDE_MODULE_PATCHES.length && s.chunks > 0 && appliedNames.length === 0) {
-                // Every patch still active after real chunks flowed by and
-                // nothing ever matched: the vendroidSheets anchors may have
-                // rotated out of Discord's bundle entirely.
-                console.error("[Vendroid] VDE patch stats: no vendroidSheets anchor matched any pushed module (sheets disabled by anchor rot?)");
+                // Patches are still active after real chunks and none
+                // matched, so the source patterns may have changed.
+                console.error("[Vendroid] VDE patch stats: no source pattern matched any pushed module (features stay stock?)");
             }
         } catch (e) {}
     }

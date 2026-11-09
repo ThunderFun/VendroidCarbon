@@ -2014,6 +2014,8 @@
     var _vendroidVoiceSetupDone = false;
     var _vendroidVoiceSetupRetries = 0;
     var _vendroidVoiceSetupScheduled = false;
-    // 60 retries x 250ms = 15s, matching the other patches' lazy-load budget.
-    var VENDROID_VOICE_MAX_RETRIES = 60;
+    // The source patch handles the normal path. Retry with backoff and no hard
+    // stop so a lazy store still recovers; cap the delay to avoid polling.
+    var VENDROID_VOICE_RETRY_BASE_MS = 250;
+    var VENDROID_VOICE_RETRY_MAX_MS = 5000;
 

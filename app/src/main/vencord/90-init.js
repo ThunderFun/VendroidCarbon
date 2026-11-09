@@ -28,6 +28,7 @@
                 // Bundle not loaded yet or boot crashed; keep polling.
             } else if (Vencord.Webpack.wreq) {
                 initStage = 1;
+                try { vdePatchRegisteredFactories("webpack-ready"); } catch (e) {}
             } else if (initAttempts >= VENDROID_WREQ_RESCUE_ATTEMPTS && tryInitWebpack()) {
                 initStage = 1;
             }

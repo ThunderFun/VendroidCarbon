@@ -36,12 +36,11 @@ internal object BootVerify {
                 "return 'vencord='+typeof Vencord+'|webpack='+w+'|mobile='+typeof VencordMobile+'|'" +
                     "+'fw='+(window.__vendroidFw?'on':'off')+'|anim='+(window.__vendroidAnimCtrl?'on':'off')" +
                     "+'|'+ls+'|uncaught=['+u+']'" +
-                    // Ported vendroidSheets patch counters: applied/missed
-                    // per replacement spec make anchor rot visible in device
-                    // reports. 'none' when the transition guard ran (old
-                    // operator bundle still carrying the vendored plugins)
-                    // or no chunk arrived yet.
-                    "+'|vdep='+(window.__vdePatchStats?JSON.stringify(window.__vdePatchStats):'none');" +
+                    // Patch counters for device reports. 'none' when the
+                    // transition guard ran or no chunk arrived. ps carries
+                    // GIF and voice source-patch and runtime status.
+                    "+'|vdep='+(window.__vdePatchStats?JSON.stringify(window.__vdePatchStats):'none')" +
+                    "+'|ps='+(window.__vendroidPatchStatus?JSON.stringify(window.__vendroidPatchStatus):'none');" +
                 "}catch(e){return 'probe-failed:'+e.message}})()"
 
     internal fun runProbe(w: WebView, source: String, persist: (ok: Boolean, verdict: String) -> Unit) {

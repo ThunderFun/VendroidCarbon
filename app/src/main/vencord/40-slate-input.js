@@ -1,9 +1,6 @@
-    // Discord exposes the platform helpers in a friendly-name re-export
-    // (isAndroidWeb/isDesktop/isIOS/...) and a minified source module. The
-    // composer reads isAndroidWeb from the re-export at render time, so that
-    // module is the override target. Discord can split the re-export, so try
-    // the full shape first, then the single prop. Both probes use the silent
-    // scan; findByProps would log on every poll miss.
+    // Resolve the friendly platform re-export when present. Try the
+    // full shape first, then the single predicate. Probe silently because
+    // findByProps logs every miss.
     function vendroidPlatformUtilsFilter(requireFullShape) {
         return function(m) {
             if (!m || typeof m.isAndroidWeb !== "function") return false;
@@ -17,6 +14,134 @@
                vendroidScanModuleCaches(vendroidPlatformUtilsFilter(false), out);
     }
 
+    // Without the friendly isAndroidWeb export, the composer chooses Slate
+    // with `!(0,<platform>.Ct)()`, and Ct reads navigator.userAgent at call
+    // time. Ct cannot be redefined, so spoof the UA only during composer
+    // render. Other Android checks keep the real UA.
+    var _vendroidSlateUaShimInstalled = false;
+    var _vendroidSlateRealUserAgent = null;
+    var _vendroidSlateFakeUserAgent = null;
+    var VENDROID_DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    var VENDROID_SLATE_COMPOSER_PATTERN =
+        /useSetting\(\)&&!\(0,[A-Za-z_$][\w$]*\.Ct\)\(\)&&null!=window\.ResizeObserver/;
+
+    function vendroidInstallSlateUaShim() {
+        if (_vendroidSlateUaShimInstalled) return true;
+        try {
+            if (_vendroidSlateRealUserAgent === null) {
+                _vendroidSlateRealUserAgent = navigator.userAgent;
+            }
+            var own = Object.getOwnPropertyDescriptor(navigator, "userAgent");
+            if (own && !own.configurable) return false;
+            Object.defineProperty(navigator, "userAgent", {
+                configurable: true,
+                enumerable: true,
+                get: function() {
+                    return _vendroidSlateFakeUserAgent || _vendroidSlateRealUserAgent;
+                }
+            });
+            _vendroidSlateUaShimInstalled = true;
+            return true;
+        } catch(e) {
+            // Some WebViews reject an own property on navigator. Try the
+            // prototype only when no own property shadows it.
+            try {
+                var proto = Object.getPrototypeOf(navigator);
+                var pdesc = proto && Object.getOwnPropertyDescriptor(proto, "userAgent");
+                if (!pdesc || !pdesc.configurable) return false;
+                var origGet = pdesc.get;
+                Object.defineProperty(proto, "userAgent", {
+                    configurable: true,
+                    enumerable: pdesc.enumerable,
+                    get: function() {
+                        if (_vendroidSlateFakeUserAgent) return _vendroidSlateFakeUserAgent;
+                        return origGet ? origGet.call(this) : _vendroidSlateRealUserAgent;
+                    }
+                });
+                _vendroidSlateUaShimInstalled = true;
+                return true;
+            } catch(e2) {
+                return false;
+            }
+        }
+    }
+
+    function vendroidFindSlateComposer() {
+        // The source patch removes the Ct call, so check its marker first.
+        var mid = null;
+        try {
+            if (Vencord.Webpack && typeof Vencord.Webpack.findModuleId === "function") {
+                mid = Vencord.Webpack.findModuleId("vde-slate-composer");
+                if (mid != null && Vencord.Webpack.wreq) {
+                    var patched = Vencord.Webpack.wreq(mid);
+                    if (patched) return { module: patched, id: mid, patched: true };
+                }
+            }
+        } catch(e) {}
+
+        var pattern = VENDROID_SLATE_COMPOSER_PATTERN;
+        mid = null;
+        try {
+            if (Vencord.Webpack && typeof Vencord.Webpack.findModuleId === "function") {
+                mid = Vencord.Webpack.findModuleId(pattern);
+            }
+        } catch(e) {}
+        if (mid != null && Vencord.Webpack && typeof Vencord.Webpack.wreq === "function") {
+            try {
+                var mod = Vencord.Webpack.wreq(mid);
+                if (mod) return { module: mod, id: mid, patched: false };
+            } catch(e) {}
+        }
+        try {
+            var fallback = findModuleByCode([pattern]);
+            if (fallback) return { module: fallback, id: null, patched: false };
+        } catch(e) {}
+        return null;
+    }
+
+    function vendroidInstallSlateComposerOverride() {
+        var found = vendroidFindSlateComposer();
+        if (!found) return false;
+        if (found.patched) {
+            _vendroidSlateOverrideDone = true;
+            console.warn("[Vendroid] Slate override: composer source patch active (module " +
+                (found.id != null ? found.id : "?") + ")");
+            return true;
+        }
+        var composer = found.module && found.module.Ay;
+        if (!composer || typeof composer.type !== "function") return false;
+        if (composer.type.__vendroidSlateWrapper) {
+            _vendroidSlateOverrideDone = true;
+            return true;
+        }
+        if (!vendroidInstallSlateUaShim()) {
+            console.warn("[Vendroid] Slate override: could not install userAgent shim");
+            return false;
+        }
+        var origType = composer.type;
+        var wrapped = function() {
+            var prev = _vendroidSlateFakeUserAgent;
+            _vendroidSlateFakeUserAgent = VENDROID_DESKTOP_UA;
+            try {
+                return origType.apply(this, arguments);
+            } finally {
+                _vendroidSlateFakeUserAgent = prev;
+            }
+        };
+        wrapped.__vendroidSlateWrapper = true;
+        try {
+            composer.type = wrapped;
+        } catch(e) {
+            return false;
+        }
+        if (composer.type !== wrapped) return false;
+        _vendroidSlateOverrideDone = true;
+        console.warn("[Vendroid] Slate override: composer Ct gate bypassed (module " +
+            (found.id != null ? found.id : "?") + ")");
+        return true;
+    }
+
     function setupSlateOverride() {
         if (_vendroidSlateOverrideDone) return;
         try {
@@ -24,62 +149,72 @@
                 if (_vendroidSlateOverrideRetries++ < 300) setTimeout(setupSlateOverride, 50);
                 return;
             }
-            // Silent lookup only; Vencord.Webpack.findByProps logs on every miss.
+            if (_vendroidOrigIsAndroidWeb === null) {
+                _vendroidOrigIsAndroidWeb = /android/i.test(navigator.userAgent || "");
+            }
+            if (!_vendroidOrigIsAndroidWeb) {
+                _vendroidSlateOverrideDone = true;
+                return;
+            }
+
+            // Resolve the friendly platform module.
             var target = {};
             var PlatformUtils = vendroidFindPlatformUtils(target);
-            if (!PlatformUtils) {
-                if (_vendroidSlateOverrideRetries++ < 300) {
-                    setTimeout(setupSlateOverride, 50);
-                } else if (!_vendroidSlateOverrideGaveUp) {
-                    // Warn once at give-up. The UA fallback in
-                    // isAndroidWebDevicePreOverride() still drives the mstyle gate.
-                    _vendroidSlateOverrideGaveUp = true;
-                    console.warn("[Vendroid] Slate override: platform module not found after 300 " +
-                        "attempts; staying on the stock mobile editor");
-                }
-                return;
-            }
-            var origResult = false;
-            try { origResult = PlatformUtils.isAndroidWeb.call(); } catch(e) {}
-            // Capture the pre-override result for the ported mstyle gate
-            // (see isAndroidWebDevicePreOverride).
-            _vendroidOrigIsAndroidWeb = origResult;
-            if (!origResult) {
-                _vendroidSlateOverrideDone = true;
-                return;
-            }
-            try {
-                Object.defineProperty(PlatformUtils, "isAndroidWeb", {
-                    value: function() { return false; },
-                    writable: true, configurable: true, enumerable: true
-                });
-                _vendroidSlateOverrideDone = true;
-                console.warn("[Vendroid] Slate override: isAndroidWeb → false (enables Slate + " +
-                    "command browser; module " + target.id + ")");
-            } catch(e) {
-                try {
-                    PlatformUtils.isAndroidWeb = function() { return false; };
+            if (PlatformUtils) {
+                var origResult = false;
+                try { origResult = PlatformUtils.isAndroidWeb.call(); } catch(e) {}
+                // Record the real platform for the mstyle gate.
+                _vendroidOrigIsAndroidWeb = origResult;
+                if (!origResult) {
                     _vendroidSlateOverrideDone = true;
-                    console.warn("[Vendroid] Slate override: isAndroidWeb → false (fallback; " +
-                        "module " + target.id + ")");
-                } catch(e2) {
-                    console.error("[Vendroid] Slate override failed: " + e2.message);
+                    return;
                 }
+                var oldOverride = false;
+                try {
+                    Object.defineProperty(PlatformUtils, "isAndroidWeb", {
+                        value: function() { return false; },
+                        writable: true, configurable: true, enumerable: true
+                    });
+                    oldOverride = true;
+                } catch(e) {
+                    try {
+                        PlatformUtils.isAndroidWeb = function() { return false; };
+                        oldOverride = true;
+                    } catch(e2) {}
+                }
+                if (oldOverride) {
+                    _vendroidSlateOverrideDone = true;
+                    console.warn("[Vendroid] Slate override: isAndroidWeb -> false (enables Slate + " +
+                        "command browser; module " + target.id + ")");
+                    applyVendroidPluginCss();
+                    return;
+                }
+                // Otherwise use the composer gate.
             }
-            // The platform result is now captured; the mstyle gate can decide.
-            applyVendroidPluginCss();
+
+            // Bypass only the composer's Ct check.
+            if (vendroidInstallSlateComposerOverride()) {
+                applyVendroidPluginCss();
+                return;
+            }
+
+            if (_vendroidSlateOverrideRetries++ < 300) {
+                setTimeout(setupSlateOverride, 50);
+            } else if (!_vendroidSlateOverrideGaveUp) {
+                // Give up once. The UA fallback still drives the mstyle gate.
+                _vendroidSlateOverrideGaveUp = true;
+                console.warn("[Vendroid] Slate override: platform/composer module not found after 300 " +
+                    "attempts; staying on the stock mobile editor");
+            }
         } catch(e) {
             console.error("[Vendroid] setupSlateOverride error: " + e.message);
             if (_vendroidSlateOverrideRetries++ < 300) setTimeout(setupSlateOverride, 50);
         }
     }
 
-    // Re-enable autocorrect on the Slate editor.  setupSlateOverride() makes
-    // Discord render its desktop editor, which sets autocorrect="off" /
-    // spellcheck="false" on the contenteditable div.  On Android WebView a
-    // contenteditable without autocorrect="on" never receives IME corrections,
-    // so suggestions appear but never apply.  A MutationObserver re-applies the
-    // attributes so React re-renders can't revert them.
+    // The desktop editor sets autocorrect="off" and spellcheck="false".
+    // Android WebView then drops IME corrections, so re-apply both attributes
+    // and observe React re-renders.
     var _vendroidAutocorrectInstalled = false;
 
     function applyAutocorrectAttrs(el) {
@@ -164,7 +299,7 @@
                     !target.closest("[data-slate-editor]")) return;
                 isComposing = false;
                 composingText = null;
-                // Note: do NOT log e.data here — it can contain typed message text.
+                // Do not log e.data here. It can contain typed message text.
                 if (VENDROID_VERBOSE_INPUT) console.warn("[Vendroid] compositionend");
             }, true);
 
@@ -178,14 +313,12 @@
                 var data = e.data;
 
                 // Log beforeinput metadata for the Slate editor. Do NOT log
-                // `data` — it carries the typed message content.
+                // data carries the typed message content.
                 if (VENDROID_VERBOSE_INPUT) console.warn("[Vendroid] beforeinput type=" + inputType + " len=" + (data ? data.length : 0) + " composing=" + isComposing);
 
-                // Only handle types needing manual Slate routing. Skip
-                // insertCompositionText — Discord's Slate plugin has its own
-                // deferred-diff system that batches keystrokes and flushes on
-                // compositionend, keeping the model in sync and the command
-                // autocomplete filter live.
+                // Skip insertCompositionText. The Slate plugin batches those
+                // edits and flushes on compositionend, which keeps the model
+                // and command autocomplete in sync.
                 if (inputType !== "deleteContentBackward" &&
                     inputType !== "deleteContentForward" &&
                     inputType !== "insertText" &&
@@ -196,14 +329,11 @@
                 var editor = findSlateEditorFromDOM(target);
                 if (!editor) return;
 
-                // After routing through Slate's API, dispatch a synthetic
-                // InputEvent so Discord's autocomplete plugin (which filters
-                // on native 'input' events) sees the change. Without this,
-                // editor.insertText() updates Slate's model and onChange but
-                // not the DOM 'input' event we suppressed via preventDefault.
-                // Only needed in slash-command context (editor starts with
-                // "/"); elsewhere Discord's plugin handles re-rendering and
-                // the popout isn't open.
+                // Dispatch a synthetic InputEvent so the autocomplete plugin
+                // sees the change. editor.insertText() updates Slate's model
+                // and onChange, but not the native input event suppressed by
+                // preventDefault. Only needed in slash-command context;
+                // elsewhere the plugin handles re-rendering.
                 function notifyDiscordInputEvent(evType, evData) {
                     try {
                         var curEditorText = getEditorText();
@@ -265,7 +395,7 @@
                         } else if (composingText && composingText.length > 0) {
                             delLen = composingText.length;
                         }
-                        // Do NOT log `data` here — it's the replacement text.
+                        // Do not log data here. It is the replacement text.
                         if (VENDROID_VERBOSE_INPUT) console.warn("[Vendroid] insertReplacementText delLen=" + delLen);
                         for (var r = 0; r < delLen; r++) {
                             editor.deleteBackward("character");
@@ -320,10 +450,9 @@
     // MessageEvents.addMessagePreSendListener no longer exists in the
     // mobile bundle, so we patch MessageActions.sendMessage directly.
 
-    // Built-in TEXT commands whose execute() is a pure string transform (from
-    // Discord module 917012, array `x`). Commands needing stores/RPCs (/nick,
-    // /kick, /ban, /timeout, /thread, /msg, /roll-dice) are omitted and fall
-    // through to the command browser / plain text.
+    // Built-in text commands whose execute() is a pure string transform.
+    // Commands needing stores or RPCs (/nick, /kick, /ban, /timeout, /thread,
+    // /msg, /roll-dice) are omitted and fall through to the command browser.
     var VENDROID_TEXT_COMMANDS = {
         shrug:    function(msg) { return { content: (msg + " \xaf\\_(\u30C4)_/\xaf").trim() }; },
         tableflip:function(msg) { return { content: (msg + " (\u256F\u00B0\u25A1\u00B0\u256F\uFE35) \u253B\u2501\u253B").trim() }; },

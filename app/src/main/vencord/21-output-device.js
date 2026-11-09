@@ -16,6 +16,19 @@
                 try { store = vendroidFindByProps("isSupported", "getMediaEngine"); } catch (e) {}
             }
             if (!store || typeof store.supports !== "function") {
+                try {
+                    var storeNs = findModuleByCode([
+                        /isSupported\(\)\{return [A-Za-z_$][\w$]*\.supported\(\)\}/,
+                        /getMediaEngine\(\)\{return [A-Za-z_$][\w$]*\}/
+                    ]);
+                    store = vendroidFindExport(storeNs, function(v) {
+                        return v && typeof v === "object" &&
+                            typeof v.isSupported === "function" &&
+                            typeof v.getMediaEngine === "function";
+                    });
+                } catch (e) {}
+            }
+            if (!store || typeof store.supports !== "function") {
                 vendroidOutputRetry("media engine store not found");
                 return;
             }

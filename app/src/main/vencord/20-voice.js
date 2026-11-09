@@ -42,22 +42,48 @@
             typeof proto.eachConnection === "function";
     }
 
-    // Bounded retry for the resolvers below. A future build may load the store
-    // lazily or move the engine module, so one miss must not disable voice
-    // permanently.
+    // Retry for lazy store or engine modules. Back off; the source patch
+    // covers the normal path.
     function vendroidVoiceRetry(reason) {
-        if (_vendroidVoiceSetupScheduled) return;
-        if (_vendroidVoiceSetupRetries++ >= VENDROID_VOICE_MAX_RETRIES) {
-            console.error("[Vendroid] Voice: giving up after " + VENDROID_VOICE_MAX_RETRIES +
-                " retries (" + reason + ")");
-            _vendroidVoiceSetupDone = true;
-            return;
+        if (_vendroidVoiceSetupScheduled || _vendroidVoiceSetupDone) return;
+        var attempt = _vendroidVoiceSetupRetries++;
+        var delay = Math.min(
+            VENDROID_VOICE_RETRY_BASE_MS * Math.pow(1.4, Math.min(attempt, 12)),
+            VENDROID_VOICE_RETRY_MAX_MS
+        );
+        if (attempt === 0 || attempt === 5 || attempt === 20 || attempt % 50 === 0) {
+            console.warn("[Vendroid] Voice: retry in " + Math.round(delay) +
+                "ms (" + reason + ")");
         }
         _vendroidVoiceSetupScheduled = true;
         setTimeout(function() {
             _vendroidVoiceSetupScheduled = false;
             setupVoiceSupport();
-        }, 250);
+        }, delay);
+    }
+
+    // Keep repeated misses out of the log without hiding the first few.
+    function vendroidVoiceLog(message) {
+        if (_vendroidVoiceSetupRetries <= 3 || _vendroidVoiceSetupRetries % 25 === 0) {
+            console.warn("[Vendroid] Voice: " + message);
+        }
+    }
+
+    // The first voice click retries setup when the store was not cached at
+    // doInit. One subscription covers the lazy chunk.
+    var _vendroidVoiceFluxHooked = false;
+    function vendroidHookVoiceFlux() {
+        if (_vendroidVoiceFluxHooked) return;
+        var fd = findFluxDispatcher();
+        if (!fd || typeof fd.subscribe !== "function") return;
+        try {
+            fd.subscribe("VOICE_CHANNEL_SELECT", function() {
+                if (!_vendroidVoiceSetupDone) setupVoiceSupport();
+            });
+            _vendroidVoiceFluxHooked = true;
+        } catch (e) {
+            console.warn("[Vendroid] Voice: VOICE_CHANNEL_SELECT subscribe failed: " + e.message);
+        }
     }
 
     // Resolves the WebRTC engine class by source signature, then pulls the
@@ -117,6 +143,7 @@
         if (to.__vendroidWebrtcInstalled) {
             var already = false;
             try { already = to.supported() === true; } catch (e) {}
+            if (already) vendroidSetPatchStatus("voice", "fallback", true);
             return already;
         }
         var webrtc;
@@ -135,35 +162,62 @@
             constructor: 1, on: 1, off: 1, addListener: 1, removeListener: 1, once: 1,
             removeAllListeners: 1, emit: 1, listeners: 1, listenerCount: 1,
             eventNames: 1, setMaxListeners: 1, getMaxListeners: 1,
-            prependListener: 1, prependOnceListener: 1, rawListeners: 1
+            prependListener: 1, prependOnceListener: 1, rawListeners: 1,
+            _events: 1, _eventsCount: 1, _maxListeners: 1, domain: 1
         };
         var proto = Object.getPrototypeOf(webrtc);
         var names = Object.getOwnPropertyNames(proto);
         var copied = 0;
+        var ownCopied = 0;
+
+        // Copy one member, bound to the live engine. Fields stay shared via
+        // accessors.
+        function copyMember(key, desc, source) {
+            try {
+                if (desc.get || desc.set) {
+                    Object.defineProperty(to, key, {
+                        configurable: true, enumerable: true,
+                        get: desc.get ? function() { return desc.get.call(source); } : undefined,
+                        set: desc.set ? function(v) { desc.set.call(source, v); } : undefined
+                    });
+                } else if (typeof desc.value === "function") {
+                    var fn = desc.value;
+                    Object.defineProperty(to, key, {
+                        configurable: true, enumerable: true, writable: true,
+                        value: function() { return fn.apply(source, arguments); }
+                    });
+                } else {
+                    Object.defineProperty(to, key, {
+                        configurable: true, enumerable: true,
+                        get: function() { return source[key]; },
+                        set: function(v) { source[key] = v; }
+                    });
+                }
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
         for (var i = 0; i < names.length; i++) {
             var key = names[i];
             if (KEEP[key]) continue;
             var desc = Object.getOwnPropertyDescriptor(proto, key);
             if (!desc) continue;
-            try {
-                if (desc.get || desc.set) {
-                    (function(k, d) {
-                        Object.defineProperty(to, k, {
-                            configurable: true, enumerable: true,
-                            get: d.get ? function() { return d.get.call(webrtc); } : undefined,
-                            set: d.set ? function(v) { d.set.call(webrtc, v); } : undefined
-                        });
-                    })(key, desc);
-                } else if (typeof desc.value === "function") {
-                    (function(k, fn) {
-                        Object.defineProperty(to, k, {
-                            configurable: true, enumerable: true, writable: true,
-                            value: function() { return fn.apply(webrtc, arguments); }
-                        });
-                    })(key, desc.value);
-                }
-                copied++;
-            } catch (e) {}
+            if (copyMember(key, desc, webrtc)) copied++;
+        }
+
+        // Class fields are own properties, not prototype members. They hold
+        // DAVE and secure-frames state, so a prototype-only copy can look
+        // supported and fail during the join. Skip EventEmitter internals and
+        // private fields.
+        var ownNames = Object.getOwnPropertyNames(webrtc);
+        for (var oi = 0; oi < ownNames.length; oi++) {
+            var ownKey = ownNames[oi];
+            if (KEEP[ownKey] || ownKey.charAt(0) === "_") continue;
+            var ownDesc = Object.getOwnPropertyDescriptor(webrtc, ownKey);
+            if (!ownDesc) continue;
+            if (copyMember(ownKey, ownDesc, webrtc)) ownCopied++;
         }
 
         try {
@@ -198,16 +252,49 @@
             });
         } catch (e) {}
 
-        var ok = false;
-        try { ok = to.supported() === true; } catch (e) {}
+        var supported = false;
+        try { supported = to.supported() === true; } catch (e) {}
+
+        // DAVE initializes on the first connection. Its getter throws until
+        // then; that is expected. Any other failure, or a missing input
+        // capability, means the copy is incomplete.
+        var dave = null;
+        var daveOk = true;
+        var daveError = null;
+        try {
+            if (typeof to.getSupportedSecureFramesProtocolVersion === "function") {
+                dave = to.getSupportedSecureFramesProtocolVersion();
+                daveOk = typeof dave === "number";
+            }
+        } catch (e) {
+            daveError = e && e.message ? e.message : String(e);
+            daveOk = /before DAVE was initialized/i.test(daveError);
+        }
+        var inputOk = true;
+        try {
+            if (typeof to.supports === "function") {
+                inputOk = to.supports("AUDIO_INPUT_DEVICE") === true;
+            }
+        } catch (e) {
+            inputOk = false;
+        }
+
+        var ok = supported && daveOk && inputOk;
+        vendroidSetPatchStatus("voice", "fallback", ok);
+        vendroidSetPatchStatus("voice", "dave", daveError ? "pending" : dave);
+        vendroidSetPatchStatus("voice", "input", inputOk);
         if (ok) {
             try {
                 Object.defineProperty(to, "__vendroidWebrtcInstalled",
                     { value: true, configurable: true });
             } catch (e) {}
-            console.warn("[Vendroid] Voice: swapped store engine to WebRTC (methods copied=" + copied + ")");
+            console.warn("[Vendroid] Voice: swapped store engine to WebRTC (methods copied=" +
+                copied + ", own=" + ownCopied + ", dave=" + (daveError ? "pending" : String(dave)) +
+                ", input=" + inputOk + ")");
         } else {
-            console.error("[Vendroid] Voice: engine swap did not take (copied=" + copied + ")");
+            console.error("[Vendroid] Voice: engine swap did not take (methods copied=" +
+                copied + ", own=" + ownCopied + ", supported=" + supported +
+                ", daveOk=" + daveOk + ", input=" + inputOk + ")");
         }
         return ok;
     }
@@ -220,53 +307,27 @@
                 return;
             }
 
-            // 1. Best-effort: flip the capability flag the picker reads. It
-            //    may be a non-configurable webpack getter, in which case this
-            //    logs and moves on; step 2 is the one that must succeed.
-            //    Prefer the known minified prop set, then a source signature
-            //    if the letters changed.
-            try {
-                var caps = null;
-                try { caps = vendroidFindByProps("g7", "fA", "zU"); } catch (e0) {}
-                if (!caps || caps.Hz === undefined) {
-                    try { caps = findModuleByCode(['ua.indexOf("OculusBrowser")']); } catch (e0) {}
-                }
-                if (!caps) {
-                    console.warn("[Vendroid] Voice: capability module not found");
-                } else if (caps.Hz === true) {
-                    console.warn("[Vendroid] Voice: Hz already true");
-                } else {
-                    var oldHz = caps.Hz;
-                    try {
-                        Object.defineProperty(caps, "Hz", {
-                            configurable: true, enumerable: true,
-                            get: function() { return true; }
-                        });
-                        console.warn("[Vendroid] Voice: Hz " + oldHz + " -> true");
-                    } catch (e1) {
-                        // Hz can be a non-configurable getter on this export.
-                        // Try the single-prop lookup for another owner before
-                        // giving up.
-                        var patched = false;
-                        try {
-                            var proxy = vendroidFindByProps("Hz");
-                            if (proxy && proxy !== caps && proxy.Hz !== true) {
-                                Object.defineProperty(proxy, "Hz", {
-                                    configurable: true, enumerable: true,
-                                    get: function() { return true; }
-                                });
-                                patched = true;
-                            }
-                        } catch (e2) {}
-                        if (patched) {
-                            console.warn("[Vendroid] Voice: Hz " + oldHz + " -> true (proxy)");
-                        } else {
-                            console.warn("[Vendroid] Voice: Hz not redefinable (" + e1.message + ")");
-                        }
+            vendroidHookVoiceFlux();
+
+            // Diagnostic only. Hz is a non-configurable export; 00-boot.js
+            // patches the source.
+            if (_vendroidVoiceSetupRetries === 0) {
+                try {
+                    var caps = null;
+                    try { caps = vendroidFindByProps("g7", "fA", "zU"); } catch (e0) {}
+                    if (!caps || caps.Hz === undefined) {
+                        try { caps = findModuleByCode(['ua.indexOf("OculusBrowser")']); } catch (e0) {}
                     }
+                    if (caps) {
+                        vendroidSetPatchStatus("voice", "hz", caps.Hz);
+                        console.warn("[Vendroid] Voice: Hz=" + caps.Hz +
+                            " (source patch handles support)");
+                    } else {
+                        console.warn("[Vendroid] Voice: capability module not found");
+                    }
+                } catch (e) {
+                    console.error("[Vendroid] Voice: Hz probe failed: " + e.message);
                 }
-            } catch (e) {
-                console.error("[Vendroid] Voice: Hz probe failed: " + e.message);
             }
 
             // 2. Resolve the WebRTC engine class by code signature and force
@@ -281,7 +342,7 @@
                     return;
                 }
             } else {
-                console.warn("[Vendroid] Voice: WebRTC engine class not found");
+                vendroidVoiceLog("WebRTC engine class not found");
             }
 
             // 3. Resolve the store by stable method names (property names are
@@ -292,14 +353,39 @@
             if (!store || typeof store.getMediaEngine !== "function") {
                 try { store = vendroidFindByProps("isSupported", "getMediaEngine"); } catch (e) {}
             }
+            if (!store || typeof store.getMediaEngine !== "function") {
+                // findByProps sees only executed modules. The store can load
+                // lazily; its method shape is stable and findModuleByCode
+                // force-loads it. That returns a namespace, so select the
+                // store by shape.
+                try {
+                    var storeNs = findModuleByCode([
+                        /isSupported\(\)\{return [A-Za-z_$][\w$]*\.supported\(\)\}/,
+                        /getMediaEngine\(\)\{return [A-Za-z_$][\w$]*\}/
+                    ]);
+                    store = vendroidFindExport(storeNs, function(v) {
+                        return v && typeof v === "object" &&
+                            typeof v.isSupported === "function" &&
+                            typeof v.getMediaEngine === "function";
+                    });
+                } catch (e) {}
+            }
             if (!store || typeof store.getMediaEngine !== "function" || typeof store.isSupported !== "function") {
-                console.warn("[Vendroid] Voice: media engine store not found");
+                vendroidVoiceLog("media engine store not found");
                 vendroidVoiceRetry("store not found");
                 return;
             }
             var supported = false;
             try { supported = store.isSupported() === true; } catch (e) { supported = false; }
-            console.warn("[Vendroid] Voice: store isSupported=" + supported);
+            var engine = null;
+            try { engine = store.getMediaEngine(); } catch (e) {}
+            var engineName = engine && engine.constructor ? engine.constructor.name : "?";
+            vendroidSetPatchStatus("voice", "store", "media-engine");
+            vendroidSetPatchStatus("voice", "engine", engineName);
+            vendroidSetPatchStatus("voice", "supported", supported);
+            vendroidSetPatchStatus("voice", "runtime", supported ? "supported" : "pending");
+            console.warn("[Vendroid] Voice: store isSupported=" + supported +
+                " engine=" + engineName);
             if (supported) {
                 _vendroidVoiceSetupDone = true;
                 return;
@@ -312,6 +398,7 @@
             }
             if (vendroidInstallEngineFallback(store, webrtcClass)) {
                 _vendroidVoiceSetupDone = true;
+                vendroidSetPatchStatus("voice", "runtime", "fallback");
             } else {
                 vendroidVoiceRetry("engine swap did not take");
             }
@@ -322,7 +409,7 @@
     }
 
     // Fallback for the evaluate injection path. The prelude shim
-    // (VENCORD_PRELUDE_JS) installs setSinkId before Discord's deferred
+    // (VENCORD_PRELUDE_JS) installs setSinkId before the deferred
     // bundles evaluate, which clears the output-device warning. Here
     // injectVencordAttempt waits for readyState past "loading", so the engine
     // can capture its capability constant before the shim exists; wrapping

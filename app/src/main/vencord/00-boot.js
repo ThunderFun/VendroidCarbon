@@ -4,12 +4,12 @@
     var _vendroidChunkArr = null;
     var _vendroidCaptureAttempts = 0;
     // Bound the fake-chunk capture loop. Each attempt registers a new module
-    // id in Discord's webpack registry; without a cap this runs for the page
+    // id in the webpack registry; without a cap this runs for the page
     // lifetime if capture never succeeds. 40 x 500ms ~= 20s.
     var _vendroidCaptureMaxAttempts = 40;
     var _vendroidGiveUpLogged = false;
     // Store-only policy for the probe-captured wreq: a startup-entry capture
-    // precedes Discord's remaining chunk pushes, so wreq.m is nearly empty;
+    // precedes the remaining chunk pushes, so wreq.m is nearly empty;
     // initializing Vencord then made findByProps miss and its Lazy proxies
     // throw "Reflect.get called on non-object", breaking plugin starts and
     // text commands. tryInitWebpack() hands the wreq over no earlier than
@@ -18,13 +18,13 @@
     var VENDROID_WREQ_MIN_MODULES = 100;
     var _vendroidWreqFloorLogged = false;
     // Hot-path input logging (beforeinput/composition, per keystroke) crosses
-    // the renderer→native IPC and lands in a disk-backed log — keep it off
+    // the renderer→native IPC and lands in a disk-backed log. Keep it off
     // unless actively debugging input issues.
     var VENDROID_VERBOSE_INPUT = false;
     // Only one probe retry timer runs at a time.
     var _vendroidCaptureTimer = null;
 
-    // Discord creates the chunk array as a plain array, so the push hook can
+    // The client creates the chunk array as a plain array, so the push hook can
     // see Array.prototype.push before webpack installs its jsonp callback.
     // Capturing the native push never yields a wreq and blocks the real
     // callback, so both capture paths skip native functions.
@@ -80,7 +80,7 @@
     function hookPushProperty(arr) {
         try {
             // Wrap an already-installed push so factories arriving through it
-            // are transformed before the underlying handler (Discord's, or a
+            // are transformed before the underlying handler (the client's, or a
             // Vencord one on the evaluateJavascript fallback) processes them.
             // Factories that already flowed through before this script ran
             // are missed; the eager-wrap case below only captures the
@@ -132,7 +132,7 @@
     //
     // Ported vendroidSheets patch specs (VendroidEnhanced/vendroidSheets,
     // GPL-3.0). Applied to module factories as chunks are pushed, before
-    // the underlying push handler sees them. Anchors are disjoint from
+    // the underlying push handler sees them. Patterns are disjoint from
     // Vencord core's patches, and each replacement carries a vde-sheet-*
     // marker so a re-apply can never double-prefix.
     //
@@ -144,7 +144,7 @@
     // source, first-occurrence regex replace (no `all` flag), and one-shot
     // retirement. A non-all patch stops matching after the first module it
     // matched is processed, even when a replacement had no effect. Missed
-    // replacements are counted so anchor rot shows up in device reports
+    // replacements are counted so signature drift shows up in device reports
     // (window.__vdePatchStats, read by the native boot-verify probe)
     // instead of failing silently.
     // ------------------------------------------------------------------
@@ -204,12 +204,127 @@
                     // replacement, so a re-run never matches.
                 }
             ]
+        },
+        {
+            // The overlay hides the mobile GIF tab with `!d.Fr`. Webpack
+            // exports are non-configurable, so patch the factory before it
+            // executes.
+            name: "vde-gif-tab",
+            feature: "gif",
+            find: "gifs?.allowSending&&!",
+            replacements: [
+                {
+                    name: "gifTab",
+                    match: /gifs\?\.allowSending&&![A-Za-z_$][\w$]*\.Fr/,
+                    replace: 'gifs?.allowSending&&!0/*vde-gif-tab*/',
+                    marker: "vde-gif-tab"
+                },
+                {
+                    // Two coupled gates hide the tab bar and switch the
+                    // content wrapper to a single-row grid. Force both.
+                    name: "gifNav",
+                    match: /([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*&&([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*&&!([A-Za-z_$][\w$]*),/,
+                    replace: '$1=!1,$3=!0/*vde-gif-nav*/,',
+                    marker: "vde-gif-nav"
+                }
+            ]
+        },
+        {
+            // Slate is gated by the minified `Ct()` Android check. Bypass
+            // only the composer's decision; other checks keep the real result.
+            name: "vde-slate-composer",
+            find: "useSetting()&&!(0,",
+            replacements: [
+                {
+                    name: "slateComposer",
+                    match: /!\(0,[A-Za-z_$][\w$]*\.Ct\)\(\)&&null!=window\.ResizeObserver/,
+                    replace: '!0/*vde-slate-composer*/&&null!=window.ResizeObserver',
+                    marker: "vde-slate-composer"
+                }
+            ]
+        },
+        {
+            // The store binds its engine at module evaluation. Make WebRTC
+            // report support before that. The `Hz` export is non-configurable,
+            // so patch the factory instead.
+            name: "vde-voice-webrtc-supported",
+            feature: "voice",
+            find: "WebRTC is not supported on",
+            replacements: [
+                {
+                    name: "webrtcSupported",
+                    match: /static supported\(\)\{return!__OVERLAY__&&\(/,
+                    replace: 'static supported(){return window.__VENDROID_VOICE_PREREQS===true||!__OVERLAY__&&(/*vde-voice-webrtc*/',
+                    marker: "vde-voice-webrtc"
+                }
+            ]
         }
     ];
 
     var _vdeActivePatches = VDE_MODULE_PATCHES.slice();
     var _vdeSeenFactories = typeof WeakSet === "function" ? new WeakSet() : null;
-    var _vdePatchStats = { chunks: 0, scanned: 0, applied: {}, missed: {}, retired: [] };
+    var _vdeRegistryWreq = null;
+    var _vdeRegistryModuleCount = -1;
+    var _vdePatchStats = {
+        chunks: 0, scanned: 0, applied: {}, missed: {}, retired: [], modules: {}
+    };
+
+    // The source patch reads this before the store binds its engine. A getter
+    // tracks late mediaDevices setup. The boolean fallback is safe because the
+    // prelude runs before the mobile runtime.
+    try {
+        Object.defineProperty(window, "__VENDROID_VOICE_PREREQS", {
+            configurable: true,
+            enumerable: false,
+            get: function() { return vendroidVoicePrereqsOk(); }
+        });
+    } catch (e) {
+        try { window.__VENDROID_VOICE_PREREQS = vendroidVoicePrereqsOk(); } catch (e2) {}
+    }
+
+    function vendroidDiscordBuild() {
+        try {
+            return (window.GLOBAL_ENV && window.GLOBAL_ENV.BUILD_NUMBER) || "?";
+        } catch (e) {
+            return "?";
+        }
+    }
+
+    // Feature status for boot verification and the patch summary. Source
+    // patches fill it through vdeMarkFeature; runtime setup fills the rest.
+    var _vendroidPatchStatus = window.__vendroidPatchStatus || {
+        build: vendroidDiscordBuild(),
+        legacy: false,
+        gif: { factory: false, module: null, runtime: "pending", error: null },
+        voice: {
+            factory: false, module: null, runtime: "pending", error: null,
+            store: null, engine: null, supported: null, hz: null, dave: null
+        }
+    };
+    window.__vendroidPatchStatus = _vendroidPatchStatus;
+
+    function vendroidPatchFeature(feature) {
+        if (!_vendroidPatchStatus[feature]) _vendroidPatchStatus[feature] = {};
+        _vendroidPatchStatus.build = vendroidDiscordBuild();
+        return _vendroidPatchStatus[feature];
+    }
+
+    function vendroidSetPatchStatus(feature, key, value) {
+        try {
+            vendroidPatchFeature(feature)[key] = value;
+        } catch (e) {}
+    }
+
+    function vdeMarkFeature(patch, applied, moduleId, error) {
+        if (!patch || !patch.feature) return;
+        try {
+            var state = vendroidPatchFeature(patch.feature);
+            state.factory = !!applied;
+            if (moduleId != null) state.module = String(moduleId);
+            if (error) state.error = String(error);
+            else if (applied) state.error = null;
+        } catch (e) {}
+    }
 
     // Transition guard: while a cached operator-built bundle still carries
     // the vendored plugins, those plugins apply their own patches, styles
@@ -248,9 +363,10 @@
         }
     }
 
-    // Applies every still-active patch to one factory. Returns a replacement
-    // factory when any replacement changed the source, else null.
-    function vdePatchFactory(moduleId, factory, code) {
+    // Applies active patches to one factory. Returns a replacement when the
+    // source changes. Registry patches stay active until the chunk pass
+    // overwrites the factory and retires them.
+    function vdePatchFactory(moduleId, factory, code, keepActive) {
         var newCode = code;
         for (var i = _vdeActivePatches.length - 1; i >= 0; i--) {
             var patch = _vdeActivePatches[i];
@@ -262,27 +378,117 @@
                     var replaced = newCode.replace(repl.match, repl.replace);
                     if (replaced === newCode) {
                         vdeCount(_vdePatchStats.missed, repl.name);
-                        console.error("[Vendroid] VDE patch " + repl.name + " matched its find but had no effect (anchor rot? module " + moduleId + ")");
+                        vdeMarkFeature(patch, false, moduleId, "find matched but replacement had no effect");
+                        console.error("[Vendroid] VDE patch " + repl.name + " matched its find but had no effect (source changed? module " + moduleId + ")");
                     } else {
                         newCode = replaced;
                         vdeCount(_vdePatchStats.applied, repl.name);
+                        _vdePatchStats.modules[repl.name] = String(moduleId);
+                        vdeMarkFeature(patch, true, moduleId, null);
                         console.warn("[Vendroid] VDE patch applied: " + repl.name + " (module " + moduleId + ")");
                     }
                 } catch (ePatch) {
                     vdeCount(_vdePatchStats.missed, repl.name);
+                    vdeMarkFeature(patch, false, moduleId, "patch threw: " + ePatch.message);
                     console.error("[Vendroid] VDE patch " + repl.name + " threw: " + ePatch.message);
                 }
             }
-            // One-shot retirement, mirroring Vencord's non-all handling.
-            _vdePatchStats.retired.push(patch.name);
-            _vdeActivePatches.splice(i, 1);
+            // Keep registry patches until the chunk pass overwrites the
+            // factory. Chunk patches retire after one match.
+            if (!keepActive) {
+                _vdePatchStats.retired.push(patch.name);
+                _vdeActivePatches.splice(i, 1);
+            }
         }
         if (newCode === code) return null;
         return vdeRecompileFactory(moduleId, newCode);
     }
 
+    // The HTML embed may load after the first chunk. Patch factories already
+    // in wreq.m; otherwise findModuleId/wreq can execute them before the push
+    // wrapper. Skip loaded modules because their exports already exist.
+    function vdePatchRegisteredFactories(reason) {
+        var wreq = null;
+        try {
+            if (typeof Vencord !== "undefined" && Vencord.Webpack &&
+                Vencord.Webpack.wreq) wreq = Vencord.Webpack.wreq;
+        } catch (e) {}
+        if (!wreq) wreq = _vendroidCapturedWreq;
+        if (!wreq || !wreq.m || typeof wreq.m !== "object") return;
+        var moduleCount = 0;
+        try { moduleCount = Object.keys(wreq.m).length; } catch (e) {}
+        // Rescan when the registry grows. Skip the same size.
+        if (_vdeActivePatches.length === 0) return;
+        if (_vdeRegistryWreq === wreq && moduleCount <= _vdeRegistryModuleCount) return;
+        _vdeRegistryWreq = wreq;
+        _vdeRegistryModuleCount = moduleCount;
+        if (legacyVendroidPluginPresent()) {
+            _vdePatchStats.legacy = true;
+            _vendroidPatchStatus.legacy = true;
+            window.__vdePatchStats = _vdePatchStats;
+            return;
+        }
+
+        var modules = wreq.m;
+        var scanned = 0;
+        var patchedCount = 0;
+        var loadedSkipped = 0;
+        for (var id in modules) {
+            if (!Object.prototype.hasOwnProperty.call(modules, id)) continue;
+            if (_vdeActivePatches.length === 0) break;
+            var factory = modules[id];
+            if (typeof factory !== "function") continue;
+            var code;
+            try { code = Function.prototype.toString.call(factory); } catch (e) { continue; }
+            scanned++;
+
+            var loaded = false;
+            try { loaded = !!(wreq.c && wreq.c[id] && wreq.c[id].loaded); } catch (e) {}
+            if (loaded) {
+                loadedSkipped++;
+                for (var p = 0; p < _vdeActivePatches.length; p++) {
+                    var loadedPatch = _vdeActivePatches[p];
+                    if (loadedPatch.feature && code.indexOf(loadedPatch.find) !== -1) {
+                        vdeMarkFeature(loadedPatch, false, id,
+                            "module executed before the factory patch could run");
+                        console.warn("[Vendroid] VDE patch " + loadedPatch.name +
+                            " missed module " + id + " because it already executed");
+                    }
+                }
+                continue;
+            }
+
+            try {
+                var patched = vdePatchFactory(id, factory, code, true);
+                if (patched) {
+                    modules[id] = patched;
+                    patchedCount++;
+                }
+            } catch (ePatch) {
+                console.error("[Vendroid] VDE registry patch failed for module " + id +
+                    ": " + ePatch.message);
+            }
+        }
+
+        _vdePatchStats.registry = {
+            reason: reason, scanned: scanned, patched: patchedCount,
+            loadedSkipped: loadedSkipped
+        };
+        _vdePatchStats.build = vendroidDiscordBuild();
+        window.__vdePatchStats = _vdePatchStats;
+        window.__vendroidPatchStatus = _vendroidPatchStatus;
+        console.warn("[Vendroid] VDE registry scan (" + reason + "): scanned=" + scanned +
+            " patched=" + patchedCount + " loadedSkipped=" + loadedSkipped +
+            " active=" + _vdeActivePatches.length);
+    }
+
     function vdeTransformChunk(chunk) {
-        if (legacyVendroidPluginPresent()) return;
+        if (legacyVendroidPluginPresent()) {
+            _vdePatchStats.legacy = true;
+            _vendroidPatchStatus.legacy = true;
+            window.__vdePatchStats = _vdePatchStats;
+            return;
+        }
         if (!chunk || !Array.isArray(chunk) || chunk.length < 2) return;
         var modules = chunk[1];
         if (!modules || typeof modules !== "object") return;
@@ -306,9 +512,11 @@
                 console.error("[Vendroid] VDE patch pass failed for module " + id + ": " + ePatch.message);
             }
         }
-        // Read by the native boot-verify probe (BOOT_VERIFY_JS) so anchor-rot
+        // Read by the native boot-verify probe (BOOT_VERIFY_JS) so drift
         // counters land in device reports.
+        _vdePatchStats.build = vendroidDiscordBuild();
         window.__vdePatchStats = _vdePatchStats;
+        window.__vendroidPatchStatus = _vendroidPatchStatus;
     }
 
     function vdeWrapPush(fn) {
@@ -384,6 +592,7 @@
             // Store only; tryInitWebpack() hands it over late (see VENDROID_WREQ_MIN_MODULES).
             _vendroidCapturedWreq = captured;
             console.warn("[Vendroid] Captured __webpack_require__ from startup entry!");
+            vdePatchRegisteredFactories("captured-wreq");
             return true;
         }
         if (_vendroidCaptureAttempts <= 3) {
@@ -475,8 +684,8 @@
         return s;
     }
 
-    // Is a Discord overlay open? Gate for the back press and swipes. Reads
-    // the stores Discord's own shortcuts use (mod+k checks
+    // Is a client overlay open? Gate for the back press and swipes. Reads
+    // the stores the client's shortcuts use (mod+k checks
     // LayerStore.hasLayers()). The layer containers keep mounted-but-empty
     // children, so the old childElementCount probe reported "open" with
     // nothing on screen, rejecting swipes and consuming back presses. The
@@ -524,7 +733,7 @@
 
     // Sidebar state reconciliation.
     //
-    // What the Discord bundle does:
+    // Sidebar behavior in the bundle:
     //   - MobileWebSidebarStore.getIsOpen() = !platform.isMobile || sI, with
     //     sI flipped only by MOBILE_WEB_SIDEBAR_OPEN/CLOSE.
     //   - Its route listener dispatches those actions on channel switches,
@@ -536,7 +745,7 @@
     //     false "open".
     //
     // syncSidebarOpenFromDom() reconciles in this order: first the store when
-    // it resolves, since that is what Discord's UI reads; then a rendered-shell
+    // it resolves, since that is what the client reads; then a rendered-shell
     // check, where sidebar_ absence means closed; last the legacy hamburger.
 
     var _vendroidSidebarStore = null;
@@ -632,7 +841,7 @@
     //
     // The enabledByDefault neutralization runs every boot, before the flag
     // early-return, so recoverPlugins can never resurrect the plugins even
-    // when the bundle patch missed (anchor rot). The sweep itself is
+    // when the bundle patch missed. The sweep itself is
     // one-shot via a dual flag: native prefs (survive WebView storage loss
     // and the in-memory localStorage shim) plus a localStorage mirror
     // (covers a silently rejected native write; bridge writes can be
@@ -898,6 +1107,7 @@
                 if (typeof Vencord.Webpack._initWebpack === "function") {
                     Vencord.Webpack._initWebpack(_vendroidCapturedWreq);
                     console.warn("[Vendroid] _initWebpack called from captured wreq, wreq=" + typeof Vencord.Webpack.wreq + " modules=" + mLen);
+                    vdePatchRegisteredFactories("init-captured");
                     if (Vencord.Webpack.wreq) return true;
                 }
             } catch(e) {
@@ -910,6 +1120,7 @@
             try {
                 Vencord.Webpack._initWebpack(wreq);
                 console.warn("[Vendroid] _initWebpack called, wreq=" + typeof Vencord.Webpack.wreq + " cache=" + typeof Vencord.Webpack.cache);
+                vdePatchRegisteredFactories("init-extracted");
                 if (Vencord.Webpack.wreq) return true;
             } catch(e) {
                 console.error("[Vendroid] _initWebpack failed: " + e.message);
@@ -966,17 +1177,22 @@
     // find. `out.id`, when passed, receives the matched module id.
     function vendroidScanModuleCaches(predicate, out, scanNested) {
         var caches = [];
+        function addCache(cache) {
+            if (cache && typeof cache === "object" && caches.indexOf(cache) === -1) {
+                caches.push(cache);
+            }
+        }
         try {
             if (typeof Vencord !== "undefined" && Vencord.Webpack) {
-                if (Vencord.Webpack.cache) caches.push(Vencord.Webpack.cache);
-                else if (Vencord.Webpack.wreq && Vencord.Webpack.wreq.c) caches.push(Vencord.Webpack.wreq.c);
+                // Add both cache views independently. Webpack.cache can be a
+                // Lazy getter, and a truthy non-object must not suppress the
+                // wreq.c fallback.
+                addCache(Vencord.Webpack.cache);
+                if (Vencord.Webpack.wreq) addCache(Vencord.Webpack.wreq.c);
             }
         } catch (e) {}
         try {
-            if (_vendroidCapturedWreq && _vendroidCapturedWreq.c &&
-                caches.indexOf(_vendroidCapturedWreq.c) === -1) {
-                caches.push(_vendroidCapturedWreq.c);
-            }
+            if (_vendroidCapturedWreq) addCache(_vendroidCapturedWreq.c);
         } catch (e) {}
         for (var c = 0; c < caches.length; c++) {
             var cache = caches[c];

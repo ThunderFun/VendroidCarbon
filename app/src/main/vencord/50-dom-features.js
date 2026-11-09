@@ -70,7 +70,7 @@
     // the first match wins. Resolution order: Vencord's findModuleId (scans
     // the factory registry, so lazily-loaded modules resolve too), then
     // findByCode (instantiated modules only), then a manual factory scan.
-    // Shared by the GIF picker and native-search patches below.
+    // Shared by native search and the voice engine resolver.
     function findModuleByCode(patterns) {
         if (!Array.isArray(patterns)) patterns = [patterns];
         if (typeof Vencord.Webpack.findModuleId === "function") {
@@ -136,26 +136,174 @@
     }
 
 
-    // GIF picker: unblock Discord's built-in GIF picker on mobile.
+    // Unblock the built-in GIF picker on mobile.
     //
-    // The expression-picker overlay hides the GIF tab when isMobile (Fr) is
-    // true: `en = gifs.allowSending && !d.Fr && ...`. We wrap the overlay's
-    // render (React.memo — inner fn at memo.type) so Fr reads false only
-    // during that one render, then restores it. A permanent Fr=false breaks
-    // navigation (MobileWebSidebarStore.getIsOpen returns `!Fr || aW`, so the
-    // sidebar would always report open).
-    //
-    // Result: the GIF tab appears inside the existing emoji picker — tap the
-    // emoji button and switch to GIF, like desktop. No separate button; sending
-    // works via the overlay's native onSelectGIF.
+    // The picker hides the GIF tab behind non-configurable feature flags.
+    // 00-boot.js patches the factory before execution; this setup wraps the
+    // memo render to clear the props that hide the tab and resets
+    // lastActiveView so the emoji button opens on emoji.
 
     var _vendroidGifPatched = false;
-    var _vendroidGifOverlayPatched = false;
     var _vendroidGifRetryCount = 0;
     var _vendroidGifGaveUp = false;
-    // Verify failures are deterministic per webpack state (a read-only export
-    // stays read-only), so unlike module resolution this budget stays small.
-    var _vendroidGifPatchRetryCount = 0;
+    var _vendroidGifOverlayPatched = false;
+    var _vendroidGifOverlayLogged = false;
+
+    // If the overlay ran before the hooks loaded, wreq.c holds unpatched
+    // exports and rewriting wreq.m is too late. Re-run the factory with both
+    // GIF rewrites and copy only the memo render into the live memo.
+    function vendroidReloadGifOverlay(OverlayModule) {
+        try {
+            var wreq = Vencord.Webpack.wreq;
+            if (!wreq || !wreq.m || !wreq.c) return false;
+            // Wrapper modules can re-export the same memo. Pick the factory
+            // whose source contains the overlay.
+            function factoryHasOverlay(candidateId) {
+                try {
+                    var f = wreq.m[candidateId];
+                    // wreq.m is a Vencord proxy. Call factory.toString();
+                    // Function.prototype.toString.call sees the proxy.
+                    return typeof f === "function" &&
+                        f.toString().indexOf("gifs?.allowSending") !== -1;
+                } catch(e) { return false; }
+            }
+            var id = null;
+            try {
+                var candidate = Vencord.Webpack.findModuleId(
+                    /hideGifFavorites:[A-Za-z_$][\w$]*,onSelectGIF:/);
+                if (candidate != null && factoryHasOverlay(candidate)) {
+                    id = candidate;
+                }
+            } catch(e) {}
+            if (id == null) {
+                for (var key in wreq.c) {
+                    try {
+                        var entry = wreq.c[key];
+                        if (entry && entry.exports &&
+                            entry.exports.A === OverlayModule.A &&
+                            factoryHasOverlay(key)) {
+                            id = key;
+                            break;
+                        }
+                    } catch(e) {}
+                }
+            }
+            if (id == null || typeof wreq.m[id] !== "function") {
+                console.warn("[Vendroid] GIF: overlay factory id not found");
+                return false;
+            }
+            var code = wreq.m[id].toString();
+            var next = code
+                .replace(/gifs\?\.allowSending&&![A-Za-z_$][\w$]*\.Fr/,
+                    "gifs?.allowSending&&!0/*vde-gif-tab*/")
+                .replace(/([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*&&([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*&&!([A-Za-z_$][\w$]*),/,
+                    "$1=!1,$3=!0/*vde-gif-nav*/,");
+            if (next.indexOf("vde-gif-tab") === -1 ||
+                next.indexOf("vde-gif-nav") === -1) {
+                var at = code.indexOf("gifs?.allowSending");
+                console.warn("[Vendroid] GIF: overlay factory anchors missing (id=" +
+                    id + ", source=" +
+                    (at >= 0 ? code.slice(at, at + 120) : "no gifs anchor") + ")");
+                return false;
+            }
+            var isArrow = next.charAt(0) === "(";
+            var expr = "0," + (!isArrow ? "function" : "") +
+                next.slice(next.indexOf("("));
+            var factory = (0, eval)(
+                "// Webpack Module " + id + " - GIF re-executed by Vendroid\n" +
+                expr + "\n//# sourceURL=https://discord.com/vencord-gif-overlay");
+            var fake = { exports: {} };
+            factory(fake, fake.exports, wreq);
+            var fresh = fake.exports && fake.exports.A;
+            if (!fresh || typeof fresh.type !== "function") {
+                console.warn("[Vendroid] GIF: re-executed overlay has no component");
+                return false;
+            }
+            OverlayModule.A.type = fresh.type;
+            if (OverlayModule.A.type !== fresh.type) {
+                console.warn("[Vendroid] GIF: live memo type is read-only");
+                return false;
+            }
+            console.warn("[Vendroid] GIF: re-executed overlay factory " + id +
+                " (patched gates)");
+            return true;
+        } catch(e) {
+            console.error("[Vendroid] GIF: overlay re-execution failed: " +
+                e.message);
+            return false;
+        }
+    }
+
+    // Props can hide the tab too: onlyEmojis, a missing gifs.allowSending,
+    // or the emoji-packs gate. Wrap the memo render and clear them only when
+    // onSelectGIF is present.
+    function vendroidPatchGifOverlayProps() {
+        if (_vendroidGifOverlayPatched) return true;
+        var OverlayModule = null;
+        try {
+            OverlayModule = findModuleByCode([
+                /hideGifFavorites:[A-Za-z_$][\w$]*,onSelectGIF:[A-Za-z_$][\w$]*,/,
+                "hideGifFavorites"
+            ]);
+        } catch(e) {}
+        if (!OverlayModule || !OverlayModule.A ||
+            typeof OverlayModule.A.type !== "function") {
+            console.warn("[Vendroid] GIF: overlay component not found for prop wrapper");
+            return false;
+        }
+        vendroidReloadGifOverlay(OverlayModule);
+        var orig = OverlayModule.A.type;
+        try {
+            var origSrc = Function.prototype.toString.call(orig);
+            var mark = origSrc.indexOf("gifs?.allowSending");
+            console.warn("[Vendroid] GIF: executed overlay source " +
+                (mark >= 0 ? origSrc.slice(mark, mark + 260) : "anchor-gone"));
+        } catch(e) {}
+        var patched = function(props) {
+            try {
+                if (!_vendroidGifOverlayLogged) {
+                    _vendroidGifOverlayLogged = true;
+                    var t0 = props && props.type;
+                    console.warn("[Vendroid] GIF: overlay props allow=" +
+                        !!(t0 && t0.gifs && t0.gifs.allowSending) +
+                        " onlyEmojis=" + !!(t0 && t0.expressionPicker &&
+                            t0.expressionPicker.onlyEmojis) +
+                        " hasOnSelectGIF=" + !!(props && props.onSelectGIF));
+                }
+                if (props && props.onSelectGIF && props.type) {
+                    var t = props.type;
+                    var g = t.gifs;
+                    var ep = t.expressionPicker;
+                    if (!g || g.allowSending !== true ||
+                        (ep && ep.onlyEmojis === true)) {
+                        var nextType = Object.assign({}, t, {
+                            gifs: Object.assign({}, g, { allowSending: true }),
+                            expressionPicker: Object.assign({}, ep,
+                                { onlyEmojis: false })
+                        });
+                        var nextProps = Object.assign({}, props, { type: nextType });
+                        return orig.call(this, nextProps);
+                    }
+                }
+            } catch(e) {
+                console.error("[Vendroid] GIF: prop wrapper failed: " + e.message);
+            }
+            return orig.apply(this, arguments);
+        };
+        try {
+            OverlayModule.A.type = patched;
+            if (OverlayModule.A.type !== patched) {
+                throw new Error("memo .type is read-only");
+            }
+            _vendroidGifOverlayPatched = true;
+            vendroidSetPatchStatus("gif", "props", "wrapped");
+            console.warn("[Vendroid] GIF: overlay prop wrapper installed");
+            return true;
+        } catch(e) {
+            console.error("[Vendroid] GIF: prop wrapper install failed: " + e.message);
+            return false;
+        }
+    }
 
     function setupGifPickerButton() {
         if (_vendroidGifPatched) return;
@@ -165,142 +313,49 @@
                 return;
             }
 
-            // Resolve core modules.
-            var PlatformUtils = null;
-            try {
-                PlatformUtils = vendroidFindByProps("Fr", "Ct", "KY", "v1");
-            } catch(e) {}
             var ExpressionPickerStore = null;
             try {
                 ExpressionPickerStore = vendroidFindByProps("r$", "ed", "v8", "RQ");
             } catch(e) {}
+            if (!ExpressionPickerStore) {
+                // findByProps sees only executed modules. findModuleByCode
+                // scans the registry and force-loads lazy store and view modules.
+                try { ExpressionPickerStore = findModuleByCode(["expression-picker-last-active-view"]); } catch(e) {}
+            }
             var ExpressionPickerViewTypes = null;
             try {
                 ExpressionPickerViewTypes = vendroidFindByProps("kx", "VQ", "wp");
             } catch(e) {}
+            if (!ExpressionPickerViewTypes) {
+                try { ExpressionPickerViewTypes = findModuleByCode(["expression-picker-chat-input-button"]); } catch(e) {}
+            }
 
-            if (!PlatformUtils || PlatformUtils.Fr === undefined ||
-                !ExpressionPickerStore || !ExpressionPickerStore.r$ ||
+            if (!ExpressionPickerStore || !ExpressionPickerStore.r$ ||
                 !ExpressionPickerViewTypes || !ExpressionPickerViewTypes.kx) {
                 if (_vendroidGifRetryCount++ < 300) {
                     setTimeout(setupGifPickerButton, 50);
                 } else if (!_vendroidGifGaveUp) {
                     _vendroidGifGaveUp = true;
-                    console.warn("[Vendroid] GIF: core modules not found after 300 attempts; " +
-                        "picker stays stock");
+                    _vendroidGifPatched = true;
+                    vendroidSetPatchStatus("gif", "runtime", "store-missing");
+                    console.warn("[Vendroid] GIF: picker store not found after 300 attempts; " +
+                        "factory patch state is in the VDE stats");
                 }
                 return;
             }
-            console.warn("[Vendroid] GIF: core modules resolved (Fr=" + PlatformUtils.Fr + ")");
 
-            // Patch the overlay: flip Fr->false only during its render call.
-            // Only needed on mobile (Fr===true); desktop already shows GIF.
-            if (PlatformUtils.Fr === true && !_vendroidGifOverlayPatched) {
-                var OverlayModule = findModuleByCode([
-                    // Match stable handler prop names; tolerates Discord
-                    // re-minifying the per-build value letters.
-                    /onSelectGIF:[A-Za-z0-9_$],onSelectEmoji:[A-Za-z0-9_$],onSelectSticker:[A-Za-z0-9_$],onSelectSound:[A-Za-z0-9_$]/,
-                    // Fallback: exact current minified signature.
-                    "onSelectGIF:a,onSelectEmoji:l,onSelectSticker:A,onSelectSound:v,channel:b"
-                ]);
-                var overlayTypeFn = null;
-                var overlayIsMemo = false;
-                if (OverlayModule && OverlayModule.A) {
-                    // React.memo: the render fn is at .type, not the memo object.
-                    if (typeof OverlayModule.A.type === "function") {
-                        overlayTypeFn = OverlayModule.A.type;
-                        overlayIsMemo = true;
-                    } else if (typeof OverlayModule.A === "function") {
-                        overlayTypeFn = OverlayModule.A;
-                    }
-                }
-                if (overlayTypeFn) {
-                    _vendroidGifOverlayPatched = true;
-                    var origOverlayRender = overlayTypeFn;
-                    var _gifOriginalFrGetter = null;
-                    try {
-                        var desc = Object.getOwnPropertyDescriptor(PlatformUtils, "Fr");
-                        if (desc && desc.get) _gifOriginalFrGetter = desc.get;
-                    } catch(e) {}
+            vendroidPatchGifOverlayProps();
 
-                    function flipFrForRender() {
-                        try {
-                            Object.defineProperty(PlatformUtils, "Fr", {
-                                get: function() { return false; },
-                                configurable: true, enumerable: true
-                            });
-                        } catch(e) {}
-                    }
-                    function restoreFr(savedFr) {
-                        try {
-                            Object.defineProperty(PlatformUtils, "Fr", {
-                                get: _gifOriginalFrGetter || function() { return savedFr; },
-                                configurable: true, enumerable: true
-                            });
-                        } catch(e) {}
-                    }
-
-                    var patchedOverlay = function() {
-                        var savedFr = PlatformUtils.Fr;
-                        flipFrForRender();
-                        var res;
-                        try {
-                            res = origOverlayRender.apply(this, arguments);
-                        } finally {
-                            restoreFr(savedFr);
-                        }
-                        return res;
-                    };
-                    try {
-                        if (overlayIsMemo) {
-                            OverlayModule.A.type = patchedOverlay;
-                            // A getter-only .type would silently ignore the
-                            // assignment; verify it took so the catch below
-                            // clears the patched flag and retries.
-                            if (OverlayModule.A.type !== patchedOverlay) throw new Error("memo .type is read-only");
-                        } else {
-                            // Plain function component: React calls A(props)
-                            // directly, so .type is a no-op. Replace the export
-                            // itself, copying statics (propTypes, displayName).
-                            for (var k in origOverlayRender) patchedOverlay[k] = origOverlayRender[k];
-                            OverlayModule.A = patchedOverlay;
-                            // Harmony exports expose A as a get-only property;
-                            // the assignment can silently no-op in sloppy mode,
-                            // so verify it actually took.
-                            if (OverlayModule.A !== patchedOverlay) throw new Error("export A is read-only");
-                        }
-                        console.warn("[Vendroid] GIF: patched overlay (Fr scoped to render only)");
-                    } catch(e) {
-                        // Return so the code below cannot mark setup complete
-                        // and mask this failure for the session.
-                        _vendroidGifOverlayPatched = false;
-                        console.error("[Vendroid] GIF: overlay patch failed: " + e.message);
-                        // Reset the view even on failure; a persisted GIF
-                        // lastActiveView would otherwise open the picker on
-                        // a view whose tab is hidden.
-                        try {
-                            ExpressionPickerStore.U(ExpressionPickerViewTypes.kx.EMOJI);
-                        } catch(e2) {
-                            console.error("[Vendroid] GIF: failed to reset lastActiveView: " + e2.message);
-                        }
-                        if (_vendroidGifPatchRetryCount++ < 10) setTimeout(setupGifPickerButton, 200);
-                        return;
-                    }
-                } else {
-                    console.error("[Vendroid] GIF: overlay not found (A type=" + (OverlayModule ? typeof OverlayModule.A : "null") + ")");
-                }
-            }
-
-            // Reset lastActiveView to emoji so the emoji button opens emoji
-            // by default (not GIF left over from prior r$ calls).
+            // Reset lastActiveView so the emoji button opens emoji by default.
             try {
                 ExpressionPickerStore.U(ExpressionPickerViewTypes.kx.EMOJI);
+                vendroidSetPatchStatus("gif", "runtime", "ready");
             } catch(e) {
+                vendroidSetPatchStatus("gif", "runtime", "reset-failed");
                 console.error("[Vendroid] GIF: failed to reset lastActiveView: " + e.message);
             }
 
             _vendroidGifPatched = true;
-            console.warn("[Vendroid] GIF picker setup complete");
 
         } catch(e) {
             console.error("[Vendroid] setupGifPickerButton failed: " + e.message);
@@ -309,38 +364,24 @@
     }
 
 
-    // Native channel search: expose Discord's built-in Search widget on
-    // mobile web through our own entry point. We mount the component the
-    // desktop toolbar loads into our own ReactDOM root inside a top-anchored
-    // card; the native results dock renders behind it and stays clickable
-    // (openSearchOverlayWithRoot below).
+    // Native channel search: mount the built-in search widget in our own
+    // top-anchored card, with the native results dock behind it.
     //
-    // Targets survive rebuilds: openNativeSearch locates the HeaderBar
-    // launcher factory by source signature (anchor regexes below, verified
-    // unique against live bundles) and parses its createPromise loader for
-    // the chunk set and widget module id, so id rotation cannot pin this
-    // feature to dead numbers. The pinned snapshot applies only when
-    // discovery fails. Nothing inside the Search graph reads
-    // PlatformUtils.Fr, so the widget is platform-agnostic once mounted.
+    // openNativeSearch locates the launcher by source signature and parses
+    // its createPromise loader for the chunk set and widget module id. A
+    // pinned snapshot is used only when discovery fails. The widget does not
+    // read PlatformUtils.Fr.
     //
-    // Why NOT the GIF-style export wrap: webpack's __webpack_require__.d
-    // defines exports as non-configurable accessors, so HeaderBarModule.A
-    // cannot be reassigned or redefined at runtime (verified on-device:
-    // assignment silently no-ops, defineProperty throws). The GIF picker
-    // worked because its target was a mutable React.memo object (.type);
-    // .A here is a plain function.
-    //
-    // Why NOT openModalLazy: abandoned after commit-time TypeErrors thrown
-    // by vendor factories. Our own root sidesteps the modal layer entirely,
-    // including the focus/popout machinery the widget fought there.
+    // Do not reassign webpack exports: they are non-configurable. Factory
+    // source patches are the reliable hook. A dedicated ReactDOM root also
+    // avoids commit-time failures in the modal layer.
 
-    // Result memo for discoverSearchTargets; the TTL lets a long-lived
-    // session re-resolve after Discord swaps bundles mid-session.
+    // Result memo for discoverSearchTargets. The TTL lets a long-lived
+    // session re-resolve after the client swaps bundles.
     var _vendroidDiscovered = null;
     var _VENDROID_DISCOVERY_TTL = 10 * 60 * 1000;
 
-    // Anchor signatures identifying the HeaderBar launcher factory; any one
-    // match is accepted.
+    // Source signatures for the HeaderBar launcher. Any match is accepted.
     var _VENDROID_SEARCH_ANCHORS = [
         /toolbar:[A-Za-z_$]{1,3},mobileToolbar:[A-Za-z_$]{1,3},"aria-label":/,
         /name:"Search",renderLoader:/,
@@ -785,7 +826,7 @@
                         }
 
                         // Mount path A: our own ReactDOM root inside the
-                        // overlay card, bypassing Discord's modal layer
+                        // overlay card, bypassing the modal layer
                         // entirely. Client resolution order:
                         // 1. findByProps("createRoot","hydrateRoot"), keyed
                         //    on prop identity so id rotation cannot miss it;
@@ -827,7 +868,7 @@
                             console.warn("[Vendroid] Search: widget opened via own root" +
                                 " (channelId=" + channelId + ", guildId=" + guildId + ")");
                         } else {
-                            // Mount path B (fallback): Discord's modal system.
+                            // Mount path B (fallback): the modal system.
                             ModalApi.openModalLazy(function() {
                                 return Promise.resolve({ default: VdeSafeSearch });
                             });
@@ -875,10 +916,10 @@
     }
 
     // Top-anchored card hosting only the input; the native results dock
-    // renders behind it, fully visible and clickable. Dedicated createRoot —
-    // no Discord modal layer involved.
+    // renders behind it, fully visible and clickable. Dedicated createRoot
+    // with no modal layer involved.
     function openSearchOverlayWithRoot(RD, R, WidgetComp, ctxKey, fdUnsubFactory) {
-        // Reuse a live instance for the same channel — re-show it without
+        // Reuse a live instance for the same channel. Re-show it without
         // remounting (remounting would recreate the search context and
         // reset state).
         if (_vendroidSearchOverlay && _vendroidSearchOverlay.ctxKey === ctxKey &&
@@ -953,10 +994,7 @@
         notifyOverlayState();
     }
 
-    // Pinned snapshot of the HeaderBar desktop loader from an older web
-    // build: Promise.all over 13 chunk ids, then module 907745 (exports
-    // default = function G({className, guildId, channelId}) building a
-    // searchContext internally via E.J). Consulted only when discovery fails.
+    // Pinned HeaderBar loader snapshot, used only when discovery fails.
     var VENDROID_SEARCH_CHUNKS = ["245553", "855151", "421630", "113582", "966016",
                                   "781202", "421225", "671367", "79171", "798567",
                                   "220803", "417664", "183752"];
