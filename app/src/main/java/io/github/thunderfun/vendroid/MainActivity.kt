@@ -194,8 +194,16 @@ class MainActivity : AppCompatActivity() {
                 WindowInsetsCompat.Type.systemBars() or
                     WindowInsetsCompat.Type.displayCutout()
             )
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             backdrop.setSystemBarInsets(bars.left, bars.top, bars.right, bars.bottom)
-            content.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            // Edge-to-edge does not resize the window for the keyboard, so
+            // reserve the IME height here or the composer stays behind it.
+            content.setPadding(
+                bars.left,
+                bars.top,
+                bars.right,
+                maxOf(bars.bottom, ime.bottom),
+            )
             insets
         }
         ViewCompat.requestApplyInsets(root)
