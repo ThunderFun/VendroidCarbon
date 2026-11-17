@@ -194,7 +194,7 @@ object Constants {
 
     /**
      * Theme-default bar color as a lowercase six-digit hex string. Must match
-     * the "#%06x" format VencordNative.getDefaultBarColor emits and the
+     * the format BarColors.resolveThemeBarColorHex emits and the
      * @color/status_bar_color resource (values/ and values-night/), which is
      * the source of truth; this constant is the fallback for bridge paths
      * with no Context to resolve it. JS consumers pass the value on

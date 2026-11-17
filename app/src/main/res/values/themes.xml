@@ -34,6 +34,5 @@
              background (API 26-30). Matches the loading screen. -->
         <item name="android:windowSplashScreenBackground">@color/status_bar_color</item>
         <item name="android:windowBackground">@color/status_bar_color</item>
-        <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
     </style>
 </resources>

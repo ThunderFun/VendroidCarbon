@@ -31,6 +31,5 @@
         <item name="android:navigationBarColor">@color/status_bar_color</item>
         <item name="android:windowSplashScreenBackground">@color/status_bar_color</item>
         <item name="android:windowBackground">@color/status_bar_color</item>
-        <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
     </style>
 </resources>

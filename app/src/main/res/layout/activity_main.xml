@@ -1,109 +1,126 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     tools:context=".MainActivity">
 
-    <!-- Placeholder only. The real WebView is created programmatically in
-         MainActivity (reusing the pre-warmed renderer when available) and
-         installed here so setContentView doesn't pay the cost of inflating a
-         WebView (Chromium init) before the WebView clients are configured. -->
-    <View
-        android:id="@+id/webview"
+    <!-- Edge-to-edge backdrop. MainActivity insets content_root by the same
+         system-bar/cutout values, so this view is visible only in the bar
+         strips. -->
+    <io.github.thunderfun.vendroid.ui.SystemBarBackdropView
+        android:id="@+id/system_bar_backdrop"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="@color/status_bar_color" />
+        android:importantForAccessibility="no" />
 
     <FrameLayout
-        android:id="@+id/loading_screen"
+        android:id="@+id/content_root"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="@color/status_bar_color">
+        android:layout_height="match_parent">
 
-        <!-- Glow backdrop blobs: radial gradients hardware-layered by
-             LoadingScreenManager. The root MUST stay a FrameLayout; the
-             manager constructor takes ViewGroup, and changing this type
-             without updating it throws ClassCastException at startup. -->
+        <!-- Placeholder only. The real WebView is created programmatically in
+             MainActivity (reusing the pre-warmed renderer when available) and
+             installed here so setContentView doesn't pay the cost of inflating
+             a WebView (Chromium init) before the WebView clients are configured. -->
         <View
-            android:id="@+id/glow_a"
-            android:layout_width="300dp"
-            android:layout_height="300dp"
-            android:layout_gravity="center"
-            android:background="@drawable/glow_blurple"
-            android:importantForAccessibility="no" />
+            android:id="@+id/webview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@color/status_bar_color" />
 
-        <View
-            android:id="@+id/glow_b"
-            android:layout_width="240dp"
-            android:layout_height="240dp"
-            android:layout_gravity="center"
-            android:background="@drawable/glow_violet"
-            android:importantForAccessibility="no" />
+        <FrameLayout
+            android:id="@+id/loading_screen"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@color/status_bar_color">
 
-        <View
-            android:id="@+id/glow_c"
-            android:layout_width="200dp"
-            android:layout_height="200dp"
-            android:layout_gravity="center"
-            android:background="@drawable/glow_indigo"
-            android:importantForAccessibility="no" />
+            <!-- Glow backdrop blobs: radial gradients hardware-layered by
+                 LoadingScreenManager. The root MUST stay a FrameLayout; the
+                 manager constructor takes ViewGroup, and changing this type
+                 without updating it throws ClassCastException at startup. -->
+            <View
+                android:id="@+id/glow_a"
+                android:layout_width="300dp"
+                android:layout_height="300dp"
+                android:layout_gravity="center"
+                android:background="@drawable/glow_blurple"
+                android:importantForAccessibility="no" />
 
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="center"
-            android:gravity="center"
-            android:orientation="vertical">
+            <View
+                android:id="@+id/glow_b"
+                android:layout_width="240dp"
+                android:layout_height="240dp"
+                android:layout_gravity="center"
+                android:background="@drawable/glow_violet"
+                android:importantForAccessibility="no" />
+
+            <View
+                android:id="@+id/glow_c"
+                android:layout_width="200dp"
+                android:layout_height="200dp"
+                android:layout_gravity="center"
+                android:background="@drawable/glow_indigo"
+                android:importantForAccessibility="no" />
 
             <LinearLayout
-                android:id="@+id/dots_container"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginBottom="24dp"
-                android:gravity="center"
-                android:orientation="horizontal">
-
-                <View
-                    android:id="@+id/dot1"
-                    android:layout_width="20dp"
-                    android:layout_height="20dp"
-                    android:layout_marginHorizontal="8dp"
-                    android:background="@drawable/loading_dot" />
-
-                <View
-                    android:id="@+id/dot2"
-                    android:layout_width="20dp"
-                    android:layout_height="20dp"
-                    android:layout_marginHorizontal="8dp"
-                    android:background="@drawable/loading_dot" />
-
-                <View
-                    android:id="@+id/dot3"
-                    android:layout_width="20dp"
-                    android:layout_height="20dp"
-                    android:layout_marginHorizontal="8dp"
-                    android:background="@drawable/loading_dot" />
-
-            </LinearLayout>
-
-            <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="center"
-                android:text="@string/splashscreen_text"
-                android:textColor="#FFFFFF"
-                android:textSize="22sp" />
+                android:gravity="center"
+                android:orientation="vertical">
 
-        </LinearLayout>
+                <LinearLayout
+                    android:id="@+id/dots_container"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="24dp"
+                    android:gravity="center"
+                    android:orientation="horizontal">
+
+                    <View
+                        android:id="@+id/dot1"
+                        android:layout_width="20dp"
+                        android:layout_height="20dp"
+                        android:layout_marginHorizontal="8dp"
+                        android:background="@drawable/loading_dot" />
+
+                    <View
+                        android:id="@+id/dot2"
+                        android:layout_width="20dp"
+                        android:layout_height="20dp"
+                        android:layout_marginHorizontal="8dp"
+                        android:background="@drawable/loading_dot" />
+
+                    <View
+                        android:id="@+id/dot3"
+                        android:layout_width="20dp"
+                        android:layout_height="20dp"
+                        android:layout_marginHorizontal="8dp"
+                        android:background="@drawable/loading_dot" />
+
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center"
+                    android:text="@string/splashscreen_text"
+                    android:textColor="#FFFFFF"
+                    android:textSize="22sp" />
+
+            </LinearLayout>
+
+        </FrameLayout>
+
+        <FrameLayout
+            android:id="@+id/fullscreen_container"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#000000"
+            android:visibility="gone" />
 
     </FrameLayout>
-
-    <FrameLayout
-        android:id="@+id/fullscreen_container"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="#000000"
-        android:visibility="gone" />
 
 </FrameLayout>

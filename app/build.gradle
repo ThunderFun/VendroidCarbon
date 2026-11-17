@@ -34,9 +34,9 @@ android {
     defaultConfig {
         applicationId "io.github.thunderfun.vendroid"
         minSdk 26
-        targetSdk 35
-        versionCode 4
-        versionName "1.0.3"
+        targetSdk 37
+        versionCode 5
+        versionName "1.0.5"
     }
 
     buildFeatures {

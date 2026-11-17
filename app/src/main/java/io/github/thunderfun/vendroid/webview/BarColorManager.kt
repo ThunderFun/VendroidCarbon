@@ -4,11 +4,12 @@ import android.graphics.Color
 import android.os.Build
 import android.view.Window
 import androidx.core.view.WindowCompat
+import io.github.thunderfun.vendroid.ui.SystemBarBackdropView
 import io.github.thunderfun.vendroid.utils.VDELog
 
 /**
- * Read/write seam over the window system-bar state [BarColorManager] manages.
- * Isolates every android.view.Window access from the manager's decision logic.
+ * Read/write seam over the system-bar state [BarColorManager] manages.
+ * Isolates Window/View access from the manager's decision logic.
  */
 interface SystemBarTarget {
     /**
@@ -19,65 +20,58 @@ interface SystemBarTarget {
      */
     fun post(block: () -> Unit)
 
-    var statusBarColor: Int
-    var navigationBarColor: Int
-
     /**
-     * Whether isStatusBarContrastEnforced / isNavigationBarContrastEnforced
-     * are available (API 35+). When false, the manager never reads or writes
-     * them.
+     * Paints the status/navigation bar backdrops. Returns true when the
+     * colors actually changed.
      */
-    val contrastEnforcementSupported: Boolean
+    fun applyBarColors(statusColor: Int, navigationColor: Int): Boolean
 
-    var isStatusBarContrastEnforced: Boolean
-    var isNavigationBarContrastEnforced: Boolean
-
-    /**
-     * Light-system-icon appearance for each bar. Via the compat wrapper this
-     * works on every supported API (legacy view flags pre-30), so it is NOT
-     * gated behind [contrastEnforcementSupported].
-     */
     var isAppearanceLightStatusBars: Boolean
     var isAppearanceLightNavigationBars: Boolean
 }
 
 /**
- * [SystemBarTarget] backed by an Activity [Window]. [postToUiThread] should be
- * Activity.runOnUiThread (inline on the UI thread, posted otherwise).
+ * [SystemBarTarget] backed by an Activity [Window] and the edge-to-edge
+ * backdrop view. Window color setters are not used; the backdrop is the
+ * single source of truth.
  */
-@Suppress("DEPRECATION") // bar color/contrast setters are deprecated on recent
-// APIs but remain live here. The app theme opts out of edge-to-edge
-// enforcement (windowOptOutEdgeToEdgeEnforcement=true), so the deprecated
-// setters are the only way to color the bars on all supported devices.
 class WindowSystemBarTarget(
     private val window: Window,
+    private val backdrop: SystemBarBackdropView,
     private val postToUiThread: (() -> Unit) -> Unit,
 ) : SystemBarTarget {
+    private var lastStatus = Int.MIN_VALUE
+    private var lastNavigation = Int.MIN_VALUE
+
     override fun post(block: () -> Unit) = postToUiThread(block)
 
-    override var statusBarColor: Int
-        get() = window.statusBarColor
-        set(value) { window.statusBarColor = value }
-
-    override var navigationBarColor: Int
-        get() = window.navigationBarColor
-        set(value) { window.navigationBarColor = value }
-
-    override val contrastEnforcementSupported: Boolean =
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM
-
-    override var isStatusBarContrastEnforced: Boolean
-        get() = if (contrastEnforcementSupported) window.isStatusBarContrastEnforced else true
-        set(value) { if (contrastEnforcementSupported) window.isStatusBarContrastEnforced = value }
-
-    override var isNavigationBarContrastEnforced: Boolean
-        get() = if (contrastEnforcementSupported) window.isNavigationBarContrastEnforced else true
-        set(value) { if (contrastEnforcementSupported) window.isNavigationBarContrastEnforced = value }
+    @Suppress("DEPRECATION") // setters are legacy-only below API 29
+    override fun applyBarColors(statusColor: Int, navigationColor: Int): Boolean {
+        // The backdrop is opaque, so a system contrast scrim would only
+        // alter the exact color the user picked. Disable it where the
+        // platform exposes the switch. Navigation contrast exists since
+        // API 29; status contrast since API 35.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+        } else {
+            // enableEdgeToEdge installs a contrast scrim on API 26-28. Clear
+            // the legacy bar colors so the backdrop shows through instead.
+            window.statusBarColor = Color.TRANSPARENT
+            window.navigationBarColor = Color.TRANSPARENT
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            window.isStatusBarContrastEnforced = false
+        }
+        if (statusColor == lastStatus && navigationColor == lastNavigation) return false
+        lastStatus = statusColor
+        lastNavigation = navigationColor
+        backdrop.setBarColors(statusColor, navigationColor)
+        return true
+    }
 
     // Non-deprecated accessor (the WindowInsetsControllerCompat(window, view)
     // constructor is deprecated on recent androidx.core). Lazy: the first
-    // reader is captureOriginals(), which only runs after the decor view
-    // exists.
+    // reader runs after the decor view exists.
     private val insetsController by lazy {
         WindowCompat.getInsetsController(window, window.decorView)
     }
@@ -92,34 +86,35 @@ class WindowSystemBarTarget(
 }
 
 /**
- * Sole writer of an activity window's status and navigation bar colors.
+ * Sole writer of the activity's status and navigation bar appearance.
  *
- * Three features recolor the bars: the Vencord overlay (status+nav black while
- * active), fullscreen video (status black while a custom view shows; the nav
- * bar is hidden via insets, not recolored), and the Vendroid settings bar
- * color picker (a user tint for both bars). Each feature publishes its state
- * through its own publish method and reads none of the others'. Every publish
- * re-derives the bar state from the three published values ([reapply]), so
- * any interleaving converges. Bars are black iff at least one of
- * overlay/video wants them black; otherwise the custom tint applies when
- * set; otherwise the captured original applies.
+ * Three features recolor the bars: the Vencord overlay and in-page viewer
+ * (status+nav black while active), native fullscreen video (status black
+ * while a custom view shows; the nav bar is hidden via insets, not recolored),
+ * and the settings color picker (a user tint for both bars). Each feature
+ * publishes its state through its own method and reads none of the others'.
+ * Every publish re-derives the bar state from the three published values
+ * ([reapply]), so any interleaving converges. Bars are black iff at least one
+ * of overlay/video wants them black; otherwise the custom tint applies when
+ * set; otherwise the theme color applies.
  *
- * This replaces two independent per-feature "original color" caches that
- * clobbered each other (a video started under the overlay snapshotted the
- * overlay's black as "original" and restored it on exit; an overlay activated
- * during fullscreen was dropped entirely, leaving the wrong color latched).
+ * The colors are painted into [SystemBarBackdropView], not written to
+ * Window.statusBarColor/navigationBarColor. At targetSdk 36+, edge-to-edge is
+ * enforced and those setters are no-ops; the inset strips work on every
+ * supported version.
  *
  * Contract:
- *  - This class must be the only code writing this window's bar colors.
- *    Route any future bar-color change through a publish + reapply here.
- *  - Do not reintroduce per-feature color snapshots. Originals are captured
- *    exactly once, before the first write ([captureOriginals]).
+ *  - This class must be the only code changing this window's bars.
  *  - Publishers write their flag first and only then queue the reapply, so
  *    every queued reapply observes it. reapply reads each flag once; a
  *    concurrent publish queues a second reapply that converges.
  */
-class BarColorManager(private val target: SystemBarTarget) {
-    /** Overlay (Vencord title bar) active. Published from the JS bridge thread. */
+class BarColorManager(
+    private val target: SystemBarTarget,
+    private val themeStatusBarColor: Int,
+    private val themeNavigationBarColor: Int,
+) {
+    /** In-page image/JS-video viewer active. Published from the JS bridge thread. */
     @Volatile
     private var overlayActive = false
 
@@ -128,44 +123,28 @@ class BarColorManager(private val target: SystemBarTarget) {
     private var videoFullscreen = false
 
     /**
-     * User tint from the Vendroid settings picker; null = theme default.
-     * A third state source like the two flags above, never a snapshot:
-     * reapply() derives the bars from it on every publish.
+     * User tint from the settings picker; null = theme default. A state
+     * source like the flags above, never a snapshot: reapply() derives the
+     * bars from it on every publish.
      */
     @Volatile
     private var customColor: Int? = null
 
-    // Original (theme) bar state. Captured once before the first write (see
-    // the class contract), then valid for the window's lifetime.
-    private var captured = false
-    private var originalStatusBarColor = Color.BLACK
-    private var originalNavigationBarColor = Color.BLACK
-    private var originalStatusBarContrastEnforced = true
-    private var originalNavigationBarContrastEnforced = true
-    private var originalLightStatusIcons = false
-    private var originalLightNavIcons = false
-
-    /**
-     * Overlay state change. Safe from any thread.
-     */
+    /** In-page viewer state change. Safe from any thread. */
     fun publishOverlayActive(active: Boolean) {
         overlayActive = active
         target.post { reapply() }
     }
 
-    /**
-     * Fullscreen-video state change. Called from WebChromeClient callbacks,
-     * so always on the UI thread.
-     */
+    /** Fullscreen-video state change. Called from WebChromeClient callbacks,
+     *  so always on the UI thread. */
     fun publishVideoFullscreen(active: Boolean) {
         videoFullscreen = active
         target.post { reapply() }
     }
 
-    /**
-     * Custom bar tint from the picker, or null to reset to the theme colors.
-     * Safe from any thread.
-     */
+    /** Custom bar tint from the picker, or null to reset to the theme colors.
+     *  Safe from any thread. */
     fun publishCustomColor(color: Int?) {
         customColor = color
         target.post { reapply() }
@@ -178,69 +157,32 @@ class BarColorManager(private val target: SystemBarTarget) {
             val video = videoFullscreen
             val custom = customColor
 
-            if (!captured) captureOriginals()
-
             val statusBlack = overlay || video
             val navBlack = overlay
-            val status = if (statusBlack) Color.BLACK else (custom ?: originalStatusBarColor)
-            val nav = if (navBlack) Color.BLACK else (custom ?: originalNavigationBarColor)
+            val status = if (statusBlack) Color.BLACK else (custom ?: themeStatusBarColor)
+            val nav = if (navBlack) Color.BLACK else (custom ?: themeNavigationBarColor)
 
-            // Icon appearance is derived, never snapshotted per feature: black
-            // bars always take light icons (otherwise a light custom tint
-            // would survive into the overlay as invisible dark icons); a
-            // custom tint picks by luminance; the theme's captured values
-            // apply only while the theme colors show.
-            val statusLight = when {
-                statusBlack -> false
-                custom != null -> relativeLuminance(custom) > LUMINANCE_LIGHT_THRESHOLD
-                else -> originalLightStatusIcons
-            }
-            val navLight = when {
-                navBlack -> false
-                custom != null -> relativeLuminance(custom) > LUMINANCE_LIGHT_THRESHOLD
-                else -> originalLightNavIcons
-            }
+            // The icon appearance is derived from the color actually painted,
+            // never from a theme snapshot: dark bars always take light icons,
+            // regardless of whether the color came from the theme, the picker,
+            // or a feature override. A mid/light tint takes dark icons.
+            val statusLight = relativeLuminance(status) > LUMINANCE_LIGHT_THRESHOLD
+            val navLight = relativeLuminance(nav) > LUMINANCE_LIGHT_THRESHOLD
 
-            // Contrast enforcement would scrim the user's exact color, so it
-            // stays off for every manager-written color; only the theme pair
-            // keeps its captured value.
-            val statusContrast =
-                if (statusBlack || custom != null) false else originalStatusBarContrastEnforced
-            val navContrast =
-                if (navBlack || custom != null) false else originalNavigationBarContrastEnforced
-
-            var changed = false
-            if (target.statusBarColor != status) {
-                target.statusBarColor = status
-                changed = true
-            }
-            if (target.navigationBarColor != nav) {
-                target.navigationBarColor = nav
-                changed = true
-            }
-            if (target.contrastEnforcementSupported) {
-                if (target.isStatusBarContrastEnforced != statusContrast) {
-                    target.isStatusBarContrastEnforced = statusContrast
-                    changed = true
-                }
-                if (target.isNavigationBarContrastEnforced != navContrast) {
-                    target.isNavigationBarContrastEnforced = navContrast
-                    changed = true
-                }
-            }
+            val colorsChanged = target.applyBarColors(status, nav)
+            var iconsChanged = false
             if (target.isAppearanceLightStatusBars != statusLight) {
                 target.isAppearanceLightStatusBars = statusLight
-                changed = true
+                iconsChanged = true
             }
             if (target.isAppearanceLightNavigationBars != navLight) {
                 target.isAppearanceLightNavigationBars = navLight
-                changed = true
+                iconsChanged = true
             }
-            if (changed) {
+            if (colorsChanged || iconsChanged) {
                 VDELog.d(
                     TAG,
                     "applied status=${hex(status)} nav=${hex(nav)} " +
-                        "contrast=$statusContrast/$navContrast " +
                         "lightIcons=$statusLight/$navLight " +
                         "(overlay=$overlay video=$video custom=${custom != null})"
                 )
@@ -250,36 +192,6 @@ class BarColorManager(private val target: SystemBarTarget) {
             // attribute writes throw (detached decor view). Never propagate.
             VDELog.e(TAG, "reapply failed", t)
         }
-    }
-
-    private fun captureOriginals() {
-        // Read into locals first. If a read throws (dying window), `captured`
-        // stays false and the next reapply retries with fresh values.
-        val status = target.statusBarColor
-        val nav = target.navigationBarColor
-        val statusContrast =
-            if (target.contrastEnforcementSupported) target.isStatusBarContrastEnforced else true
-        val navContrast =
-            if (target.contrastEnforcementSupported) target.isNavigationBarContrastEnforced else true
-        val statusLight = target.isAppearanceLightStatusBars
-        val navLight = target.isAppearanceLightNavigationBars
-
-        originalStatusBarColor = status
-        originalNavigationBarColor = nav
-        originalStatusBarContrastEnforced = statusContrast
-        originalNavigationBarContrastEnforced = navContrast
-        originalLightStatusIcons = statusLight
-        originalLightNavIcons = navLight
-        captured = true
-        // Debug visibility for the theme's appearance values: if a theme
-        // ships dark icons on its dark bar, this line is how it gets caught
-        // in QA (the Material3 parents never set windowLightStatusBar
-        // explicitly, so the resolved default is worth watching).
-        VDELog.d(
-            TAG,
-            "captured original status=${hex(status)} nav=${hex(nav)} " +
-                "contrast=$statusContrast/$navContrast lightIcons=$statusLight/$navLight"
-        )
     }
 
     private fun hex(color: Int): String = "0x" + Integer.toHexString(color).uppercase()
@@ -301,7 +213,7 @@ class BarColorManager(private val target: SystemBarTarget) {
     companion object {
         private const val TAG = "BarColors"
 
-        /** Above this relative luminance a custom tint takes dark icons. */
+        /** Above this relative luminance a tint takes dark icons. */
         private const val LUMINANCE_LIGHT_THRESHOLD = 0.5
     }
 }

@@ -6,8 +6,9 @@ import android.app.Dialog
 import android.app.AlertDialog
 import android.content.Context
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -19,7 +20,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.TypedValue
 import java.io.File
 import android.view.View
 import android.view.ViewGroup
@@ -32,6 +32,8 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebChromeClient
 import android.widget.Toast
+import io.github.thunderfun.vendroid.utils.BarColorHex
+import io.github.thunderfun.vendroid.utils.BarColors
 import io.github.thunderfun.vendroid.utils.Constants
 import io.github.thunderfun.vendroid.utils.DiscordBranch
 import io.github.thunderfun.vendroid.utils.FirewallConfig
@@ -42,6 +44,7 @@ import io.github.thunderfun.vendroid.utils.getStringSafe
 import io.github.thunderfun.vendroid.utils.vdeGson
 import io.github.thunderfun.vendroid.ui.LoadingScreenManager
 import io.github.thunderfun.vendroid.ui.SplashPalette
+import io.github.thunderfun.vendroid.ui.SystemBarBackdropView
 import io.github.thunderfun.vendroid.webview.BarColorManager
 import io.github.thunderfun.vendroid.webview.HttpCacheTuner
 import io.github.thunderfun.vendroid.webview.HttpClient
@@ -131,11 +134,19 @@ class MainActivity : AppCompatActivity() {
      * colors themselves; see [BarColorManager]. Route any future bar-color
      * change through it. Direct window writes reintroduce the clobbering
      * bug this replaced. Per-window by design; it dies with this activity
-     * instance, so a theme change (activity recreation) re-captures the new
+     * instance, so a theme change (activity recreation) re-resolves the new
      * theme's colors rather than restoring a stale snapshot.
      */
     val barColors: BarColorManager by lazy {
-        BarColorManager(WindowSystemBarTarget(window) { runOnUiThread(it) })
+        val themeColor = BarColors.resolveThemeBarColor(this)
+        BarColorManager(
+            WindowSystemBarTarget(
+                window,
+                findViewById(R.id.system_bar_backdrop),
+            ) { runOnUiThread(it) },
+            themeStatusBarColor = themeColor,
+            themeNavigationBarColor = themeColor,
+        )
     }
 
     /**
@@ -160,45 +171,44 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Theme-resolved bar color: the picker's "default" and the reset target.
-     * Resolves the attribute (not the color resource) so values-night and any
-     * future re-point of the attr stay correct.
-     *
-     * The fallback reads @color/status_bar_color via ContextCompat, which
-     * resolves by device configuration rather than by theme. That matches
-     * the attribute today: every theme points the attr at this resource, and
-     * values and values-night agree. It is also the right "no tint" default
-     * if a future theme drops the attr.
+     * Delegates to [BarColors] so the main and recovery screens resolve the
+     * same value.
      */
-    // android.R.attr.statusBarColor is deprecated on API 36+ along with the
-    // setter, but reading it is still the only way to get the theme's value,
-    // and the app opts out of edge-to-edge enforcement.
-    @Suppress("DEPRECATION")
-    fun resolveThemeBarColor(): Int {
-        val tv = TypedValue()
-        if (theme.resolveAttribute(android.R.attr.statusBarColor, tv, true)) {
-            try {
-                val color = if (tv.type == TypedValue.TYPE_REFERENCE ||
-                    tv.type == TypedValue.TYPE_STRING
-                ) {
-                    if (tv.resourceId != 0) ContextCompat.getColor(this, tv.resourceId) else null
-                } else {
-                    tv.data
-                }
-                if (color != null) return color
-            } catch (t: Throwable) {
-                VDELog.w("Main", "theme bar color resolve failed; using fallback: $t")
-            }
+    fun resolveThemeBarColor(): Int = BarColors.resolveThemeBarColor(this)
+
+    /**
+     * Edge-to-edge layout: inset the content out of the system bars/cutout
+     * and paint the exposed strips through [SystemBarBackdropView]. Runs
+     * after setContentView, before the first bar-color publish.
+     */
+    private fun setupSystemBarInsets() {
+        val root = findViewById<View>(R.id.root)
+        val backdrop = findViewById<SystemBarBackdropView>(R.id.system_bar_backdrop)
+        val content = findViewById<View>(R.id.content_root)
+        // Paint the theme color before the first inset dispatch; the manager
+        // immediately overrides this when a custom tint is stored.
+        val themeColor = resolveThemeBarColor()
+        backdrop.setBarColors(themeColor, themeColor)
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or
+                    WindowInsetsCompat.Type.displayCutout()
+            )
+            backdrop.setSystemBarInsets(bars.left, bars.top, bars.right, bars.bottom)
+            content.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
         }
-        return ContextCompat.getColor(this, R.color.status_bar_color)
+        ViewCompat.requestApplyInsets(root)
     }
 
-    /** Startup path: read the persisted tint, publish it and tint the chrome. */
+    /** Startup path: read the persisted tint, publish it and tint the chrome.
+     *  Always publishes, including null, so the manager paints the theme
+     *  colors even when the user never picked a tint. */
     private fun applyCustomBarColor(sPrefs: SharedPreferences) {
         val stored = sPrefs.getStringSafe(SettingKeys.KEY_VENDROID_BAR_COLOR, "") {
             VDELog.e("Main", "vendroid_barColor type-poisoned; using default", it)
         }
-        val parsed = VencordNative.parseBarColorOrNull(stored)
-        if (parsed != null) applyBarChromeTint(parsed)
+        applyBarChromeTint(BarColorHex.parseOrNull(stored))
     }
 
     /** Startup path: read the persisted splash glow color (null = auto). */
@@ -206,7 +216,7 @@ class MainActivity : AppCompatActivity() {
         val stored = sPrefs.getStringSafe(SettingKeys.KEY_VENDROID_ORB_COLOR, "") {
             VDELog.e("Main", "vendroid_orbColor type-poisoned; using default", it)
         }
-        customOrbColor = VencordNative.parseBarColorOrNull(stored)
+        customOrbColor = BarColorHex.parseOrNull(stored)
     }
 
     /** Startup path: read the persisted splash background (null = auto). */
@@ -214,7 +224,7 @@ class MainActivity : AppCompatActivity() {
         val stored = sPrefs.getStringSafe(SettingKeys.KEY_VENDROID_SPLASH_BG_COLOR, "") {
             VDELog.e("Main", "vendroid_splashBgColor type-poisoned; using default", it)
         }
-        customSplashBgColor = VencordNative.parseBarColorOrNull(stored)
+        customSplashBgColor = BarColorHex.parseOrNull(stored)
         applySplashStageColor()
     }
 
@@ -252,6 +262,16 @@ class MainActivity : AppCompatActivity() {
         } catch (t: Throwable) {
             VDELog.e("Main", "applyBarChromeTint failed", t)
         }
+    }
+
+    /**
+     * Clears the in-page viewer's bar state when the document that owned it
+     * goes away. VencordNative also forgets its duplicate-publish edge so the
+     * next document can publish true again.
+     */
+    internal fun resetBarOverlayState() {
+        barColors.publishOverlayActive(false)
+        if (::vencordNative.isInitialized) vencordNative.resetOverlayActiveState()
     }
 
     @JvmField
@@ -450,13 +470,14 @@ class MainActivity : AppCompatActivity() {
         // WebView debugging exposes the page (cookies, token, JS context) to
         // any attached debugger. Gate it behind an explicit build flag.
         WebView.setWebContentsDebuggingEnabled(BuildConfig.ALLOW_WEBVIEW_DEBUGGING)
+        WindowCompat.enableEdgeToEdge(window)
         setContentView(R.layout.activity_main)
-        WindowCompat.setDecorFitsSystemWindows(window, true)
+        setupSystemBarInsets()
 
         // Publish the persisted picker tint before anything else draws: the
-        // manager snapshots the theme values on its first reapply, so this
-        // must run after setContentView (theme attrs applied to the window)
-        // and before any overlay/video publish could possibly arrive.
+        // manager derives the theme colors on its first reapply, so this must
+        // run after setContentView (theme attrs applied to the window) and
+        // before any overlay/video publish could possibly arrive.
         applyCustomBarColor(sPrefs)
         loadCustomOrbColor(sPrefs)
         loadSplashBgColor(sPrefs)

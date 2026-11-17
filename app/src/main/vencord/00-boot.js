@@ -180,19 +180,6 @@
             ]
         },
         {
-            name: "vde-sheets-fsm-string",
-            find: ',fullScreenOnMobile:"',
-            replacements: [
-                {
-                    name: "fsmString",
-                    match: /fullScreenOnMobile:"(?:[A-Za-z_$][\w$]*)"/, // /fullScreenOnMobile:"\i"/
-                    replace: 'fullScreenOnMobile:""'
-                    // No marker: idempotent because the neutralized
-                    // fullScreenOnMobile:"" no longer matches.
-                }
-            ]
-        },
-        {
             name: "vde-sheets-fsm-class",
             find: "fullscreenOnMobile__",
             replacements: [
@@ -226,20 +213,6 @@
                     match: /([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*&&([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*&&!([A-Za-z_$][\w$]*),/,
                     replace: '$1=!1,$3=!0/*vde-gif-nav*/,',
                     marker: "vde-gif-nav"
-                }
-            ]
-        },
-        {
-            // Slate is gated by the minified `Ct()` Android check. Bypass
-            // only the composer's decision; other checks keep the real result.
-            name: "vde-slate-composer",
-            find: "useSetting()&&!(0,",
-            replacements: [
-                {
-                    name: "slateComposer",
-                    match: /!\(0,[A-Za-z_$][\w$]*\.Ct\)\(\)&&null!=window\.ResizeObserver/,
-                    replace: '!0/*vde-slate-composer*/&&null!=window.ResizeObserver',
-                    marker: "vde-slate-composer"
                 }
             ]
         },

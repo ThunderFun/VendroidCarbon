@@ -20,6 +20,8 @@ import io.github.thunderfun.vendroid.BuildConfig
 import io.github.thunderfun.vendroid.MainActivity
 import io.github.thunderfun.vendroid.R
 import io.github.thunderfun.vendroid.RecoveryActivity
+import io.github.thunderfun.vendroid.utils.BarColorHex
+import io.github.thunderfun.vendroid.utils.BarColors
 import io.github.thunderfun.vendroid.utils.Constants
 import io.github.thunderfun.vendroid.utils.DiscordBranch
 import io.github.thunderfun.vendroid.utils.FirewallConfig
@@ -85,21 +87,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         }
 
         /**
-         * Strict "#RRGGBB" parser for the bar-color picker bridge. Pure (no
-         * android.graphics) so the contract test runs on plain JVM; returns
-         * opaque ARGB or null when malformed. "" is the reserved reset value
-         * and is handled by the callers, not parsed here.
+         * Strict "#RRGGBB" parser for the bar-color picker bridge. Delegates
+         * to [BarColorHex] so startup reads and bridge writes accept exactly
+         * the same input. "" is the reserved reset value and is handled by the
+         * callers, not parsed here.
          */
-        internal fun parseBarColorOrNull(value: String): Int? {
-            if (value.length != 7 || value[0] != '#') return null
-            var rgb = 0
-            for (i in 1..6) {
-                val digit = Character.digit(value[i], 16)
-                if (digit < 0) return null
-                rgb = (rgb shl 4) or digit
-            }
-            return 0xFF000000.toInt() or rgb
-        }
+        internal fun parseBarColorOrNull(value: String): Int? =
+            BarColorHex.parseOrNull(value)
 
         // Capability token, injected only into the top-level Discord document
         // (see bridgeBootstrapJs). addJavascriptInterface exposes the bridge to
@@ -671,6 +665,12 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         lastOverlayActive.set(active)
     }
 
+    /** Forgets the last overlay edge when a navigation destroys the document
+     *  that published it, so the next document can publish `true` again. */
+    internal fun resetOverlayActiveState() {
+        lastOverlayActive.set(null)
+    }
+
     @JavascriptInterface
     fun goBack(token: String?) {
         if (!isBridgeAuthorized(token)) return
@@ -1111,15 +1111,11 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun getDefaultBarColor(token: String?): String {
         // No domain gate, like getAppIcons: the payload is this app's own
         // theme color, which leaks nothing.
-        // No Context on these paths to resolve the resource; the constant
-        // mirrors @color/status_bar_color.
+        // The constant is the no-Context fallback; it mirrors
+        // @color/status_bar_color.
         if (!isBridgeAuthorized(token)) return Constants.DEFAULT_BAR_COLOR_HEX
         val act = activity.get() ?: return Constants.DEFAULT_BAR_COLOR_HEX
-        // Theme-resolved (values-night + future attr re-pointing correct);
-        // "#%06x" masks alpha and normalizes to lowercase.
-        return String.format(
-            java.util.Locale.US, "#%06x", act.resolveThemeBarColor() and 0xFFFFFF
-        )
+        return BarColors.resolveThemeBarColorHex(act)
     }
 
     // --- Splash glow color picker (Vendroid settings "Appearance" section) ---

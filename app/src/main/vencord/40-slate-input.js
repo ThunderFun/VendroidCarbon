@@ -68,20 +68,8 @@
     }
 
     function vendroidFindSlateComposer() {
-        // The source patch removes the Ct call, so check its marker first.
-        var mid = null;
-        try {
-            if (Vencord.Webpack && typeof Vencord.Webpack.findModuleId === "function") {
-                mid = Vencord.Webpack.findModuleId("vde-slate-composer");
-                if (mid != null && Vencord.Webpack.wreq) {
-                    var patched = Vencord.Webpack.wreq(mid);
-                    if (patched) return { module: patched, id: mid, patched: true };
-                }
-            }
-        } catch(e) {}
-
         var pattern = VENDROID_SLATE_COMPOSER_PATTERN;
-        mid = null;
+        var mid = null;
         try {
             if (Vencord.Webpack && typeof Vencord.Webpack.findModuleId === "function") {
                 mid = Vencord.Webpack.findModuleId(pattern);
@@ -90,12 +78,12 @@
         if (mid != null && Vencord.Webpack && typeof Vencord.Webpack.wreq === "function") {
             try {
                 var mod = Vencord.Webpack.wreq(mid);
-                if (mod) return { module: mod, id: mid, patched: false };
+                if (mod) return { module: mod, id: mid };
             } catch(e) {}
         }
         try {
             var fallback = findModuleByCode([pattern]);
-            if (fallback) return { module: fallback, id: null, patched: false };
+            if (fallback) return { module: fallback, id: null };
         } catch(e) {}
         return null;
     }
@@ -103,12 +91,6 @@
     function vendroidInstallSlateComposerOverride() {
         var found = vendroidFindSlateComposer();
         if (!found) return false;
-        if (found.patched) {
-            _vendroidSlateOverrideDone = true;
-            console.warn("[Vendroid] Slate override: composer source patch active (module " +
-                (found.id != null ? found.id : "?") + ")");
-            return true;
-        }
         var composer = found.module && found.module.Ay;
         if (!composer || typeof composer.type !== "function") return false;
         if (composer.type.__vendroidSlateWrapper) {

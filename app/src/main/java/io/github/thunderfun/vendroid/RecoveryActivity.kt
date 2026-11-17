@@ -14,8 +14,11 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.graphics.ColorUtils
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.card.MaterialCardView
+import io.github.thunderfun.vendroid.utils.BarColors
 import io.github.thunderfun.vendroid.utils.SettingKeys
 import io.github.thunderfun.vendroid.utils.ShareHelper
 import io.github.thunderfun.vendroid.utils.VDELog
@@ -41,6 +44,15 @@ class RecoveryActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Keep the status/nav icons legible on the recovery screen's dark
+        // window background.
+        WindowCompat.enableEdgeToEdge(window)
+        val darkIcons = ColorUtils.calculateLuminance(BarColors.resolveThemeBarColor(this)) > 0.5
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = darkIcons
+            isAppearanceLightNavigationBars = darkIcons
+        }
 
         // Trampoline: restart immediately, no UI.
         if (intent?.getBooleanExtra(EXTRA_RELAUNCH_MAIN, false) == true) {

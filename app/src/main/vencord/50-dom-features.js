@@ -368,9 +368,9 @@
     // top-anchored card, with the native results dock behind it.
     //
     // openNativeSearch locates the launcher by source signature and parses
-    // its createPromise loader for the chunk set and widget module id. A
-    // pinned snapshot is used only when discovery fails. The widget does not
-    // read PlatformUtils.Fr.
+    // its createPromise loader for the chunk set and widget module id. Both
+    // are validated after the chunks load; no build-specific ids are pinned.
+    // A miss logs one actionable line and stops instead of retrying dead ids.
     //
     // Do not reassign webpack exports: they are non-configurable. Factory
     // source patches are the reliable hook. A dedicated ReactDOM root also
@@ -381,11 +381,45 @@
     var _vendroidDiscovered = null;
     var _VENDROID_DISCOVERY_TTL = 10 * 60 * 1000;
 
+    // Debug trace for the open path. Enable with
+    // localStorage.setItem("vde-search-debug", "1") and reload, or set
+    // window.__VENDROID_SEARCH_DEBUG = true before clicking search.
+    // Off by default; only failures and recovery paths use console.warn/error.
+    function _vendroidSearchDebugEnabled() {
+        try {
+            if (window.__VENDROID_SEARCH_DEBUG === true) return true;
+        } catch(e) {}
+        try {
+            return !!(window.localStorage &&
+                window.localStorage.getItem("vde-search-debug") === "1");
+        } catch(e) {}
+        return false;
+    }
+
+    function _vendroidSearchTrace(message) {
+        if (!_vendroidSearchDebugEnabled()) return;
+        try {
+            var args = Array.prototype.slice.call(arguments);
+            args[0] = "[Vendroid] Search-trace " + message;
+            console.warn.apply(console, args);
+        } catch(e) {}
+    }
+
     // Source signatures for the HeaderBar launcher. Any match is accepted.
+    // Minified variable lengths are not bounded: a rebuild may pick two- or
+    // four-character names, and the anchor is about the object shape, not the
+    // identifier length.
     var _VENDROID_SEARCH_ANCHORS = [
-        /toolbar:[A-Za-z_$]{1,3},mobileToolbar:[A-Za-z_$]{1,3},"aria-label":/,
+        /toolbar:[A-Za-z_$][A-Za-z0-9_$]*,mobileToolbar:[A-Za-z_$][A-Za-z0-9_$]*,"aria-label":/,
         /name:"Search",renderLoader:/,
         /webpackId:\d{4,7},name:"Search"/
+    ];
+
+    // Stable method strings inside the Search factory. Used only when the id
+    // parsed from the launcher loader no longer points at the widget.
+    var _VENDROID_SEARCH_CODE_SIGNS = [
+        "initializeAutocomplete(",
+        "setSelectedSearchContext("
     ];
 
     // Parse {chunks, mid} out of a factory source string. Null when the
@@ -453,9 +487,96 @@
         }
     }
 
+    // True when a module's factory carries a stable Search signature.
+    function _vendroidSearchFactoryLooksRight(src) {
+        if (!src) return false;
+        for (var i = 0; i < _VENDROID_SEARCH_CODE_SIGNS.length; i++) {
+            if (src.indexOf(_VENDROID_SEARCH_CODE_SIGNS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    // The widget namespace must expose a default component. Everything else
+    // (the launcher loader, the chunk set) is evidence, not proof.
+    function _vendroidSearchModuleValid(mod) {
+        try {
+            return !!(mod && typeof mod.default === "function");
+        } catch(e) {
+            return false;
+        }
+    }
+
+    // Resolve the Search widget by id, then by factory source signature.
+    // wreq.c (already executed modules) is checked first, then the whole
+    // wreq.m registry, so a rebuilt id is recovered without pinning it.
+    // Returns { id, module, source } or null.
+    function _vendroidResolveSearchModule(wr, preferredMid) {
+        var tried = {};
+
+        function attempt(id, source) {
+            if (id == null || tried[String(id)]) return null;
+            tried[String(id)] = 1;
+            try {
+                var mod = wr(id);
+                if (_vendroidSearchModuleValid(mod)) {
+                    _vendroidSearchTrace("module validated id=" + id +
+                        " source=" + source + " default=function");
+                    return { id: id, module: mod, source: source };
+                }
+                _vendroidSearchTrace("module rejected id=" + id + " source=" +
+                    source + " default=" + (mod ? typeof mod.default : "undefined"));
+            } catch(e) {
+                _vendroidSearchTrace("module " + id + " source=" + source +
+                    " threw: " + e.message);
+            }
+            return null;
+        }
+
+        var hit = attempt(preferredMid, "loader");
+        if (hit) return hit;
+
+        // Cached modules: the factory is still in wreq.m even though the
+        // export object lives in wreq.c.
+        try {
+            var cache = (wr && wr.c) || {};
+            var cacheIds = Object.keys(cache);
+            for (var ci = 0; ci < cacheIds.length; ci++) {
+                var cacheId = cacheIds[ci];
+                var cacheFactory = wr.m && wr.m[cacheId];
+                if (typeof cacheFactory !== "function") continue;
+                var cacheSrc = null;
+                try { cacheSrc = cacheFactory.toString(); } catch(eCacheSrc) { continue; }
+                if (!_vendroidSearchFactoryLooksRight(cacheSrc)) continue;
+                hit = attempt(cacheId, "cache-signature");
+                if (hit) return hit;
+            }
+        } catch(eCache) {}
+
+        // Registered but not executed factories, including the lazy widgets
+        // just loaded by the chunk set.
+        try {
+            var factories = (wr && wr.m) || {};
+            var ids = Object.keys(factories);
+            for (var fi = 0; fi < ids.length; fi++) {
+                var id = ids[fi];
+                var factory = factories[id];
+                if (typeof factory !== "function") continue;
+                var src = null;
+                try { src = factory.toString(); } catch(eSrc) { continue; }
+                if (!_vendroidSearchFactoryLooksRight(src)) continue;
+                hit = attempt(id, "factory-signature");
+                if (hit) return hit;
+            }
+        } catch(eFactories) {}
+
+        return null;
+    }
+
     // Chunk ids + widget module id for THIS build, or null when discovery
-    // fails (caller falls back to the pinned snapshot). Never throws.
+    // fails. Never falls back to a pinned snapshot. Never throws.
     function discoverSearchTargets(W) {
+        var headerId = null;
+        var extracted = null;
         try {
             if (_vendroidDiscovered &&
                 (Date.now() - _vendroidDiscovered.ts) < _VENDROID_DISCOVERY_TTL) {
@@ -487,29 +608,245 @@
                     } catch(eScan) {}
                 }
             }
-            if (hid == null) throw new Error("stage=locate: launcher module not found");
+            if (hid == null) throw new Error("launcher module not found");
+            headerId = String(hid);
 
             // Then parse the lazy-search registration out of its source.
             var facFn = W.wreq.m[hid];
-            if (typeof facFn !== "function") throw new Error("stage=extract: factory gone");
+            if (typeof facFn !== "function") throw new Error("launcher factory is not callable");
             var targets = _vendroidExtractSearchTargets(String(facFn));
-            if (!targets) throw new Error("stage=extract/sanity: no usable createPromise/bind target");
+            if (!targets) throw new Error("createPromise/bind target missing or out of range");
+            extracted = targets;
 
             _vendroidDiscovered = {
                 chunks: targets.chunks,
                 mid: targets.mid,
+                headerId: headerId,
                 ts: Date.now()
             };
-            console.warn("[Vendroid] Search: discovered chunks=" + targets.chunks.length +
-                " mid=" + targets.mid + " (header id=" + hid + ")");
+            _vendroidSearchTrace("discovered chunks=" + targets.chunks.length +
+                " mid=" + targets.mid + " header=" + headerId);
             return _vendroidDiscovered;
         } catch(eDisc) {
             // No negative caching: the next click retries, so boot races and
-            // rebuild churn recover without polling.
-            console.error("[Vendroid] Search: discovery failed (" + eDisc.message +
-                "); falling back to pinned snapshot");
+            // rebuild churn recover without polling. Do not try pinned ids;
+            // they belong to old builds and obscure the real failure.
+            console.error("[Vendroid] Search: discovery failed (header=" +
+                (headerId == null ? "not found" : headerId) + ", extract=" +
+                (extracted ? ("chunks=" + extracted.chunks.length + " mid=" +
+                    extracted.mid) : "none") + "): " + eDisc.message +
+                ". No pinned-id fallback.");
             return null;
         }
+    }
+
+    // Modal API is only needed when the own-root mount cannot be used. In
+    // the current build the openModal* exports live in a lazy module, so
+    // findByProps can miss even though Vencord.Common.ModalAPI is available.
+    function _vendroidSearchModalApi(W) {
+        try {
+            var common = W.Common && W.Common.ModalAPI;
+            if (common && typeof common.openModalLazy === "function") return common;
+        } catch(eCommon) {}
+        try {
+            var silent = vendroidFindByProps("openModalLazy", "openModal", "closeModal");
+            if (silent && typeof silent.openModalLazy === "function") return silent;
+        } catch(eSilent) {}
+        return null;
+    }
+
+    // ReactDOM client resolution. hydrateRoot was tree-shaken out of the
+    // current React 19 web build, so the primary lookup keys on createRoot
+    // only. The two pinned ids are fallbacks and are type-checked.
+    function _vendroidReactDomClient(mod) {
+        try {
+            if (mod && typeof mod.createRoot === "function") return mod;
+            if (mod && mod.default && typeof mod.default.createRoot === "function") {
+                return mod.default;
+            }
+        } catch(e) {}
+        return null;
+    }
+
+    function _vendroidResolveReactDom(W, wr) {
+        try {
+            var byProps = typeof W.findByProps === "function" ?
+                W.findByProps("createRoot") : null;
+            var fromProps = _vendroidReactDomClient(byProps);
+            if (fromProps) return { api: fromProps, source: "findByProps" };
+        } catch(eProps) {}
+
+        var ids = [490349, 379800];
+        for (var i = 0; i < ids.length; i++) {
+            var id = ids[i];
+            try {
+                var candidate = _vendroidReactDomClient(wr(id));
+                if (candidate) return { api: candidate, source: "module " + id };
+                _vendroidSearchTrace("ReactDOM module " + id + " rejected (no createRoot)");
+            } catch(e) {
+                _vendroidSearchTrace("ReactDOM module " + id + " threw: " + e.message);
+            }
+        }
+        return null;
+    }
+
+    // Error boundary for errors thrown in Search's child hooks/effects. The
+    // createElement try/catch below only covers element construction.
+    var _vendroidSearchBoundaryFor = null;
+    var _vendroidSearchBoundaryComp = null;
+    function _vendroidSearchBoundary(R) {
+        if (!R || typeof R.Component !== "function") return null;
+        if (_vendroidSearchBoundaryFor === R && _vendroidSearchBoundaryComp) {
+            return _vendroidSearchBoundaryComp;
+        }
+        try {
+            _vendroidSearchBoundaryComp = class extends R.Component {
+                constructor(props) {
+                    super(props);
+                    this.state = { failed: false };
+                }
+                static getDerivedStateFromError() {
+                    return { failed: true };
+                }
+                componentDidCatch(error, info) {
+                    console.error("[Vendroid] Search: component error" +
+                        (info && info.componentStack ? "\nSTACK: " + info.componentStack : "") +
+                        (error && error.stack ? "\nERROR: " + error.stack : ""));
+                }
+                render() {
+                    if (this.state && this.state.failed) return null;
+                    return this.props && this.props.children != null ?
+                        this.props.children : null;
+                }
+            };
+            _vendroidSearchBoundaryFor = R;
+            return _vendroidSearchBoundaryComp;
+        } catch(e) {
+            _vendroidSearchTrace("error boundary unavailable: " + e.message);
+            return null;
+        }
+    }
+
+    function _vendroidHasMethods(obj, methods) {
+        if (!obj) return false;
+        for (var i = 0; i < methods.length; i++) {
+            try {
+                if (typeof obj[methods[i]] !== "function") return false;
+            } catch(e) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Find a store by method shape. Property names are stable; minified
+    // export letters are not. findByProps only sees executed modules, so the
+    // silent cache scan and a source-signature lookup cover lazy stores.
+    function _vendroidSearchStore(W, methods, signatures) {
+        var store = null;
+        // Silent cache scan first: a miss in Vencord's findByProps logs an
+        // error stack, and a lazy store can miss there anyway.
+        try {
+            store = vendroidFindByProps.apply(null, methods);
+            if (_vendroidHasMethods(store, methods)) return store;
+        } catch(eCache) {}
+
+        try {
+            store = W.findByProps.apply(null, methods);
+            if (_vendroidHasMethods(store, methods)) return store;
+        } catch(eProps) {}
+
+        if (signatures && signatures.length) {
+            try {
+                var ns = findModuleByCode(signatures);
+                store = vendroidFindExport(ns, function(v) {
+                    return _vendroidHasMethods(v, methods);
+                });
+                if (_vendroidHasMethods(store, methods)) return store;
+            } catch(eCode) {}
+        }
+        return null;
+    }
+
+    // Route/context inputs for Search. Channel id first, then guild id from
+    // the channel record. A DM has no guild id and is valid.
+    function _vendroidSearchResolveContext(W) {
+        var out = {
+            channelId: null, guildId: null, channelType: null,
+            channel: null, selectedSource: "none", route: ""
+        };
+        try { out.route = (window.location && window.location.pathname) || ""; } catch(e) {}
+
+        // The route is the authoritative channel. /channels/@me/<id> is a DM
+        // or group DM; /channels/<guild>/<id> is a guild channel or thread.
+        var routeMatch = /^\/channels\/([^\/?#]+)\/([^\/?#]+)/.exec(out.route);
+        if (routeMatch) {
+            out.channelId = routeMatch[2];
+            out.selectedSource = "route";
+        }
+
+        // Fallback for a transient route state: the selected-channel store.
+        if (out.channelId == null) {
+            var selected = _vendroidSearchStore(W,
+                ["getCurrentlySelectedChannelId", "getChannelId", "getVoiceChannelId"],
+                [/getCurrentlySelectedChannelId\([^)]*\)\{/]);
+            if (selected) {
+                try {
+                    if (typeof selected.getCurrentlySelectedChannelId === "function") {
+                        out.channelId = selected.getCurrentlySelectedChannelId();
+                        out.selectedSource = "getCurrentlySelectedChannelId";
+                    }
+                } catch(eSel) {}
+                if ((out.channelId == null || out.channelId === undefined) &&
+                    typeof selected.getChannelId === "function") {
+                    try {
+                        out.channelId = selected.getChannelId();
+                        out.selectedSource = "getChannelId";
+                    } catch(eFallback) {}
+                }
+            }
+        }
+
+        var channels = _vendroidSearchStore(W, ["getChannel", "hasChannel"], null);
+        if (channels && out.channelId != null) {
+            try { out.channel = channels.getChannel(out.channelId) || null; } catch(eCh) {}
+        }
+        var ch = out.channel;
+        if (ch) {
+            try { out.channelType = ch.type == null ? null : ch.type; } catch(eType) {}
+            try {
+                if (typeof ch.getGuildId === "function") out.guildId = ch.getGuildId();
+            } catch(eGuildMethod) {}
+            if (out.guildId == null && ch.guild_id != null) out.guildId = ch.guild_id;
+            if (out.guildId === undefined) out.guildId = null;
+        }
+        return out;
+    }
+
+    // The search input can render while the mobile sidebar shows no results.
+    // After a query is submitted, log the sidebar section, selected context id,
+    // and result-node count.
+    function _vendroidSearchResultsProbe(label) {
+        if (!_vendroidSearchDebugEnabled()) return;
+        var section = null;
+        var ctxId = null;
+        try {
+            var sidebar = vendroidFindByProps("getSection", "getCurrentSearchContextId");
+            if (sidebar) {
+                if (typeof sidebar.getSection === "function") section = sidebar.getSection();
+                if (typeof sidebar.getCurrentSearchContextId === "function") {
+                    ctxId = sidebar.getCurrentSearchContextId();
+                }
+            }
+        } catch(e) {}
+        var resultNodes = 0;
+        try {
+            resultNodes = document.querySelectorAll(
+                '[class*="searchResults"],[class*="searchResult"],' +
+                '[data-list-id*="search"]').length;
+        } catch(e) {}
+        _vendroidSearchTrace(label + " section=" + section + " contextId=" + ctxId +
+            " resultNodes=" + resultNodes);
     }
 
     var _vendroidSearchPatched = false;
@@ -552,11 +889,10 @@
                     console.error("[Vendroid] Search-diag rejection :: " + m +
                         (r && r.stack ? "\nSTACK: " + r.stack : ""));
                 });
-                console.warn("[Vendroid] Search-diag listeners installed");
+                _vendroidSearchTrace("diag listeners installed");
             }
 
             _vendroidSearchPatched = true;
-            console.warn("[Vendroid] Native search setup complete (entry-point poller installed)");
             setInterval(injectSearchButtonIfMissing, 750);
             ensureSearchButtonStyle();
             injectSearchButtonIfMissing();
@@ -722,169 +1058,190 @@
         _vendroidSearchOpening = true;
         try {
             var W = Vencord.Webpack;
-            var wr = W.wreq;
+            var wr = W && W.wreq;
+            _vendroidSearchTrace("open build=" + (window.GLOBAL_ENV &&
+                window.GLOBAL_ENV.BUILD_NUMBER || "?") + " wr.e=" +
+                (wr ? typeof wr.e : "no-wreq"));
             if (!wr || typeof wr.e !== "function") {
                 console.error("[Vendroid] Search: webpack require without chunk loader");
                 _vendroidSearchOpening = false;
                 return;
             }
-            var ModalApi = null;
-            try { ModalApi = W.findByProps("openModalLazy", "openModal", "closeModal"); } catch(e) {}
-            if (!ModalApi || typeof ModalApi.openModalLazy !== "function") {
-                console.error("[Vendroid] Search: modal API not found");
+            // Optional: the own-root path below does not use it. Only the
+            // fallback needs openModalLazy.
+            var ModalApi = _vendroidSearchModalApi(W);
+            if (!ModalApi) {
+                _vendroidSearchTrace("modal API unavailable; own root only");
+            }
+
+            var discovered = discoverSearchTargets(W);
+            if (!discovered) {
+                // discoverSearchTargets logged the actionable line. Do not
+                // retry stale ids and do not open an empty overlay.
                 _vendroidSearchOpening = false;
                 return;
             }
+            var targetChunks = discovered.chunks.slice();
+            var targetMid = discovered.mid;
+            var chunkCount = targetChunks.length;
+            var loadedChunks = [];
+            _vendroidSearchTrace("targets header=" + discovered.headerId +
+                " chunks=" + chunkCount + " mid=" + targetMid);
 
-            var targetChunks = VENDROID_SEARCH_CHUNKS.slice();
-            var targetMid = VENDROID_SEARCH_MODULE_ID;
-            var discovered = discoverSearchTargets(W);
-            if (discovered && discovered.chunks && discovered.chunks.length >= 2 &&
-                typeof discovered.mid === "number") {
-                targetChunks = discovered.chunks;
-                targetMid = discovered.mid;
-            } else {
-                console.warn("[Vendroid] Search: fallback to pinned ids (chunks=" +
-                    VENDROID_SEARCH_CHUNKS.length + " mid=" + VENDROID_SEARCH_MODULE_ID + ")");
-            }
-
-            Promise.all(targetChunks.map(function(c) { return wr.e(c); }))
-                .then(function() {
-                    // Probe pass: touching each module in Search.default's
-                    // import header runs its factory now, inside try/catch
-                    // with its id attached, instead of anonymously mid-commit
-                    // when React first renders it.
-                    var probeFails = [];
-                    for (var pi = 0; pi < VENDROID_SEARCH_DEP_PROBES.length; pi++) {
-                        var pid = VENDROID_SEARCH_DEP_PROBES[pi];
-                        var pmod = null;
-                        var perr = null;
-                        try { pmod = wr(pid); } catch(pe) { perr = pe; }
-                        if (perr || !pmod) {
-                            probeFails.push(pid + (perr ? " (" + perr.message + ")" : " (empty)"));
-                            console.error("[Vendroid] Search: dep probe FAILED id=" + pid +
-                                (perr ? " :: " + perr.message : ""));
-                        }
+            Promise.all(targetChunks.map(function(c) {
+                var pending;
+                try {
+                    pending = wr.e(c);
+                } catch(eChunkSync) {
+                    console.error("[Vendroid] Search: chunk " + c + " could not be " +
+                        "requested (" + eChunkSync.message + "); target mid=" +
+                        targetMid + " chunks=" + targetChunks.join(",") + ". No pinned-id retry.");
+                    throw eChunkSync;
+                }
+                return Promise.resolve(pending).then(function(m) {
+                    loadedChunks.push(c);
+                    _vendroidSearchTrace("chunk " + c + " resolved (" +
+                        loadedChunks.length + "/" + chunkCount + ")");
+                    return m;
+                }, function(errChunk) {
+                    console.error("[Vendroid] Search: chunk " + c + " failed (" +
+                        (errChunk && errChunk.message ? errChunk.message :
+                            String(errChunk)) + "); target mid=" + targetMid +
+                        " chunks=" + targetChunks.join(",") + ". No pinned-id retry.");
+                    _vendroidSearchTrace("chunk " + c + " rejected");
+                    throw errChunk;
+                });
+            })).then(function() {
+                try {
+                    // Validate the id parsed from the loader. If the widget
+                    // moved, recover it by factory source instead of using
+                    // a build-specific number.
+                    var resolved = _vendroidResolveSearchModule(wr, targetMid);
+                    if (!resolved) {
+                        throw new Error("Search module missing/unexpected (loader id " +
+                            targetMid + "; no module with a default component and " +
+                            _VENDROID_SEARCH_CODE_SIGNS.join("/") + " was found)");
                     }
-                    if (probeFails.length === 0) {
-                        console.warn("[Vendroid] Search: all " +
-                            VENDROID_SEARCH_DEP_PROBES.length + " dependency probes OK");
-                    } else if (VENDROID_SEARCH_PROBES_FATAL) {
-                        console.error("[Vendroid] Search: " + probeFails.length +
-                            " dependency probes failed; aborting modal open" +
-                            " (VENDROID_SEARCH_PROBES_FATAL=true)");
-                        _vendroidSearchOpening = false;
+                    var mod = resolved.module;
+                    if (String(resolved.id) !== String(targetMid)) {
+                        console.warn("[Vendroid] Search: widget id changed " +
+                            targetMid + " -> " + resolved.id + " (source=" +
+                            resolved.source + ")");
+                    }
+                    targetMid = resolved.id;
+                    _vendroidSearchTrace("module id=" + targetMid + " source=" +
+                        resolved.source + " default=function chunks=" + chunkCount);
+
+                    var R = (W.Common && W.Common.React) ||
+                            W.findByProps("createElement", "Fragment");
+                    if (!R || typeof R.createElement !== "function") {
+                        throw new Error("React.createElement unavailable");
+                    }
+                    _vendroidSearchTrace("React resolved (source=" +
+                        ((W.Common && W.Common.React) ? "Common" : "findByProps") +
+                        ", version=" + (R.version || "?") + ")");
+
+                    // Resolve the route's channel, not the selected-guild
+                    // map: getCurrentlySelectedChannelId first, getChannelId
+                    // only as the fallback. DMs have no guild id.
+                    var ctx = _vendroidSearchResolveContext(W);
+                    var channelId = ctx.channelId;
+                    var guildId = ctx.guildId;
+                    _vendroidSearchTrace("context channelId=" + channelId +
+                        " guildId=" + guildId + " type=" + ctx.channelType +
+                        " selectedSource=" + ctx.selectedSource + " route=" +
+                        ctx.route + " channel=" + (ctx.channel ? "found" : "missing"));
+                    if (channelId == null || !ctx.channel) {
+                        console.error("[Vendroid] Search: no channel context" +
+                            " (route=" + ctx.route + ", channelId=" + channelId +
+                            ", guildId=" + guildId + ", channel=" +
+                            (ctx.channel ? "found" : "missing") +
+                            "); not opening an empty overlay");
                         return;
-                    } else {
-                        // Probes are forensics, not a gate: every failure was
-                        // logged with its id above, and the commit path below
-                        // runs guarded regardless.
-                        console.error("[Vendroid] Search: " + probeFails.length +
-                            " dependency probes failed; continuing (non-fatal)");
                     }
 
-                    try {
-                        var mod = wr(targetMid);
-                        if (!mod || typeof mod.default !== "function") {
-                            throw new Error("Search module missing/unexpected (id " +
-                                targetMid + ")");
-                        }
-
-                        var R = (W.Common && W.Common.React) ||
-                                W.findByProps("createElement", "Fragment");
-                        if (!R || typeof R.createElement !== "function") {
-                            throw new Error("React.createElement unavailable");
-                        }
-                        console.warn("[Vendroid] Search: React resolved (source=" +
-                            ((W.Common && W.Common.React) ? "Common" : "findByProps") +
-                            ", version=" + (R.version || "?") + ")");
-
-                        // Same props the desktop toolbar passes; guildId comes
-                        // from the channel record (DMs have none -> undefined).
-                        var channelId, guildId;
+                    var SearchComp = mod.default;
+                    var VdeSearchBoundary = _vendroidSearchBoundary(R);
+                    var vdeRenderCount = 0;
+                    function VdeSafeSearch(props) {
+                        vdeRenderCount++;
                         try {
-                            var ChanStore = W.findByProps("getChannel", "hasChannel");
-                            var SelCh = W.findByProps("getChannelId", "getVoiceChannelId");
-                            channelId = SelCh && SelCh.getChannelId && SelCh.getChannelId();
-                            var ch = ChanStore && channelId && ChanStore.getChannel(channelId);
-                            if (ch && ch.guild_id) guildId = ch.guild_id;
-                        } catch(e2) {}
-
-                        var SearchComp = mod.default;
-                        var vdeRenderCount = 0;
-                        function VdeSafeSearch(props) {
-                            vdeRenderCount++;
-                            try {
-                                return R.createElement(SearchComp,
-                                    Object.assign({}, props, { guildId: guildId, channelId: channelId }));
-                            } catch(errR) {
-                                console.error("[Vendroid] Search: wrapper render threw @call#" +
-                                    vdeRenderCount + "\nSTACK: " +
-                                    (errR && errR.stack ? errR.stack : String(errR)));
-                                return null;
+                            var child = R.createElement(SearchComp,
+                                Object.assign({}, props, {
+                                    guildId: guildId == null ? undefined : guildId,
+                                    channelId: channelId
+                                }));
+                            if (VdeSearchBoundary) {
+                                return R.createElement(VdeSearchBoundary, null, child);
                             }
+                            return child;
+                        } catch(errR) {
+                            console.error("[Vendroid] Search: wrapper render threw @call#" +
+                                vdeRenderCount + "\nSTACK: " +
+                                (errR && errR.stack ? errR.stack : String(errR)));
+                            return null;
                         }
+                    }
 
-                        // Mount path A: our own ReactDOM root inside the
-                        // overlay card, bypassing the modal layer
-                        // entirely. Client resolution order:
-                        // 1. findByProps("createRoot","hydrateRoot"), keyed
-                        //    on prop identity so id rotation cannot miss it;
-                        //    current web builds tree-shake hydrateRoot away,
-                        //    so this often finds nothing today.
-                        // 2. Pinned vendor id 490349, shipped in a boot-time
-                        //    <script> and unreachable via wr.e(). The
-                        //    createRoot type check keeps a reused id pointing
-                        //    at the wrong module from passing.
-                        // 3. Null: fall back to the modal path below.
-                        var RD = null;
-                        try {
-                            var rdByProps = typeof W.findByProps === "function" ?
-                                W.findByProps("createRoot", "hydrateRoot") : null;
-                            if (rdByProps && typeof rdByProps.createRoot === "function") RD = rdByProps;
-                        } catch(eRDP) {}
-                        if (!RD) {
-                            try {
-                                var rdMod = wr(490349);
-                                if (rdMod && typeof rdMod.createRoot === "function") RD = rdMod;
-                            } catch(eRD) {}
+                    function openModalFallback(reason) {
+                        if (!ModalApi || typeof ModalApi.openModalLazy !== "function") {
+                            console.error("[Vendroid] Search: no ReactDOM root and no" +
+                                " modal API (" + reason + "); search cannot open");
+                            return;
                         }
-                        if (RD && typeof RD.createRoot === "function") {
-                            var searchCtxKey = String(guildId == null ? "dm" : guildId) +
-                                "/" + String(channelId == null ? "?" : channelId);
-                            openSearchOverlayWithRoot(RD, R, VdeSafeSearch,
-                                searchCtxKey,
-                                function() {
-                                    // Disposing on channel change prevents a
-                                    // stale context surviving navigation.
-                                    var fd = findFluxDispatcher();
-                                    if (!(fd && typeof fd.subscribe === "function")) return null;
-                                    var onNav = function() { closeSearchOverlay(true); };
-                                    fd.subscribe("CHANNEL_SELECT", onNav);
-                                    return function() {
-                                        try { fd.unsubscribe("CHANNEL_SELECT", onNav); } catch(e) {}
-                                    };
-                                });
-                            console.warn("[Vendroid] Search: widget opened via own root" +
-                                " (channelId=" + channelId + ", guildId=" + guildId + ")");
-                        } else {
-                            // Mount path B (fallback): the modal system.
+                        try {
                             ModalApi.openModalLazy(function() {
                                 return Promise.resolve({ default: VdeSafeSearch });
                             });
                             console.warn("[Vendroid] Search: widget opened via modal API" +
-                                " (channelId=" + channelId + ", guildId=" + guildId + ")");
+                                " (" + reason + ", channelId=" + channelId +
+                                ", guildId=" + guildId + ")");
+                        } catch(eModal) {
+                            console.error("[Vendroid] Search: modal fallback failed: " +
+                                eModal.message);
                         }
-                    } catch(err2) {
-                        console.error("[Vendroid] Search: open failed: " + err2.message);
-                    } finally {
-                        _vendroidSearchOpening = false;
                     }
-                }, function(err3) {
-                    console.error("[Vendroid] Search: chunk load failed: " +
-                        (err3 && err3.message ? err3.message : String(err3)));
+
+                    // Mount path A: our own ReactDOM root inside the overlay
+                    // card. createRoot is the only required export today;
+                    // hydrateRoot is gone from the React 19 web build.
+                    var rd = _vendroidResolveReactDom(W, wr);
+                    _vendroidSearchTrace("ReactDOM source=" +
+                        (rd ? rd.source : "none"));
+                    if (rd) {
+                        var searchCtxKey = String(guildId == null ? "dm" : guildId) +
+                            "/" + String(channelId);
+                        openSearchOverlayWithRoot(rd.api, R, VdeSafeSearch,
+                            searchCtxKey,
+                            function() {
+                                // Disposing on channel change prevents a
+                                // stale context surviving navigation.
+                                var fd = findFluxDispatcher();
+                                if (!(fd && typeof fd.subscribe === "function")) return null;
+                                var onNav = function() { closeSearchOverlay(true); };
+                                fd.subscribe("CHANNEL_SELECT", onNav);
+                                return function() {
+                                    try { fd.unsubscribe("CHANNEL_SELECT", onNav); } catch(e) {}
+                                };
+                            },
+                            function() { openModalFallback("empty own root"); });
+                        _vendroidSearchTrace("widget opened via own root" +
+                            " (source=" + rd.source + ", channelId=" + channelId +
+                            ", guildId=" + guildId + ")");
+                    } else {
+                        openModalFallback("no ReactDOM client");
+                    }
+                } catch(err2) {
+                    console.error("[Vendroid] Search: open failed: " +
+                        (err2 && err2.message ? err2.message : String(err2)));
+                } finally {
                     _vendroidSearchOpening = false;
-                });
+                }
+            }, function(err3) {
+                console.error("[Vendroid] Search: chunk load failed: " +
+                    (err3 && err3.message ? err3.message : String(err3)));
+                _vendroidSearchOpening = false;
+            });
         } catch(e) {
             _vendroidSearchOpening = false;
             console.error("[Vendroid] openNativeSearch failed: " + e.message);
@@ -908,9 +1265,9 @@
             try { o.fdUnsub && o.fdUnsub(); } catch(e) {}
             try { o.root.unmount(); } catch(e) {}
             try { o.el.remove(); } catch(e) {}
-            console.warn("[Vendroid] Search overlay disposed");
+            _vendroidSearchTrace("overlay disposed");
         } else {
-            console.warn("[Vendroid] Search overlay hidden (native search session left running)");
+            _vendroidSearchTrace("overlay hidden (native search session left running)");
         }
         notifyOverlayState();
     }
@@ -918,7 +1275,7 @@
     // Top-anchored card hosting only the input; the native results dock
     // renders behind it, fully visible and clickable. Dedicated createRoot
     // with no modal layer involved.
-    function openSearchOverlayWithRoot(RD, R, WidgetComp, ctxKey, fdUnsubFactory) {
+    function openSearchOverlayWithRoot(RD, R, WidgetComp, ctxKey, fdUnsubFactory, onEmpty) {
         // Reuse a live instance for the same channel. Re-show it without
         // remounting (remounting would recreate the search context and
         // reset state).
@@ -931,7 +1288,7 @@
                 document.removeEventListener('keydown', _vendroidSearchOverlay.onKey, true);
                 document.addEventListener('keydown', _vendroidSearchOverlay.onKey, true);
             } catch(e) {}
-            console.warn("[Vendroid] Search overlay re-shown for same channel");
+            _vendroidSearchTrace("overlay re-shown for same channel");
             notifyOverlayState();
             return;
         }
@@ -990,33 +1347,81 @@
             el: el, root: root, onKey: onKey, ctxKey: ctxKey,
             fdUnsub: typeof fdUnsubFactory === "function" ? fdUnsubFactory() : null
         };
-        console.warn("[Vendroid] Search overlay opened for " + ctxKey);
+        _vendroidSearchTrace("overlay opened for " + ctxKey);
         notifyOverlayState();
+        _vendroidInspectSearchRoot(mountNode, root, onEmpty);
     }
 
-    // Pinned HeaderBar loader snapshot, used only when discovery fails.
-    var VENDROID_SEARCH_CHUNKS = ["245553", "855151", "421630", "113582", "966016",
-                                  "781202", "421225", "671367", "79171", "798567",
-                                  "220803", "417664", "183752"];
-    var VENDROID_SEARCH_MODULE_ID = 907745;
+    // After root.render, confirm something actually mounted. React commits
+    // asynchronously, so a single frame can be too early. If the widget
+    // settles with no input, close the empty card and use the modal fallback.
+    function _vendroidInspectSearchRoot(mountNode, root, onEmpty) {
+        var finished = false;
 
-    // Set true while debugging a rebuild: aborting on the first failed probe
-    // names the dead dep id immediately instead of surfacing it as an
-    // anonymous commit-time error.
-    var VENDROID_SEARCH_PROBES_FATAL = false;
+        function inspect(attempt) {
+            if (finished) return;
+            if (!_vendroidSearchOverlay || _vendroidSearchOverlay.root !== root) return;
 
-    // Modules imported by Search.default's own dependency header (transcribed
-    // from the widget chunk source), plus representatives of the shared
-    // vendor mega-file (react-dom client 490349, popper 888767, the large
-    // utility modules) whose factories execute lazily on first render and
-    // were implicated in the earlier anonymous "TypeError: e is not a
-    // function".
-    var VENDROID_SEARCH_DEP_PROBES = [
-        477900, 582128, 64015, 775602, 138298, 761640, 734057, 71393,
-        309010, 256796, 517381, 822382, 408730, 616252, 753806, 775427,
-        145331, 742788, 921242, 652215, 375708,
-        /* vendor + large utilities */ 490349, 888767, 819354, 311358,
-        902537, 727222, 596829, 683402, 195554, 666624, 333007,
-        822986, 733344, 821500, 382811, 552229, 458265, 499957, 247320
-    ];
+            var input = null;
+            try {
+                input = mountNode.querySelector('input,[contenteditable="true"],' +
+                    '[role="searchbox"],[role="textbox"],[class*="searchBar"],' +
+                    '[class*="searchInput"]');
+            } catch(eInput) {}
+            var hasChildren = !!mountNode.firstChild;
+            var resultNodes = 0;
+            try {
+                resultNodes = document.querySelectorAll(
+                    '[class*="searchResults"],[class*="searchResult"],' +
+                    '[data-list-id*="search"]').length;
+            } catch(eResults) {}
+            _vendroidSearchTrace("render inspect attempt=" + attempt +
+                " children=" + hasChildren + " input=" + !!input +
+                " resultNodes=" + resultNodes);
+
+            if (input) {
+                finished = true;
+                _vendroidSearchResultsProbe("after-render");
+                // A query can set the sidebar context without rendering
+                // results. After Enter, wait briefly, then log the section,
+                // context id, and result count.
+                try {
+                    mountNode.addEventListener('keydown', function(e) {
+                        if (e.key !== 'Enter') return;
+                        setTimeout(function() {
+                            _vendroidSearchResultsProbe("after-query");
+                        }, 800);
+                    }, true);
+                } catch(eKey) {}
+                return;
+            }
+
+            if (attempt < 3) {
+                setTimeout(function() { inspect(attempt + 1); }, 200);
+                return;
+            }
+
+            finished = true;
+            console.error("[Vendroid] Search: own root rendered no search input" +
+                " (children=" + hasChildren + ", resultNodes=" + resultNodes +
+                "); using modal fallback");
+            try {
+                console.error("[Vendroid] Search: mount output=" +
+                    String(mountNode.innerHTML || "").slice(0, 600));
+            } catch(eHtml) {}
+            closeSearchOverlay(true);
+            if (typeof onEmpty === "function") {
+                try { onEmpty(); } catch(eEmpty) {
+                    console.error("[Vendroid] Search: empty-root fallback threw: " +
+                        eEmpty.message);
+                }
+            }
+        }
+
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(function() { inspect(0); });
+        } else {
+            setTimeout(function() { inspect(0); }, 0);
+        }
+    }
 

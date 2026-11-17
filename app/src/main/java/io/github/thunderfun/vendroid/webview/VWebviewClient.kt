@@ -108,6 +108,10 @@ class VWebviewClient(
             it.currentHostForBridge = Uri.parse(url).host
             it.navigationInProgress = true
             it.documentGeneration = generation
+            // The document that owned the in-page viewer is gone. Clear the
+            // bars and the bridge's edge dedupe so the next document can
+            // publish its own overlay state.
+            it.resetBarOverlayState()
         }
         VDELog.i("WV", "Page started: ${UrlNormalizer.redactForLog(url)}")
         VChromeClient.resetPageErrorQuota()
